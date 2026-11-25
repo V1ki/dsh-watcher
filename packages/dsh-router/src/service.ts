@@ -505,7 +505,10 @@ export class RouterRuntime {
     return this.forwardAdminReplyToWorker(activeFocus, rawText, msg);
   }
 
-  private formatNotificationText(decision: RouterDecisionRecord): string {
+  private formatNotificationText(
+    decision: RouterDecisionRecord,
+    opts?: { compact?: boolean },
+  ): string {
     const tag = `[#${extractShortId(decision)}]`;
     const lines: string[] = [`${tag} ${decision.summary}`];
     if (decision.draftText?.trim()) {
@@ -518,15 +521,21 @@ export class RouterRuntime {
       lines.push(`想确认下：${decision.question.trim()}`);
     }
     if (decision.options.length > 0) {
-      const formatted = decision.options.map((opt, idx) =>
-        idx === decision.recommendedIndex ? `${idx + 1}. ${opt}（推荐）` : `${idx + 1}. ${opt}`,
-      );
+      const formatted = decision.options.map((opt, idx) => {
+        const hasRecTag = /[（(]\s*推荐\s*[）)]/.test(opt);
+        if (idx === decision.recommendedIndex && !hasRecTag) {
+          return `${idx + 1}. ${opt}（推荐）`;
+        }
+        return `${idx + 1}. ${opt}`;
+      });
       lines.push(`可选：${formatted.join(' / ')}`);
     }
-    if (decision.rawUrl) {
-      lines.push(decision.rawUrl);
+    if (opts?.compact !== true) {
+      if (decision.rawUrl) {
+        lines.push(decision.rawUrl);
+      }
+      lines.push('直接回复就能接着聊；回“下一个”切下一条');
     }
-    lines.push('直接回复就能接着聊；回“下一个”切下一条');
     return lines.join('\n');
   }
 
@@ -636,7 +645,8 @@ export class RouterRuntime {
         return { attention, notification: notif, deferred: true };
       }
 
-      const text = this.formatNotificationText(decision);
+      const isSameFocusFollowup = activeFocus !== null && activeFocus.id === decision.id;
+      const text = this.formatNotificationText(decision, { compact: isSameFocusFollowup });
       const imagePath = options.imagePath ?? decision.imagePath ?? undefined;
       const sent = await this.deliverToWechat(
         decision,
@@ -974,8 +984,9 @@ export class RouterRuntime {
       : [];
     const options = Array.isArray(input.options)
       ? input.options.map((item) => String(item).trim()).filter(Boolean)
-      : existing.options;
+      : [];
     const recIdx =
+      options.length > 0 &&
       typeof input.recommendedIndex === 'number' &&
       Number.isInteger(input.recommendedIndex) &&
       input.recommendedIndex >= 0 &&
@@ -989,11 +1000,12 @@ export class RouterRuntime {
     const draftText = input.draftText?.trim() || null;
     const blindspot = input.blindspot?.trim() || null;
     const reportMode = input.mode ?? null;
+    const question = input.question?.trim() || null;
 
     const updatedBase: RouterDecisionRecord = {
       ...existing,
       summary: summaryText,
-      question: input.question !== undefined ? (input.question.trim() || null) : existing.question,
+      question,
       options,
       recommendedIndex: recIdx,
       imagePath,

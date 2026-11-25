@@ -1151,4 +1151,227 @@ describe('@local/dsh-router backend', () => {
       cleanup();
     }
   });
+
+  it('clears stale question/options across multi-round reports, avoids duplicate recommended tags, and uses compact WeChat format only on same-focus follow-ups', async () => {
+    let currentNow = new Date('2026-06-10T06:00:00.000Z');
+    const sentWechat: WechatSendInput[] = [];
+    const { hub, router, cleanup } = createHarness({
+      now: () => currentNow,
+      initialPolicy: { presenceMode: 'away' },
+      controllerId: 'wxid_admin_demo',
+      wechatSend: async (input) => {
+        sentWechat.push(input);
+        return { status: 'sent' };
+      },
+    });
+    const footer = '直接回复就能接着聊；回“下一个”切下一条';
+    const url160 = 'https://github.com/org/repo/pull/160';
+    const url161 = 'https://github.com/org/repo/pull/161';
+
+    try {
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-compact-160',
+          threadKey: 'org/repo#160',
+          type: 'github.pr_review_requested',
+          summary: 'Refactor notification formatter',
+          rawRef: { url: url160, repo: 'org/repo', number: 160 },
+        }),
+      );
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-compact-161',
+          threadKey: 'org/repo#161',
+          type: 'github.pr_review_requested',
+          summary: 'Fix retry backoff jitter',
+          rawRef: { url: url161, repo: 'org/repo', number: 161 },
+        }),
+      );
+
+      const dec160 = router.listDecisions().find((d) => d.threadKey === 'org/repo#160')!;
+      const dec161 = router.listDecisions().find((d) => d.threadKey === 'org/repo#161')!;
+
+      const round1 = await router.submitWorkerReport({
+        decisionId: dec160.id,
+        conclusion: '第一轮查完了，准备好了改动方案',
+        draftText: 'First draft reply.',
+        blindspot: '还没在窄屏测',
+        question: '先按哪个方案改？',
+        options: ['方案A（推荐）', '方案B'],
+        recommendedIndex: 0,
+        mode: 'discuss',
+      });
+      assert.equal(round1.question, '先按哪个方案改？');
+      assert.deepEqual(round1.options, ['方案A（推荐）', '方案B']);
+      assert.equal(round1.recommendedIndex, 0);
+
+      assert.equal(sentWechat.length, 1);
+      const msg1 = String(sentWechat[0].text);
+      assert.match(msg1, /^\[#160\] 第一轮查完了，准备好了改动方案/);
+      assert.match(msg1, /拟发草稿：\nFirst draft reply\./);
+      assert.match(msg1, /还没验证：还没在窄屏测/);
+      assert.match(msg1, /想确认下：先按哪个方案改？/);
+      assert.match(msg1, /可选：1\. 方案A（推荐） \/ 2\. 方案B/);
+      assert.doesNotMatch(msg1, /（推荐）（推荐）/);
+      assert.equal(msg1.includes(url160), true);
+      assert.equal(msg1.includes(footer), true);
+
+      currentNow = new Date('2026-06-10T06:01:00.000Z');
+      const round2 = await router.submitWorkerReport({
+        decisionId: dec160.id,
+        conclusion: '第二轮已改完，不需要再选方案了',
+        question: '   ',
+        recommendedIndex: 0,
+        mode: 'done',
+      });
+      assert.equal(round2.question, null);
+      assert.deepEqual(round2.options, []);
+      assert.equal(round2.recommendedIndex, null);
+      const persisted2 = router.db.getDecision(dec160.id)!;
+      assert.equal(persisted2.question, null);
+      assert.deepEqual(persisted2.options, []);
+      assert.equal(persisted2.recommendedIndex, null);
+
+      assert.equal(sentWechat.length, 2);
+      const msg2 = String(sentWechat[1].text);
+      assert.equal(msg2, '[#160] 第二轮已改完，不需要再选方案了');
+      assert.equal(msg2.includes('想确认下：'), false);
+      assert.equal(msg2.includes('可选：'), false);
+      assert.equal(msg2.includes(url160), false);
+      assert.equal(msg2.includes(footer), false);
+
+      currentNow = new Date('2026-06-10T06:02:00.000Z');
+      const round3 = await router.submitWorkerReport({
+        decisionId: dec160.id,
+        conclusion: '第三轮补了一版草稿',
+        draftText: 'Updated draft text.',
+        blindspot: '只跑了单测',
+        question: '这份草稿直接发吗？',
+        options: ['先留着', '直接发(推荐)', '再改改'],
+        recommendedIndex: 1,
+        mode: 'review_draft',
+      });
+      assert.equal(round3.question, '这份草稿直接发吗？');
+      assert.deepEqual(round3.options, ['先留着', '直接发(推荐)', '再改改']);
+      assert.equal(round3.recommendedIndex, 1);
+      const persisted3 = router.db.getDecision(dec160.id)!;
+      assert.equal(persisted3.question, '这份草稿直接发吗？');
+      assert.deepEqual(persisted3.options, ['先留着', '直接发(推荐)', '再改改']);
+      assert.equal(persisted3.recommendedIndex, 1);
+
+      assert.equal(sentWechat.length, 3);
+      const msg3 = String(sentWechat[2].text);
+      assert.match(msg3, /^\[#160\] 第三轮补了一版草稿/);
+      assert.match(msg3, /拟发草稿：\nUpdated draft text\./);
+      assert.match(msg3, /还没验证：只跑了单测/);
+      assert.match(msg3, /想确认下：这份草稿直接发吗？/);
+      assert.match(msg3, /可选：1\. 先留着 \/ 2\. 直接发\(推荐\) \/ 3\. 再改改/);
+      assert.doesNotMatch(msg3, /\(推荐\)（推荐）/);
+      assert.equal(msg3.includes(url160), false);
+      assert.equal(msg3.includes(footer), false);
+
+      currentNow = new Date('2026-06-10T06:03:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec161.id,
+        conclusion: '退避抖动定位清楚了',
+        question: '按默认上限 30s 改行吗？',
+        options: ['按 30s 改', '改成 60s'],
+        recommendedIndex: 0,
+        mode: 'discuss',
+      });
+      assert.equal(sentWechat.length, 3);
+
+      const manualSwitch = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '#161',
+      });
+      assert.equal(manualSwitch.handled, true);
+      const switchText = manualSwitch.replyText ?? '';
+      assert.match(switchText, /^\[#161\] 退避抖动定位清楚了/);
+      assert.match(switchText, /可选：1\. 按 30s 改（推荐） \/ 2\. 改成 60s/);
+      assert.equal(switchText.includes(url161), true);
+      assert.equal(switchText.includes(footer), true);
+
+      currentNow = new Date('2026-06-10T06:04:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec161.id,
+        conclusion: '已按 30s 改完并跑过测试',
+        mode: 'done',
+      });
+      assert.equal(sentWechat.length, 4);
+      const msg4 = String(sentWechat[3].text);
+      assert.equal(msg4, '[#161] 已按 30s 改完并跑过测试');
+      assert.equal(msg4.includes(url161), false);
+      assert.equal(msg4.includes(footer), false);
+
+      await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '先放着',
+      });
+      const backTo160 = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '#160',
+      });
+      assert.equal(backTo160.handled, true);
+      assert.equal((backTo160.replyText ?? '').includes(url160), true);
+      assert.equal((backTo160.replyText ?? '').includes(footer), true);
+
+      const nextTo161 = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '下一个',
+      });
+      assert.equal(nextTo161.handled, true);
+      const nextText = nextTo161.replyText ?? '';
+      assert.match(nextText, /^\[#161\]/);
+      assert.equal(nextText.includes(url161), true);
+      assert.equal(nextText.includes(footer), true);
+
+      currentNow = new Date('2026-06-11T07:00:00.000Z');
+      await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '完成',
+      });
+      await router.submitWorkerReport({
+        decisionId: dec161.id,
+        conclusion: '焦点清空后再次汇报应发完整版',
+      });
+      assert.equal(sentWechat.length, 5);
+      const msg5 = String(sentWechat[4].text);
+      assert.match(msg5, /^\[#161\] 焦点清空后再次汇报应发完整版/);
+      assert.equal(msg5.includes(url161), true);
+      assert.equal(msg5.includes(footer), true);
+
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-compact-162',
+          threadKey: 'org/repo#162',
+          type: 'github.pr_review_requested',
+          summary: 'Check deferred tick full format',
+          rawRef: { url: 'https://github.com/org/repo/pull/162', repo: 'org/repo', number: 162 },
+        }),
+      );
+      const dec162 = router.listDecisions().find((d) => d.threadKey === 'org/repo#162')!;
+      await router.submitWorkerReport({
+        decisionId: dec162.id,
+        conclusion: '排队项等待弹出',
+      });
+      assert.equal(sentWechat.length, 5);
+
+      currentNow = new Date('2026-06-12T08:00:00.000Z');
+      const poppedTick = await router.tickDeferred();
+      assert.equal(poppedTick.delivered, 1);
+      assert.equal(sentWechat.length, 6);
+      const msg6 = String(sentWechat[5].text);
+      assert.match(msg6, /^\[#162\] 排队项等待弹出/);
+      assert.equal(msg6.includes('https://github.com/org/repo/pull/162'), true);
+      assert.equal(msg6.includes(footer), true);
+    } finally {
+      cleanup();
+    }
+  });
 });
