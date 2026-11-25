@@ -1,0 +1,15 @@
+# @local/dsh-trigger-memo Cordis mount manifest
+# Registers time_nudge / news_followup / long_watch trigger scheduler and room tools (memo_add, memo_list, memo_cancel).
+- insert:
+    - id: trigger-memo
+      name: "@local/dsh-trigger-memo"
+      config:
+        tickIntervalMs: 60000
+        maxActivePerRoom: 5
+        proactiveBudgetMode: calendar_day
+        proactiveBudgetHours: 18
+        proactiveBudgetMaxPerRoom: 1
+        defaultNotifyWechatChatId: ""
+        newsDefaultIntervalHours: 8
+        newsMaxDays: 3
+        longWatchDefaultIntervalHours: 96

@@ -1,0 +1,56 @@
+{
+  "name": "@local/dsh-trigger-memo",
+  "version": "0.1.0",
+  "description": "DSH Hub Trigger Memo Engine — Time-Window Nudges, News Follow-ups & Long-Term Official Announcement Watch with Room Tools",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./scheduler": {
+      "types": "./lib/scheduler.d.ts",
+      "default": "./lib/scheduler.js"
+    },
+    "./web-scout": {
+      "types": "./lib/web-scout.d.ts",
+      "default": "./lib/web-scout.js"
+    },
+    "./tools": {
+      "types": "./lib/tools.d.ts",
+      "default": "./lib/tools.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "build": "sh -c 'if [ -d src ] && find src -name \"*.ts\" | grep -q .; then tsc -p tsconfig.json; fi'",
+    "test": "sh -c 'if [ -d test ] && find test -name \"*.test.ts\" | grep -q .; then tsc -p tsconfig.test.json && node --test \"lib-test/test/**/*.test.js\"; fi'"
+  },
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "devDependencies": {
+    "@local/dsh-hub": "workspace:*"
+  },
+  "peerDependencies": {
+    "@local/dsh-hub": "^0.1.0",
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "@deepseek-ai/dsh-scope": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
