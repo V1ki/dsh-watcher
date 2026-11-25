@@ -258,7 +258,8 @@ export function buildFastPathPrompt(input: FastPathPromptInput): string {
     const routerLines = [
       `decisionId: ${decisionId}`,
       ...(linkedFromThreadKey ? [`关联线索: ${linkedFromThreadKey} -> ${subscription.threadKey}`] : []),
-      `收到最新进展/审阅意见后继续处理，完成后务必调用 \`router_report_result\`（传入 \`decisionId\`: \`${decisionId}\`）用简短大白话汇报结果（改界面请附 \`imagePath\` 截图）。`,
+      `- 有新的审阅意见/人类评论，或你做了新的代码/外发操作并产生新进展时：继续处理后调用 \`router_report_result\`（传入 \`decisionId\`: \`${decisionId}\`）用简短大白话汇报结果（改界面请附 \`imagePath\` 截图）。`,
+      '- 若只是 PR 合并、Issue 自动关闭等系统状态变动提醒，且核对后确认没有新评论/新要求、无需任何处理：直接静默结束，不要调用 `router_report_result` 打扰管理员。',
     ];
     sections.push(`## Directive\n${routerLines.join('\n')}`);
     return sections.join('\n\n');

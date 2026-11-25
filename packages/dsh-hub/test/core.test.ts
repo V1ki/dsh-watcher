@@ -12,6 +12,7 @@ import { openHubDb } from '../src/db.js';
 import { createDoorGuard } from '../src/guard.js';
 import { createSessionBridge, type DshAgent, type SessionBridgeContext } from '../src/session-bridge.js';
 import { createHubService } from '../src/service.js';
+import { buildFastPathPrompt } from '../src/posterior.js';
 import { apply } from '../src/index.js';
 
 function makeEvent(overrides: Partial<NormalizedEvent> = {}): NormalizedEvent {
@@ -653,6 +654,9 @@ test('GitHub PR inherits active Issue router subscription, forwards decisionId p
     assert.match(firstPrompt, /github:example-owner\/example-repo#243/);
     assert.match(firstPrompt, /router_report_result/);
     assert.match(firstPrompt, /imagePath/);
+    assert.match(firstPrompt, /静默结束/);
+    assert.match(firstPrompt, /不要调用 `router_report_result`/);
+    assert.doesNotMatch(firstPrompt, /完成后务必调用/);
 
     const followUpRes = await service.ingest(
       makeEvent({
@@ -731,4 +735,45 @@ test('GitHub PR inherits active Issue router subscription, forwards decisionId p
   } finally {
     db.close();
   }
+});
+
+test('buildFastPathPrompt instructs router workers to report real progress and stay silent on pure status echoes', () => {
+  const now = new Date().toISOString();
+  const prompt = buildFastPathPrompt({
+    subscription: {
+      id: 'sub-echo-1',
+      source: 'github',
+      threadKey: 'github:example-owner/example-repo#512',
+      sessionId: 'sess-worker-512',
+      workstreamId: 'ws-512',
+      personaId: null,
+      owner: 'router',
+      metadata: {
+        decisionId: 'dec-512',
+        linkedFromThreadKey: 'github:example-owner/example-repo#500',
+      },
+      status: 'active',
+      createdAt: now,
+      updatedAt: now,
+    },
+    event: makeEvent({
+      id: 'evt-pr-merged-512',
+      type: 'pull_request',
+      threadKey: 'github:example-owner/example-repo#512',
+      entityKey: 'github:example-owner/example-repo#512',
+      summary: 'PR #512 merged and closed linked Issue #500',
+      payload: {
+        body: '',
+      },
+    }),
+    tier: 'triage',
+  });
+
+  assert.match(prompt, /decisionId: dec-512/);
+  assert.match(prompt, /关联线索: github:example-owner\/example-repo#500 -> github:example-owner\/example-repo#512/);
+  assert.match(prompt, /调用 `router_report_result`（传入 `decisionId`: `dec-512`）/);
+  assert.match(prompt, /imagePath/);
+  assert.match(prompt, /PR 合并、Issue 自动关闭/);
+  assert.match(prompt, /直接静默结束，不要调用 `router_report_result`/);
+  assert.doesNotMatch(prompt, /完成后务必调用/);
 });
