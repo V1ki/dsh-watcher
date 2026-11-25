@@ -1,0 +1,202 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.0
+        version: 24.19.2
+      typescript:
+        specifier: ^5.8.0
+        version: 5.9.3
+
+  packages/dsh-connector-github:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+    devDependencies:
+      '@local/dsh-hub':
+        specifier: workspace:*
+        version: link:../dsh-hub
+
+  packages/dsh-connector-wxarc:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+    devDependencies:
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+      '@local/dsh-hub':
+        specifier: workspace:*
+        version: link:../dsh-hub
+
+  packages/dsh-hub:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+
+  packages/dsh-hub-bundle:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+      '@local/dsh-connector-github':
+        specifier: workspace:*
+        version: link:../dsh-connector-github
+      '@local/dsh-hub':
+        specifier: workspace:*
+        version: link:../dsh-hub
+      '@local/dsh-persona':
+        specifier: workspace:*
+        version: link:../dsh-persona
+      '@local/dsh-router':
+        specifier: workspace:*
+        version: link:../dsh-router
+      '@local/dsh-trigger-memo':
+        specifier: workspace:*
+        version: link:../dsh-trigger-memo
+    optionalDependencies:
+      '@local/dsh-connector-wxarc':
+        specifier: workspace:*
+        version: link:../dsh-connector-wxarc
+
+  packages/dsh-persona:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+
+  packages/dsh-router:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+    devDependencies:
+      '@local/dsh-hub':
+        specifier: workspace:*
+        version: link:../dsh-hub
+
+  packages/dsh-trigger-memo:
+    dependencies:
+      '@deepseek-ai/cordis':
+        specifier: ^4.0.0
+        version: 4.1.0
+      '@deepseek-ai/dsh-scope':
+        specifier: '>=0.2.2-rc.1 <0.3.0'
+        version: 0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)
+      '@deepseek-ai/schemastery':
+        specifier: ^3.18.5
+        version: 3.19.0
+    devDependencies:
+      '@local/dsh-hub':
+        specifier: workspace:*
+        version: link:../dsh-hub
+
+packages:
+
+  '@deepseek-ai/cordis@4.1.0':
+    resolution: {integrity: sha512-CJrjNyBkKn1SfvBQUcgFYKFnLjS+uKrhdMsbHU60xabvi12d+xQ+IQSNlME5Z+B+4Zi6n4BDknKY94tEPeo47w==}
+    hasBin: true
+    peerDependencies:
+      '@deepseek-ai/cordis-plugin-include': ~1.1.0
+      '@deepseek-ai/cordis-plugin-loader': ~1.1.0
+    peerDependenciesMeta:
+      '@deepseek-ai/cordis-plugin-include':
+        optional: true
+      '@deepseek-ai/cordis-plugin-loader':
+        optional: true
+
+  '@deepseek-ai/cosmokit@1.9.0':
+    resolution: {integrity: sha512-5O1S53mZiJyZYcvxxD0Qv1EY7qFPSxbGyD8CbVK6gw7W9FvcXZj2YIX1ZkOqyQQ3Xt2rFkZDHJv0+V3Zmmp8CA==}
+
+  '@deepseek-ai/dsh-scope@0.2.2-rc.5':
+    resolution: {integrity: sha512-iRmkbchma2F3nhrOgh9ss3D3NPYv0FZRfwyM6wt0MhJMd9R4u1dIbrvlhRNBglF+Nr5rD3yiA4PQjpWclb8XUQ==}
+    peerDependencies:
+      '@deepseek-ai/cordis': ~4.1.0
+
+  '@deepseek-ai/schemastery@3.19.0':
+    resolution: {integrity: sha512-bDXoYQa7ghAhmdYD5VPlzKxEzJV/aKkz5l4V5h1u06z8GAPN1ROewSjvR9WiXhpa52E9fng8lpH5QdCRIQgnyQ==}
+
+  '@standard-schema/spec@1.1.0':
+    resolution: {integrity: sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w==}
+
+  '@types/node@24.19.2':
+    resolution: {integrity: sha512-93d49wCWJkCyN87MxLpNN6KXPCwFw7bVUg79mGUV1OS40JGWwVCr8n61DXCSqz7CV6/VfPkb7xec7uP2M+QHWQ==}
+
+  typescript@5.9.3:
+    resolution: {integrity: sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw==}
+    engines: {node: '>=14.17'}
+    hasBin: true
+
+  undici-types@7.24.6:
+    resolution: {integrity: sha512-WRNW+sJgj5OBN4/0JpHFqtqzhpbnV0GuB+OozA9gCL7a993SmU+1JBZCzLNxYsbMfIeDL+lTsphD5jN5N+n0zg==}
+
+snapshots:
+
+  '@deepseek-ai/cordis@4.1.0':
+    dependencies:
+      '@deepseek-ai/cosmokit': 1.9.0
+      '@standard-schema/spec': 1.1.0
+
+  '@deepseek-ai/cosmokit@1.9.0': {}
+
+  '@deepseek-ai/dsh-scope@0.2.2-rc.5(@deepseek-ai/cordis@4.1.0)':
+    dependencies:
+      '@deepseek-ai/cordis': 4.1.0
+
+  '@deepseek-ai/schemastery@3.19.0':
+    dependencies:
+      '@deepseek-ai/cosmokit': 1.9.0
+      '@standard-schema/spec': 1.1.0
+
+  '@standard-schema/spec@1.1.0': {}
+
+  '@types/node@24.19.2':
+    dependencies:
+      undici-types: 7.24.6
+
+  typescript@5.9.3: {}
+
+  undici-types@7.24.6: {}

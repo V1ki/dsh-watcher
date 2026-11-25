@@ -1,0 +1,22 @@
+{
+  "name": "dsh-watcher-monorepo",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.26.2",
+  "description": "DSH Unified Watcher — Core Service, Persona Wardrobe, GitHub Adapter, Proactive Memos, and macOS WeChat Bridge",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --if-present run build",
+    "test": "pnpm -r --if-present run test",
+    "check:comments": "node scripts/check-no-comments.ts",
+    "check": "pnpm run check:comments && pnpm run build",
+    "deploy:macmini": "node scripts/deploy-macmini.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.8.0"
+  }
+}
