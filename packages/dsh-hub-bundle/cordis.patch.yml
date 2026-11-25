@@ -1,0 +1,16 @@
+# @local/dsh-hub-bundle Meta-Bundle manifest
+# Persona starts first so personaWardrobe is ready for Hub and all Connectors.
+# Non-darwin hosts automatically ignore @local/dsh-connector-wxarc via dsh.bundle.platforms.
+- insert:
+    - id: persona
+      name: "@local/dsh-persona"
+    - id: hub
+      name: "@local/dsh-hub"
+    - id: router
+      name: "@local/dsh-router"
+    - id: connector-github
+      name: "@local/dsh-connector-github"
+    - id: trigger-memo
+      name: "@local/dsh-trigger-memo"
+    - id: connector-wxarc
+      name: "@local/dsh-connector-wxarc"
