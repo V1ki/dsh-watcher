@@ -1,0 +1,19 @@
+# @local/dsh-connector-github Cordis mount manifest
+# Credentials stay in $DSH_HOME/.credentials.yaml via ctx.credentials (falling back to legacy watcher-github/* keys and `gh auth token`).
+- insert:
+    - id: connector-github
+      name: "@local/dsh-connector-github"
+      config:
+        ownerLogins: []
+        autoSendOwners: []
+        botLogin: ""
+        enableNotifications: true
+        pollIntervalMs: 60000
+        pinnedPollIntervalMs: 30000
+        defaultPersonaId: null
+        auth:
+          readCredentialProfile: "github-read"
+          actCredentialProfile: "github-act"
+          fallbackGhCli: true
+        repoMap: {}
+        pinnedItems: []
