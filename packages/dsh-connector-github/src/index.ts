@@ -31,7 +31,13 @@ import {
   type GitHubCredentialStore,
   type GitHubLogger,
 } from './auth.js';
-import { GitHubPoller, MAX_RECENT_EVENTS, type GitHubPinnedItem, type GitHubRecentEvent } from './poller.js';
+import {
+  extractLinkedIssues,
+  GitHubPoller,
+  MAX_RECENT_EVENTS,
+  type GitHubPinnedItem,
+  type GitHubRecentEvent,
+} from './poller.js';
 import { GitHubGraphResolver, MAX_CONTEXT_CARD_CHARS } from './graph-resolver.js';
 import {
   createGitHubSink,
@@ -1121,6 +1127,7 @@ export {
   resolveDefaultCredentialsPath,
   withFileLock,
   writeFileAtomic,
+  extractLinkedIssues,
   GitHubPoller,
   MAX_RECENT_EVENTS,
   GitHubGraphResolver,

@@ -107,6 +107,7 @@ interface IssueSnapshotState {
   bodyHash: string;
   commentsCount: number;
   lastCommentSyncAt?: string;
+  lastReviewSyncAt?: string;
 }
 
 interface RepoIssueSnapshotStore {
@@ -156,6 +157,29 @@ interface GitHubIssueLike {
 interface GitHubCommentLike {
   id: string | number;
   body?: string | null;
+  html_url?: string;
+  created_at?: string;
+  updated_at?: string;
+  user?: GitHubUserLike;
+  reactions?: Record<string, unknown>;
+}
+
+interface GitHubPrReviewLike {
+  id: string | number;
+  state?: string;
+  body?: string | null;
+  html_url?: string;
+  submitted_at?: string;
+  user?: GitHubUserLike;
+}
+
+interface GitHubPrReviewCommentLike {
+  id: string | number;
+  body?: string | null;
+  path?: string;
+  line?: number | null;
+  original_line?: number | null;
+  pull_request_review_id?: string | number | null;
   html_url?: string;
   created_at?: string;
   updated_at?: string;
@@ -258,6 +282,27 @@ function diffIssueSnapshots(
   return { changes, addedLabels, removedLabels, onlyLabelsChanged };
 }
 
+const LINKED_ISSUE_REGEX =
+  /\b(?:fix(?:e[sd])?|close[sd]?|resolve[sd]?)(?:\s*:\s*|\s+)(?:([a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.-]+))?#(\d+)\b/gi;
+
+export function extractLinkedIssues(body: string | null | undefined, repo: string): number[] {
+  if (!body) return [];
+  const cleaned = String(body).replace(/<!--[\s\S]*?-->/g, ' ');
+  const repoLower = String(repo || '').trim().toLowerCase();
+  const matched = new Set<number>();
+  LINKED_ISSUE_REGEX.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = LINKED_ISSUE_REGEX.exec(cleaned)) !== null) {
+    const refRepo = m[1] ? m[1].trim().toLowerCase() : '';
+    if (refRepo && refRepo !== repoLower) continue;
+    const num = Number(m[2]);
+    if (Number.isInteger(num) && num > 0) {
+      matched.add(num);
+    }
+  }
+  return [...matched].sort((a, b) => a - b);
+}
+
 function buildCommentSummary(
   body: string | null | undefined,
   actorLogin: string,
@@ -275,6 +320,57 @@ function buildCommentSummary(
   return cleaned.length > MAX_COMMENT_SUMMARY_CHARS
     ? `${cleaned.slice(0, MAX_COMMENT_SUMMARY_CHARS - 1)}…`
     : cleaned;
+}
+
+function buildReviewSummary(
+  state: string,
+  body: string | null | undefined,
+  actorLogin: string,
+  repo: string,
+  number: number,
+): string {
+  const stateTag = state || 'REVIEWED';
+  const cleaned = String(body || '')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) {
+    return `[${stateTag}] ${actorLogin} reviewed ${repo}#${number}`;
+  }
+  const prefix = `[${stateTag}] `;
+  const maxBody = Math.max(20, MAX_COMMENT_SUMMARY_CHARS - prefix.length);
+  const excerpt = cleaned.length > maxBody ? `${cleaned.slice(0, maxBody - 1)}…` : cleaned;
+  return `${prefix}${excerpt}`;
+}
+
+function buildInlineReviewCommentSummary(
+  filePath: string | undefined,
+  line: number | null | undefined,
+  body: string | null | undefined,
+  actorLogin: string,
+  repo: string,
+  number: number,
+): string {
+  const location = filePath
+    ? typeof line === 'number' && Number.isFinite(line)
+      ? `${filePath}:${line}`
+      : filePath
+    : '';
+  const cleaned = String(body || '')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) {
+    return location
+      ? `[${location}] ${actorLogin} commented on ${repo}#${number}`
+      : `${actorLogin} commented on ${repo}#${number}`;
+  }
+  const prefix = location ? `[${location}] ` : '';
+  const maxBody = Math.max(20, MAX_COMMENT_SUMMARY_CHARS - prefix.length);
+  const excerpt = cleaned.length > maxBody ? `${cleaned.slice(0, maxBody - 1)}…` : cleaned;
+  return `${prefix}${excerpt}`;
 }
 
 function maxIsoTimestamp(a: string | null | undefined, b: string | null | undefined): string | undefined {
@@ -393,15 +489,23 @@ export class GitHubPoller {
     this._writeCursor('state:self_published', { value: { ids } });
   }
 
-  private _loadSeenComments(entityKey: string): Set<string> {
-    const rec = this._readCursor(`seen:comments:${entityKey}`);
+  private _loadSeenIds(cursorKey: string): Set<string> {
+    const rec = this._readCursor(cursorKey);
     const ids = rec?.value?.ids;
     return new Set(Array.isArray(ids) ? ids.map(String) : []);
   }
 
-  private _saveSeenComments(entityKey: string, seenSet: Set<string>): void {
+  private _saveSeenIds(cursorKey: string, seenSet: Set<string>): void {
     const ids = [...seenSet].slice(-MAX_SEEN_COMMENTS);
-    this._writeCursor(`seen:comments:${entityKey}`, { value: { ids } });
+    this._writeCursor(cursorKey, { value: { ids } });
+  }
+
+  private _loadSeenComments(entityKey: string): Set<string> {
+    return this._loadSeenIds(`seen:comments:${entityKey}`);
+  }
+
+  private _saveSeenComments(entityKey: string, seenSet: Set<string>): void {
+    this._saveSeenIds(`seen:comments:${entityKey}`, seenSet);
   }
 
   private _loadReactionState(entityKey: string): ReactionState {
@@ -444,6 +548,7 @@ export class GitHubPoller {
             ? e.commentsCount
             : 0,
         lastCommentSyncAt: typeof e.lastCommentSyncAt === 'string' ? e.lastCommentSyncAt : undefined,
+        lastReviewSyncAt: typeof e.lastReviewSyncAt === 'string' ? e.lastReviewSyncAt : undefined,
       };
     }
     return {
@@ -488,10 +593,11 @@ export class GitHubPoller {
     entityKey: string;
     since?: string;
     baselineMs?: number;
+    linkedIssues?: number[];
     token: string;
     signal?: AbortSignal;
   }): Promise<{ emitted: number; latestCommentAt?: string; ok: boolean }> {
-    const { repo, item, isPr, entityKey, since, baselineMs, token, signal } = params;
+    const { repo, item, isPr, entityKey, since, baselineMs, linkedIssues = [], token, signal } = params;
     const query = since ? `?since=${encodeURIComponent(since)}&per_page=100` : '?per_page=100';
     const path = `/repos/${repo}/issues/${item.number}/comments${query}`;
     const headers: Record<string, string> = {
@@ -567,6 +673,7 @@ export class GitHubPoller {
           commentId: cid,
           body: comment.body || '',
           reactions: reactions?.raw,
+          ...(isPr && linkedIssues.length > 0 ? { linkedIssues } : {}),
         },
         rawRef: {
           url: comment.html_url || item.html_url,
@@ -583,6 +690,204 @@ export class GitHubPoller {
     }
 
     return { emitted, latestCommentAt, ok: true };
+  }
+
+  private async _pollRepoPrReviews(params: {
+    repo: string;
+    item: GitHubIssueLike;
+    entityKey: string;
+    baselineMs?: number;
+    linkedIssues?: number[];
+    token: string;
+    signal?: AbortSignal;
+  }): Promise<{ emitted: number; latestReviewAt?: string; ok: boolean }> {
+    const { repo, item, entityKey, baselineMs, linkedIssues = [], token, signal } = params;
+    const headers: Record<string, string> = {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${token}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'dsh-connector-github/0.1.0',
+    };
+
+    let emitted = 0;
+    let latestReviewAt: string | undefined = undefined;
+    let reviewsOk = false;
+    let inlineOk = false;
+
+    const reviewsPath = `/repos/${repo}/pulls/${item.number}/reviews?per_page=100`;
+    try {
+      const resp = await this.fetchImpl(`${GITHUB_API}${reviewsPath}`, { headers, signal });
+      if (!resp.ok) {
+        this.logger?.warn?.(
+          `[connector-github] Failed to fetch PR reviews for ${repo}#${item.number}: HTTP ${resp.status}`,
+        );
+      } else {
+        const data = await resp.json().catch(() => null);
+        if (Array.isArray(data)) {
+          reviewsOk = true;
+          const cursorKey = `seen:pr_reviews:${entityKey}`;
+          const seen = this._loadSeenIds(cursorKey);
+          let seenDirty = false;
+
+          for (const review of data as GitHubPrReviewLike[]) {
+            const reviewId = String(review.id);
+            const reviewState = String(review.state || '').toUpperCase();
+            if (reviewState === 'PENDING') continue;
+
+            latestReviewAt = maxIsoTimestamp(latestReviewAt, review.submitted_at);
+            if (seen.has(reviewId)) continue;
+            seen.add(reviewId);
+            seenDirty = true;
+
+            const trimmedBody = String(review.body || '')
+              .replace(/<!--[\s\S]*?-->/g, ' ')
+              .trim();
+            if (!trimmedBody && reviewState === 'COMMENTED') continue;
+
+            if (typeof baselineMs === 'number' && Number.isFinite(baselineMs)) {
+              const submittedMs = review.submitted_at ? Date.parse(review.submitted_at) : Number.NaN;
+              if (Number.isFinite(submittedMs) && submittedMs <= baselineMs) continue;
+            }
+
+            if (this.shouldDropSelfOrBot(review.user, review.body, reviewId)) continue;
+
+            await this._emitEvent({
+              id: randomUUID(),
+              source: SOURCE_ID,
+              type: 'github.pr.comment',
+              dedupeKey: `github:${repo}#${item.number}:review:${reviewId}`,
+              threadKey: entityKey,
+              entityKey,
+              actor: this.toActor(review.user),
+              trustLevel: this.classifyTrust(review.user),
+              occurredAt: review.submitted_at || new Date().toISOString(),
+              summary: buildReviewSummary(
+                reviewState,
+                review.body,
+                review.user?.login || 'someone',
+                repo,
+                item.number,
+              ),
+              payload: {
+                repo,
+                number: item.number,
+                isPr: true,
+                title: item.title || '',
+                reviewId,
+                reviewState,
+                body: review.body || '',
+                ...(linkedIssues.length > 0 ? { linkedIssues } : {}),
+              },
+              rawRef: {
+                url: review.html_url || item.html_url,
+                externalId: reviewId,
+                repo,
+                number: item.number,
+              },
+            });
+            emitted += 1;
+          }
+
+          if (seenDirty) {
+            this._saveSeenIds(cursorKey, seen);
+          }
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[connector-github] Failed to fetch PR reviews for ${repo}#${item.number}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    const inlinePath = `/repos/${repo}/pulls/${item.number}/comments?per_page=100`;
+    try {
+      const resp = await this.fetchImpl(`${GITHUB_API}${inlinePath}`, { headers, signal });
+      if (!resp.ok) {
+        this.logger?.warn?.(
+          `[connector-github] Failed to fetch PR review comments for ${repo}#${item.number}: HTTP ${resp.status}`,
+        );
+      } else {
+        const data = await resp.json().catch(() => null);
+        if (Array.isArray(data)) {
+          inlineOk = true;
+          const cursorKey = `seen:pr_review_comments:${entityKey}`;
+          const seen = this._loadSeenIds(cursorKey);
+          let seenDirty = false;
+
+          for (const comment of data as GitHubPrReviewCommentLike[]) {
+            const cid = String(comment.id);
+            const commentAt = maxIsoTimestamp(comment.updated_at, comment.created_at);
+            latestReviewAt = maxIsoTimestamp(latestReviewAt, commentAt);
+
+            if (seen.has(cid)) continue;
+            seen.add(cid);
+            seenDirty = true;
+
+            if (typeof baselineMs === 'number' && Number.isFinite(baselineMs)) {
+              const commentMs = commentAt ? Date.parse(commentAt) : Number.NaN;
+              if (Number.isFinite(commentMs) && commentMs <= baselineMs) continue;
+            }
+
+            if (this.shouldDropSelfOrBot(comment.user, comment.body, cid)) continue;
+
+            const line = comment.line ?? comment.original_line ?? undefined;
+            const reactions = extractReactions(comment);
+            await this._emitEvent({
+              id: randomUUID(),
+              source: SOURCE_ID,
+              type: 'github.pr.comment',
+              dedupeKey: `github:${repo}#${item.number}:review_comment:${cid}`,
+              threadKey: entityKey,
+              entityKey,
+              actor: this.toActor(comment.user),
+              trustLevel: this.classifyTrust(comment.user),
+              occurredAt: comment.created_at || comment.updated_at || new Date().toISOString(),
+              summary: buildInlineReviewCommentSummary(
+                comment.path,
+                line,
+                comment.body,
+                comment.user?.login || 'someone',
+                repo,
+                item.number,
+              ),
+              payload: {
+                repo,
+                number: item.number,
+                isPr: true,
+                title: item.title || '',
+                commentId: cid,
+                reviewCommentId: cid,
+                ...(comment.pull_request_review_id !== undefined && comment.pull_request_review_id !== null
+                  ? { reviewId: String(comment.pull_request_review_id) }
+                  : {}),
+                ...(comment.path ? { path: comment.path } : {}),
+                ...(typeof line === 'number' && Number.isFinite(line) ? { line } : {}),
+                body: comment.body || '',
+                reactions: reactions?.raw,
+                ...(linkedIssues.length > 0 ? { linkedIssues } : {}),
+              },
+              rawRef: {
+                url: comment.html_url || item.html_url,
+                externalId: cid,
+                repo,
+                number: item.number,
+              },
+            });
+            emitted += 1;
+          }
+
+          if (seenDirty) {
+            this._saveSeenIds(cursorKey, seen);
+          }
+        }
+      }
+    } catch (err) {
+      this.logger?.warn?.(
+        `[connector-github] Failed to fetch PR review comments for ${repo}#${item.number}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+
+    return { emitted, latestReviewAt, ok: reviewsOk && inlineOk };
   }
 
   listRecentEvents(): GitHubRecentEvent[] {
@@ -931,7 +1236,8 @@ export class GitHubPoller {
         this._saveReactionState(entityKey, state);
       }
 
-      if (this.shouldDropSelfOrBot(item.user, item.body, item.id)) continue;
+      const skipHeadEvent = this.shouldDropSelfOrBot(item.user, item.body, item.id);
+      const linkedIssues = isPr ? extractLinkedIssues(item.body, repo) : [];
 
       const labels = normalizeLabels(item.labels);
       const itemKey = String(item.number);
@@ -940,60 +1246,142 @@ export class GitHubPoller {
       const isPinned = this._isPinnedTarget(repo, item.number);
 
       if (!prev) {
-        const trustLevel = this.classifyTrust(item.user);
-        await this._emitEvent({
-          id: randomUUID(),
-          source: SOURCE_ID,
-          type: isPr ? 'github.pr.updated' : 'github.issue.updated',
-          dedupeKey: `github:${repo}#${item.number}:updated:${item.updated_at}`,
-          threadKey: entityKey,
-          entityKey,
-          actor: this.toActor(item.user),
-          trustLevel,
-          occurredAt: item.updated_at || new Date().toISOString(),
-          summary: `${isPr ? 'PR' : 'Issue'} ${repo}#${item.number}: ${item.title || ''}`.trim(),
-          payload: {
-            repo,
-            number: item.number,
-            isPr,
-            state: item.state,
-            draft: Boolean(item.draft),
-            title: item.title || '',
-            body: item.body || '',
-            labels,
-            reactions: reactions?.raw,
-          },
-          rawRef: {
-            url: item.html_url,
-            externalId: String(item.id ?? item.number),
-            repo,
-            number: item.number,
-          },
-        });
-        emitted += 1;
+        if (!skipHeadEvent) {
+          const trustLevel = this.classifyTrust(item.user);
+          await this._emitEvent({
+            id: randomUUID(),
+            source: SOURCE_ID,
+            type: isPr ? 'github.pr.updated' : 'github.issue.updated',
+            dedupeKey: `github:${repo}#${item.number}:updated:${item.updated_at}`,
+            threadKey: entityKey,
+            entityKey,
+            actor: this.toActor(item.user),
+            trustLevel,
+            occurredAt: item.updated_at || new Date().toISOString(),
+            summary: `${isPr ? 'PR' : 'Issue'} ${repo}#${item.number}: ${item.title || ''}`.trim(),
+            payload: {
+              repo,
+              number: item.number,
+              isPr,
+              state: item.state,
+              draft: Boolean(item.draft),
+              title: item.title || '',
+              body: item.body || '',
+              labels,
+              reactions: reactions?.raw,
+              ...(isPr && linkedIssues.length > 0 ? { linkedIssues } : {}),
+            },
+            rawRef: {
+              url: item.html_url,
+              externalId: String(item.id ?? item.number),
+              repo,
+              number: item.number,
+            },
+          });
+          emitted += 1;
+        }
 
-        if (hadBaseline && !isPinned && nextSnapshot.commentsCount > 0 && prevRepoMaxUpdatedAt) {
-          const itemMs = item.updated_at ? Date.parse(item.updated_at) : Number.NaN;
-          const prevMaxMs = Date.parse(prevRepoMaxUpdatedAt);
-          if (!Number.isFinite(itemMs) || !Number.isFinite(prevMaxMs) || itemMs > prevMaxMs) {
-            const commentRes = await this._pollRepoIssueComments({
+        let initialCommentFetchFailed = false;
+        let initialReviewFetchFailed = false;
+        const isInitialOpenBotPr = skipHeadEvent && isPr && item.state === 'open';
+
+        if (!isPinned) {
+          if (isInitialOpenBotPr) {
+            if (nextSnapshot.commentsCount > 0) {
+              const commentRes = await this._pollRepoIssueComments({
+                repo,
+                item,
+                isPr,
+                entityKey,
+                linkedIssues,
+                token,
+                signal,
+              });
+              emitted += commentRes.emitted;
+              if (commentRes.ok) {
+                nextSnapshot.lastCommentSyncAt = maxIsoTimestamp(
+                  commentRes.latestCommentAt,
+                  item.updated_at,
+                );
+              } else {
+                initialCommentFetchFailed = true;
+              }
+            }
+            const reviewRes = await this._pollRepoPrReviews({
               repo,
               item,
-              isPr,
               entityKey,
-              since: prevRepoMaxUpdatedAt,
-              baselineMs: prevMaxMs,
+              linkedIssues,
               token,
               signal,
             });
-            emitted += commentRes.emitted;
-            if (commentRes.ok) {
-              nextSnapshot.lastCommentSyncAt = maxIsoTimestamp(
-                commentRes.latestCommentAt,
+            emitted += reviewRes.emitted;
+            if (reviewRes.ok) {
+              nextSnapshot.lastReviewSyncAt = maxIsoTimestamp(
+                reviewRes.latestReviewAt,
                 item.updated_at,
               );
+            } else {
+              initialReviewFetchFailed = true;
+            }
+          } else if (hadBaseline && prevRepoMaxUpdatedAt) {
+            const itemMs = item.updated_at ? Date.parse(item.updated_at) : Number.NaN;
+            const prevMaxMs = Date.parse(prevRepoMaxUpdatedAt);
+            if (!Number.isFinite(itemMs) || !Number.isFinite(prevMaxMs) || itemMs > prevMaxMs) {
+              if (nextSnapshot.commentsCount > 0) {
+                const commentRes = await this._pollRepoIssueComments({
+                  repo,
+                  item,
+                  isPr,
+                  entityKey,
+                  since: prevRepoMaxUpdatedAt,
+                  baselineMs: prevMaxMs,
+                  linkedIssues,
+                  token,
+                  signal,
+                });
+                emitted += commentRes.emitted;
+                if (commentRes.ok) {
+                  nextSnapshot.lastCommentSyncAt = maxIsoTimestamp(
+                    commentRes.latestCommentAt,
+                    item.updated_at,
+                  );
+                } else {
+                  initialCommentFetchFailed = true;
+                }
+              }
+              if (isPr) {
+                const reviewRes = await this._pollRepoPrReviews({
+                  repo,
+                  item,
+                  entityKey,
+                  baselineMs: prevMaxMs,
+                  linkedIssues,
+                  token,
+                  signal,
+                });
+                emitted += reviewRes.emitted;
+                if (reviewRes.ok) {
+                  nextSnapshot.lastReviewSyncAt = maxIsoTimestamp(
+                    reviewRes.latestReviewAt,
+                    item.updated_at,
+                  );
+                } else {
+                  initialReviewFetchFailed = true;
+                }
+              }
             }
           }
+        }
+
+        if (isInitialOpenBotPr && (initialCommentFetchFailed || initialReviewFetchFailed)) {
+          continue;
+        }
+        if (initialCommentFetchFailed) {
+          nextSnapshot.updatedAt = prevRepoMaxUpdatedAt || null;
+          nextSnapshot.commentsCount = 0;
+        } else if (initialReviewFetchFailed) {
+          nextSnapshot.updatedAt = prevRepoMaxUpdatedAt || null;
         }
 
         store.items[itemKey] = nextSnapshot;
@@ -1009,35 +1397,65 @@ export class GitHubPoller {
       }
 
       nextSnapshot.lastCommentSyncAt = prev.lastCommentSyncAt;
+      nextSnapshot.lastReviewSyncAt = prev.lastReviewSyncAt;
       let commentFetchFailed = false;
-      if (!isPinned && nextSnapshot.commentsCount > 0 && (commentsIncreased || updatedAtChanged)) {
-        const since = prev.lastCommentSyncAt || prev.updatedAt || undefined;
-        const baselineMs =
-          !prev.lastCommentSyncAt && updatedAtChanged && prev.updatedAt
-            ? Date.parse(prev.updatedAt)
-            : undefined;
-        const commentRes = await this._pollRepoIssueComments({
-          repo,
-          item,
-          isPr,
-          entityKey,
-          since,
-          baselineMs,
-          token,
-          signal,
-        });
-        emitted += commentRes.emitted;
-        if (commentRes.ok) {
-          nextSnapshot.lastCommentSyncAt = maxIsoTimestamp(
-            maxIsoTimestamp(prev.lastCommentSyncAt, commentRes.latestCommentAt),
-            item.updated_at,
-          );
-        } else {
-          commentFetchFailed = true;
+      let reviewFetchFailed = false;
+      if (!isPinned && (commentsIncreased || updatedAtChanged)) {
+        if (nextSnapshot.commentsCount > 0) {
+          const since = prev.lastCommentSyncAt || prev.updatedAt || undefined;
+          const baselineMs =
+            !prev.lastCommentSyncAt && updatedAtChanged && prev.updatedAt
+              ? Date.parse(prev.updatedAt)
+              : undefined;
+          const commentRes = await this._pollRepoIssueComments({
+            repo,
+            item,
+            isPr,
+            entityKey,
+            since,
+            baselineMs,
+            linkedIssues,
+            token,
+            signal,
+          });
+          emitted += commentRes.emitted;
+          if (commentRes.ok) {
+            nextSnapshot.lastCommentSyncAt = maxIsoTimestamp(
+              maxIsoTimestamp(prev.lastCommentSyncAt, commentRes.latestCommentAt),
+              item.updated_at,
+            );
+          } else {
+            commentFetchFailed = true;
+          }
+        }
+
+        if (isPr) {
+          const reviewBaselineMs =
+            !prev.lastReviewSyncAt && updatedAtChanged && prev.updatedAt
+              ? Date.parse(prev.updatedAt)
+              : undefined;
+          const reviewRes = await this._pollRepoPrReviews({
+            repo,
+            item,
+            entityKey,
+            baselineMs: reviewBaselineMs,
+            linkedIssues,
+            token,
+            signal,
+          });
+          emitted += reviewRes.emitted;
+          if (reviewRes.ok) {
+            nextSnapshot.lastReviewSyncAt = maxIsoTimestamp(
+              maxIsoTimestamp(prev.lastReviewSyncAt, reviewRes.latestReviewAt),
+              item.updated_at,
+            );
+          } else {
+            reviewFetchFailed = true;
+          }
         }
       }
 
-      if (diff.changes.length > 0) {
+      if (!skipHeadEvent && diff.changes.length > 0) {
         const trustLevel = this.classifyTrust(item.user);
         const eventType = diff.onlyLabelsChanged
           ? (isPr ? 'github.pr.labeled' : 'github.issue.labeled')
@@ -1067,6 +1485,7 @@ export class GitHubPoller {
             removedLabels: diff.removedLabels,
             changes: diff.changes,
             reactions: reactions?.raw,
+            ...(isPr && linkedIssues.length > 0 ? { linkedIssues } : {}),
           },
           rawRef: {
             url: item.html_url,
@@ -1081,6 +1500,8 @@ export class GitHubPoller {
       if (commentFetchFailed) {
         nextSnapshot.updatedAt = prev.updatedAt;
         nextSnapshot.commentsCount = prev.commentsCount;
+      } else if (reviewFetchFailed) {
+        nextSnapshot.updatedAt = prev.updatedAt;
       }
       store.items[itemKey] = nextSnapshot;
       storeDirty = true;

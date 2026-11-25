@@ -18,6 +18,7 @@ import {
   apply,
   normalizeConfig,
   createGitHubAuth,
+  extractLinkedIssues,
   GitHubPoller,
   GitHubGraphResolver,
   MAX_CONTEXT_CARD_CHARS,
@@ -794,6 +795,509 @@ test('poller: repo polling fetches incremental issue/PR comments on updated_at c
     assert.equal(events[0].type, 'github.issue.comment');
     assert.equal(events[0].actor.login, 'carol');
     assert.equal(events[0].summary, 'Confirmed fixed on latest build');
+  } finally {
+    db.close();
+  }
+});
+
+test('extractLinkedIssues: parses Fixes/Closes/Resolves variants, same-repo refs, ignores cross-repo and HTML comments', () => {
+  const repo = 'example-owner/example-repo';
+  assert.deepEqual(extractLinkedIssues(null, repo), []);
+  assert.deepEqual(extractLinkedIssues(undefined, repo), []);
+  assert.deepEqual(
+    extractLinkedIssues(
+      [
+        'Summary of changes',
+        'Fixes #243',
+        'fix #12, Fixed: #243',
+        'Closes EXAMPLE-OWNER/EXAMPLE-REPO#244',
+        'closed #8',
+        'Resolves other-owner/other-repo#999',
+        'resolve #15',
+        '<!-- Fixes #777 -->',
+      ].join('\n'),
+      repo,
+    ),
+    [8, 12, 15, 243, 244],
+  );
+});
+
+test('poller: bot-created open PR suppresses head event but captures human comments, PR reviews, inline review comments, and linkedIssues', async () => {
+  const db = openWatcherDb({ inMemory: true });
+  try {
+    const repo = 'example-owner/example-repo';
+    const config = normalizeConfig({
+      ownerLogins: ['example-owner'],
+      botLogin: 'example-bot[bot]',
+      enableNotifications: false,
+      repoMap: { [repo]: { localPath: '/tmp/example-repo' } },
+    });
+
+    const credentials = {
+      readSlot: async (): Promise<GitHubAuthToken> => ({
+        token: 'tok_read',
+        slot: 'read',
+        source: 'credentials',
+        isBot: false,
+        login: 'example-owner',
+      }),
+      clearCache: () => {},
+    };
+
+    const warnings: string[] = [];
+    let round = 1;
+    let failReviewsOnce = false;
+
+    const mockFetch = async (url: string): Promise<FetchResponseLike> => {
+      if (url.includes(`/repos/${repo}/issues?`)) {
+        if (round === 1) {
+          return makeResponse(
+            200,
+            [
+              {
+                id: 2450,
+                number: 245,
+                title: 'Automated fix for polling gap',
+                state: 'open',
+                comments: 2,
+                pull_request: { url: `https://api.github.com/repos/${repo}/pulls/245` },
+                user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+                body: 'Implements fix.\n\nFixes #243\nCloses example-owner/example-repo#244\nResolves external/other#999',
+                labels: [{ name: 'automation' }],
+                updated_at: '2026-11-20T11:00:00Z',
+                html_url: `https://github.com/${repo}/pull/245`,
+              },
+              {
+                id: 2460,
+                number: 246,
+                title: 'Human PR referencing issue',
+                state: 'open',
+                comments: 0,
+                pull_request: { url: `https://api.github.com/repos/${repo}/pulls/246` },
+                user: { id: 10, login: 'alice', type: 'User' },
+                body: 'Manual patch\n\nResolves #250',
+                labels: [],
+                updated_at: '2026-11-20T10:50:00Z',
+                html_url: `https://github.com/${repo}/pull/246`,
+              },
+            ],
+            { etag: '"etag-bot-pr-r1"' },
+          );
+        }
+
+        if (round === 2) {
+          return makeResponse(
+            200,
+            [
+              {
+                id: 2450,
+                number: 245,
+                title: 'Automated fix for polling gap (rebased)',
+                state: 'open',
+                comments: 2,
+                pull_request: { url: `https://api.github.com/repos/${repo}/pulls/245` },
+                user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+                body: 'Implements fix.\n\nFixes #243\nCloses example-owner/example-repo#244\nResolves external/other#999',
+                labels: [{ name: 'automation' }, { name: 'ready' }],
+                updated_at: '2026-11-20T11:10:00Z',
+                html_url: `https://github.com/${repo}/pull/245`,
+              },
+            ],
+            { etag: '"etag-bot-pr-r2"' },
+          );
+        }
+
+        return makeResponse(
+          200,
+          [
+            {
+              id: 2450,
+              number: 245,
+              title: 'Automated fix for polling gap (rebased)',
+              state: 'open',
+              comments: 2,
+              pull_request: { url: `https://api.github.com/repos/${repo}/pulls/245` },
+              user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+              body: 'Implements fix.\n\nFixes #243\nCloses example-owner/example-repo#244\nResolves external/other#999',
+              labels: [{ name: 'automation' }, { name: 'ready' }],
+              updated_at: '2026-11-20T11:20:00Z',
+              html_url: `https://github.com/${repo}/pull/245`,
+            },
+          ],
+          { etag: `"etag-bot-pr-r${round}"` },
+        );
+      }
+
+      if (url.includes(`/repos/${repo}/issues/245/comments`)) {
+        return makeResponse(200, [
+          {
+            id: 7001,
+            user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+            body: 'Bot summary checklist',
+            html_url: `https://github.com/${repo}/pull/245#issuecomment-7001`,
+            created_at: '2026-11-20T10:55:00Z',
+            updated_at: '2026-11-20T10:55:00Z',
+          },
+          {
+            id: 7002,
+            user: { id: 10, login: 'alice', type: 'User' },
+            body: 'Could you also cover edge case X?',
+            html_url: `https://github.com/${repo}/pull/245#issuecomment-7002`,
+            created_at: '2026-11-20T10:58:00Z',
+            updated_at: '2026-11-20T10:58:00Z',
+          },
+        ]);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/245/reviews?per_page=100`)) {
+        if (failReviewsOnce) {
+          failReviewsOnce = false;
+          return makeResponse(500, { message: 'Temporary failure' });
+        }
+        if (round === 1) {
+          return makeResponse(200, [
+            {
+              id: 8001,
+              user: { id: 1, login: 'example-owner', type: 'User' },
+              state: 'CHANGES_REQUESTED',
+              body: 'Please guard against empty arrays before indexing.',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8001`,
+              submitted_at: '2026-11-20T10:59:00Z',
+            },
+            {
+              id: 8002,
+              user: { id: 11, login: 'bob', type: 'User' },
+              state: 'PENDING',
+              body: 'Draft review not submitted yet',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8002`,
+            },
+            {
+              id: 8003,
+              user: { id: 11, login: 'bob', type: 'User' },
+              state: 'COMMENTED',
+              body: '',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8003`,
+              submitted_at: '2026-11-20T10:59:30Z',
+            },
+            {
+              id: 8004,
+              user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+              state: 'COMMENTED',
+              body: 'Bot self review should be dropped',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8004`,
+              submitted_at: '2026-11-20T10:59:45Z',
+            },
+          ]);
+        }
+        if (round === 2) {
+          return makeResponse(200, [
+            {
+              id: 8001,
+              user: { id: 1, login: 'example-owner', type: 'User' },
+              state: 'CHANGES_REQUESTED',
+              body: 'Please guard against empty arrays before indexing.',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8001`,
+              submitted_at: '2026-11-20T10:59:00Z',
+            },
+            {
+              id: 8002,
+              user: { id: 11, login: 'bob', type: 'User' },
+              state: 'COMMENTED',
+              body: 'Submitted review comment now',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8002`,
+              submitted_at: '2026-11-20T11:08:00Z',
+            },
+            {
+              id: 8005,
+              user: { id: 1, login: 'example-owner', type: 'User' },
+              state: 'APPROVED',
+              body: '',
+              html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8005`,
+              submitted_at: '2026-11-20T11:10:00Z',
+            },
+          ]);
+        }
+        return makeResponse(200, [
+          {
+            id: 8006,
+            user: { id: 12, login: 'carol', type: 'User' },
+            state: 'COMMENTED',
+            body: 'Recovered after transient 500',
+            html_url: `https://github.com/${repo}/pull/245#pullrequestreview-8006`,
+            submitted_at: '2026-11-20T11:20:00Z',
+          },
+        ]);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/245/comments?per_page=100`)) {
+        return makeResponse(200, [
+          {
+            id: 9001,
+            user: { id: 1, login: 'example-owner', type: 'User' },
+            path: 'src/poller.ts',
+            line: 42,
+            pull_request_review_id: 8001,
+            body: 'Handle missing cursor gracefully here.',
+            html_url: `https://github.com/${repo}/pull/245#discussion_r9001`,
+            created_at: '2026-11-20T10:59:00Z',
+            updated_at: '2026-11-20T10:59:00Z',
+          },
+          {
+            id: 9002,
+            user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+            path: 'src/poller.ts',
+            line: 42,
+            body: 'Automated reply from bot',
+            html_url: `https://github.com/${repo}/pull/245#discussion_r9002`,
+            created_at: '2026-11-20T10:59:10Z',
+            updated_at: '2026-11-20T10:59:10Z',
+          },
+        ]);
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const events: NormalizedEvent[] = [];
+    const poller = new GitHubPoller({
+      config,
+      credentials,
+      db,
+      logger: { warn: (msg: unknown) => warnings.push(String(msg)) },
+      fetchImpl: mockFetch,
+      onEvent: async (e) => {
+        events.push(e);
+      },
+    });
+
+    await poller.pollOnce();
+    const botPrEvents = events.filter((e) => e.entityKey === `github:${repo}#245`);
+    const humanPrEvents = events.filter((e) => e.entityKey === `github:${repo}#246`);
+    assert.equal(humanPrEvents.length, 1);
+    assert.equal(humanPrEvents[0].type, 'github.pr.updated');
+    assert.deepEqual(humanPrEvents[0].payload.linkedIssues, [250]);
+
+    assert.equal(botPrEvents.some((e) => e.type === 'github.pr.updated'), false);
+    assert.equal(botPrEvents.length, 3);
+    assert.ok(botPrEvents.every((e) => e.type === 'github.pr.comment'));
+    assert.ok(botPrEvents.every((e) => JSON.stringify(e.payload.linkedIssues) === JSON.stringify([243, 244])));
+
+    const regularComment = botPrEvents.find((e) => e.dedupeKey === `github:${repo}#245:comment:7002`);
+    assert.ok(regularComment);
+    assert.equal(regularComment.actor.login, 'alice');
+    assert.equal(regularComment.summary, 'Could you also cover edge case X?');
+
+    const changesReqReview = botPrEvents.find((e) => e.dedupeKey === `github:${repo}#245:review:8001`);
+    assert.ok(changesReqReview);
+    assert.equal(changesReqReview.actor.login, 'example-owner');
+    assert.equal(changesReqReview.trustLevel, 'owner');
+    assert.equal(changesReqReview.occurredAt, '2026-11-20T10:59:00Z');
+    assert.equal(changesReqReview.rawRef?.url, `https://github.com/${repo}/pull/245#pullrequestreview-8001`);
+    assert.match(changesReqReview.summary, /CHANGES_REQUESTED/);
+    assert.match(changesReqReview.summary, /empty arrays/);
+
+    const inlineComment = botPrEvents.find((e) => e.dedupeKey === `github:${repo}#245:review_comment:9001`);
+    assert.ok(inlineComment);
+    assert.equal(inlineComment.actor.login, 'example-owner');
+    assert.match(inlineComment.summary, /\[src\/poller\.ts:42\]/);
+    assert.match(inlineComment.summary, /Handle missing cursor gracefully here\./);
+    assert.equal(inlineComment.payload.path, 'src/poller.ts');
+    assert.equal(inlineComment.payload.line, 42);
+
+    events.length = 0;
+    round = 2;
+    await poller.pollOnce();
+    assert.equal(events.some((e) => e.type === 'github.pr.updated' || e.type === 'github.pr.labeled'), false);
+    assert.equal(events.length, 2);
+    assert.ok(events.some((e) => e.dedupeKey === `github:${repo}#245:review:8002` && e.actor.login === 'bob'));
+    const approved = events.find((e) => e.dedupeKey === `github:${repo}#245:review:8005`);
+    assert.ok(approved);
+    assert.match(approved.summary, /APPROVED/);
+    assert.deepEqual(approved.payload.linkedIssues, [243, 244]);
+
+    events.length = 0;
+    round = 3;
+    failReviewsOnce = true;
+    await poller.pollOnce();
+    assert.equal(events.length, 0);
+    assert.ok(warnings.some((w) => w.includes('HTTP 500')));
+
+    round = 4;
+    await poller.pollOnce();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].dedupeKey, `github:${repo}#245:review:8006`);
+    assert.equal(events[0].actor.login, 'carol');
+    assert.deepEqual(events[0].payload.linkedIssues, [243, 244]);
+  } finally {
+    db.close();
+  }
+});
+
+test('poller: retries !prev initial comment/review fetch on next poll after transient 500 without duplicating head event or seen items', async () => {
+  const db = openWatcherDb({ inMemory: true });
+  try {
+    const repo = 'example-owner/example-repo';
+    const config = normalizeConfig({
+      ownerLogins: ['example-owner'],
+      botLogin: 'example-bot[bot]',
+      enableNotifications: false,
+      repoMap: { [repo]: { localPath: '/tmp/example-repo' } },
+    });
+
+    const credentials = {
+      readSlot: async (): Promise<GitHubAuthToken> => ({
+        token: 'tok_read',
+        slot: 'read',
+        source: 'credentials',
+        isBot: false,
+        login: 'example-owner',
+      }),
+      clearCache: () => {},
+    };
+
+    const warnings: string[] = [];
+    let round = 1;
+    let failBotReviewsOnce = true;
+    let failHumanCommentsOnce = true;
+
+    const mockFetch = async (url: string): Promise<FetchResponseLike> => {
+      if (url.includes(`/repos/${repo}/issues?`)) {
+        const items: unknown[] = [
+          {
+            id: 3001,
+            number: 301,
+            title: 'Bot PR initial transient failure',
+            state: 'open',
+            comments: 1,
+            pull_request: { url: `https://api.github.com/repos/${repo}/pulls/301` },
+            user: { id: 900, login: 'example-bot[bot]', type: 'Bot' },
+            body: 'Fixes #300',
+            labels: [],
+            updated_at: '2026-11-20T12:00:00Z',
+            html_url: `https://github.com/${repo}/pull/301`,
+          },
+        ];
+        if (round >= 2) {
+          items.push({
+            id: 3002,
+            number: 302,
+            title: 'Human PR arriving after baseline',
+            state: 'open',
+            comments: 1,
+            pull_request: { url: `https://api.github.com/repos/${repo}/pulls/302` },
+            user: { id: 10, login: 'alice', type: 'User' },
+            body: 'Closes #305',
+            labels: [],
+            updated_at: '2026-11-20T12:10:00Z',
+            html_url: `https://github.com/${repo}/pull/302`,
+          });
+        }
+        return makeResponse(200, items, { etag: `"etag-init-retry-r${round}"` });
+      }
+
+      if (url.includes(`/repos/${repo}/issues/301/comments`)) {
+        return makeResponse(200, [
+          {
+            id: 9101,
+            user: { id: 10, login: 'alice', type: 'User' },
+            body: 'Initial human comment on bot PR',
+            html_url: `https://github.com/${repo}/pull/301#issuecomment-9101`,
+            created_at: '2026-11-20T11:59:00Z',
+            updated_at: '2026-11-20T11:59:00Z',
+          },
+        ]);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/301/reviews?per_page=100`)) {
+        if (failBotReviewsOnce) {
+          failBotReviewsOnce = false;
+          return makeResponse(500, { message: 'Transient review error' });
+        }
+        return makeResponse(200, [
+          {
+            id: 9201,
+            user: { id: 1, login: 'example-owner', type: 'User' },
+            state: 'CHANGES_REQUESTED',
+            body: 'Caught on retry after initial 500',
+            html_url: `https://github.com/${repo}/pull/301#pullrequestreview-9201`,
+            submitted_at: '2026-11-20T12:00:00Z',
+          },
+        ]);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/301/comments?per_page=100`)) {
+        return makeResponse(200, []);
+      }
+
+      if (url.includes(`/repos/${repo}/issues/302/comments`)) {
+        if (failHumanCommentsOnce) {
+          failHumanCommentsOnce = false;
+          return makeResponse(500, { message: 'Transient comment error' });
+        }
+        return makeResponse(200, [
+          {
+            id: 9301,
+            user: { id: 11, login: 'bob', type: 'User' },
+            body: 'Recovered initial comment on human PR',
+            html_url: `https://github.com/${repo}/pull/302#issuecomment-9301`,
+            created_at: '2026-11-20T12:09:00Z',
+            updated_at: '2026-11-20T12:09:00Z',
+          },
+        ]);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/302/reviews?per_page=100`)) {
+        return makeResponse(200, []);
+      }
+
+      if (url.endsWith(`/repos/${repo}/pulls/302/comments?per_page=100`)) {
+        return makeResponse(200, []);
+      }
+
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+
+    const events: NormalizedEvent[] = [];
+    const poller = new GitHubPoller({
+      config,
+      credentials,
+      db,
+      logger: { warn: (msg: unknown) => warnings.push(String(msg)) },
+      fetchImpl: mockFetch,
+      onEvent: async (e) => {
+        events.push(e);
+      },
+    });
+
+    await poller.pollOnce();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].dedupeKey, `github:${repo}#301:comment:9101`);
+    assert.ok(warnings.some((w) => w.includes('HTTP 500')));
+
+    events.length = 0;
+    round = 2;
+    await poller.pollOnce();
+    assert.equal(events.length, 2);
+    const retriedBotReview = events.find((e) => e.dedupeKey === `github:${repo}#301:review:9201`);
+    assert.ok(retriedBotReview);
+    assert.deepEqual(retriedBotReview.payload.linkedIssues, [300]);
+    const humanHead = events.find((e) => e.entityKey === `github:${repo}#302` && e.type === 'github.pr.updated');
+    assert.ok(humanHead);
+    assert.deepEqual(humanHead.payload.linkedIssues, [305]);
+
+    events.length = 0;
+    round = 3;
+    await poller.pollOnce();
+    assert.equal(events.length, 1);
+    assert.equal(events[0].type, 'github.pr.comment');
+    assert.equal(events[0].dedupeKey, `github:${repo}#302:comment:9301`);
+    assert.equal(events[0].actor.login, 'bob');
+    assert.deepEqual(events[0].payload.linkedIssues, [305]);
+
+    events.length = 0;
+    round = 4;
+    await poller.pollOnce();
+    assert.equal(events.length, 0);
   } finally {
     db.close();
   }
