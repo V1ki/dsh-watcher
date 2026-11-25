@@ -214,15 +214,55 @@ export function buildFastPathPrompt(input: FastPathPromptInput): string {
     if (cardText) sections.push(`## Persona\n${cardText}`);
   }
 
-  const eventItem = {
+  const rawBody = typeof event.payload?.body === 'string' ? event.payload.body : '';
+  const body = rawBody.trim() ? rawBody : event.summary;
+  const reviewState =
+    typeof event.payload?.reviewState === 'string' && event.payload.reviewState.trim()
+      ? event.payload.reviewState.trim()
+      : undefined;
+  const path =
+    typeof event.payload?.path === 'string' && event.payload.path.trim()
+      ? event.payload.path.trim()
+      : undefined;
+  const line =
+    typeof event.payload?.line === 'number' && Number.isFinite(event.payload.line)
+      ? event.payload.line
+      : undefined;
+  const eventItem: Record<string, unknown> = {
     id: event.id,
     type: event.type,
     actor: event.actor?.login ?? event.actor?.id ?? 'unknown',
     occurredAt: event.occurredAt,
     url: event.rawRef?.url,
-    body: typeof event.payload?.body === 'string' ? event.payload.body : event.summary,
+    summary: event.summary,
+    body,
+    ...(reviewState ? { reviewState } : {}),
+    ...(path ? { path } : {}),
+    ...(line !== undefined ? { line } : {}),
   };
   sections.push(`## External Event Data (${event.source}:${event.threadKey})\n\`\`\`json\n${JSON.stringify([eventItem], null, 2)}\n\`\`\``);
+
+  const decisionId =
+    subscription.owner === 'router' &&
+    typeof subscription.metadata?.decisionId === 'string' &&
+    subscription.metadata.decisionId.trim()
+      ? subscription.metadata.decisionId.trim()
+      : null;
+
+  if (decisionId) {
+    const linkedFromThreadKey =
+      typeof subscription.metadata?.linkedFromThreadKey === 'string' &&
+      subscription.metadata.linkedFromThreadKey.trim()
+        ? subscription.metadata.linkedFromThreadKey.trim()
+        : null;
+    const routerLines = [
+      `decisionId: ${decisionId}`,
+      ...(linkedFromThreadKey ? [`关联线索: ${linkedFromThreadKey} -> ${subscription.threadKey}`] : []),
+      `收到最新进展/审阅意见后继续处理，完成后务必调用 \`router_report_result\`（传入 \`decisionId\`: \`${decisionId}\`）用简短大白话汇报结果（改界面请附 \`imagePath\` 截图）。`,
+    ];
+    sections.push(`## Directive\n${routerLines.join('\n')}`);
+    return sections.join('\n\n');
+  }
 
   const directive = tier === 'autonomous'
     ? 'Complete the requested action or use `watch_stage_draft` to stage external replies.'

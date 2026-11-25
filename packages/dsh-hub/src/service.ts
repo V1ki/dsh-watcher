@@ -75,6 +75,42 @@ function previewOf(action: string, payload: Record<string, unknown>): string {
 
 const VALID_ACTION_TIERS = new Set<ActionTier>(['inbox-only', 'triage', 'review', 'autonomous']);
 
+function parsePositiveInt(value: unknown): number | null {
+  if (typeof value === 'number' && Number.isInteger(value) && value > 0) return value;
+  if (typeof value === 'string' && /^[1-9]\d*$/.test(value.trim())) return Number(value.trim());
+  return null;
+}
+
+function extractGitHubRepo(event: NormalizedEvent): string | null {
+  if (typeof event.rawRef?.repo === 'string' && event.rawRef.repo.trim()) {
+    return event.rawRef.repo.trim();
+  }
+  const payloadRepo = event.payload?.repo;
+  if (typeof payloadRepo === 'string' && payloadRepo.trim()) {
+    return payloadRepo.trim();
+  }
+  const match = /^github:([^#\s]+)#\d+$/.exec(event.threadKey);
+  return match?.[1]?.trim() || null;
+}
+
+function extractLinkedIssueNumbers(payload: Record<string, unknown> | undefined): number[] {
+  if (!payload) return [];
+  const nums: number[] = [];
+  const seen = new Set<number>();
+  const add = (value: unknown): void => {
+    const parsed = parsePositiveInt(value);
+    if (parsed !== null && !seen.has(parsed)) {
+      seen.add(parsed);
+      nums.push(parsed);
+    }
+  };
+  if (Array.isArray(payload.linkedIssues)) {
+    for (const item of payload.linkedIssues) add(item);
+  }
+  add(payload.linkedFromIssue);
+  return nums;
+}
+
 export class HubRuntime implements HubService {
   readonly db: WatcherDb;
   readonly guard: DoorGuard;
@@ -417,7 +453,10 @@ export class HubRuntime implements HubService {
       return { accepted: true, inboxId, routedVia: 'inbox' };
     }
 
-    const subscription = this.resolveSubscription(event.source, event.threadKey);
+    let subscription = this.resolveSubscription(event.source, event.threadKey);
+    if (!subscription && event.source === 'github') {
+      subscription = this.inheritGitHubLinkedSubscription(event);
+    }
     if (subscription) {
       const metaTier = subscription.metadata?.tier;
       const tier: ActionTier =
@@ -614,6 +653,33 @@ export class HubRuntime implements HubService {
     }
 
     return { accepted: true, inboxId, routedVia: 'rule' };
+  }
+
+  private inheritGitHubLinkedSubscription(event: NormalizedEvent): ThreadSubscription | null {
+    const linkedIssues = extractLinkedIssueNumbers(event.payload);
+    if (linkedIssues.length === 0) return null;
+    const repo = extractGitHubRepo(event);
+    if (!repo) return null;
+    for (const issueNum of linkedIssues) {
+      const parentThreadKey = `github:${repo}#${issueNum}`;
+      if (parentThreadKey === event.threadKey) continue;
+      const parentSub = this.resolveSubscription('github', parentThreadKey);
+      if (parentSub) {
+        return this.registerSubscription({
+          source: event.source,
+          threadKey: event.threadKey,
+          workstreamId: parentSub.workstreamId,
+          sessionId: parentSub.sessionId,
+          personaId: parentSub.personaId,
+          owner: parentSub.owner,
+          metadata: {
+            ...parentSub.metadata,
+            linkedFromThreadKey: parentSub.threadKey,
+          },
+        });
+      }
+    }
+    return null;
   }
 
   private upsertWorkstream(

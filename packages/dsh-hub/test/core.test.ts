@@ -546,3 +546,189 @@ test('registerAdminWechatHandler and dispatchAdminWechatMessage support ordered 
     db.close();
   }
 });
+
+function readDeliveredText(message: unknown): string {
+  const msg = message as { content?: Array<{ text?: string }> } | undefined;
+  return msg?.content?.map((item) => item.text ?? '').join('\n') ?? '';
+}
+
+test('GitHub PR inherits active Issue router subscription, forwards decisionId prompt, and reuses subscription on follow-ups', async () => {
+  const db = openHubDb({ inMemory: true });
+  try {
+    const guard = createDoorGuard();
+    const { ctx, sent, agents } = makeMockSessionContext();
+    agents.set('sess-issue-243', {
+      session: { id: 'sess-issue-243' },
+      state: { running: false },
+      followup: (msg) => {
+        sent.push({ sessionId: 'sess-issue-243', mode: 'followup', message: msg });
+      },
+      whenIdle: async () => {},
+    });
+    agents.set('sess-manual', {
+      session: { id: 'sess-manual' },
+      state: { running: false },
+      followup: (msg) => {
+        sent.push({ sessionId: 'sess-manual', mode: 'followup', message: msg });
+      },
+      whenIdle: async () => {},
+    });
+    const bridge = createSessionBridge(ctx, db, null);
+    const service = createHubService(undefined, { db, guard, sessionBridge: bridge });
+
+    const now = new Date().toISOString();
+    const ttl = new Date(Date.now() + 3600_000).toISOString();
+    db.db
+      .prepare(
+        `INSERT INTO workstreams (
+           id, source, workstream_key, primary_entity_key, entity_keys_json,
+           workspace_path, session_id, status, mode, trust_mode,
+           delivery_count, max_wakeups, ttl_expires_at, config_revision, created_at, updated_at
+         ) VALUES ('ws-243', 'github', 'github:example-owner/example-repo#243', 'github:example-owner/example-repo#243', '["github:example-owner/example-repo#243"]', '/repo/example', 'sess-issue-243', 'active', 'repeat', 'triage', 0, 10, ?, 1, ?, ?)`,
+      )
+      .run(ttl, now, now);
+
+    service.registerSubscription({
+      source: 'github',
+      threadKey: 'github:example-owner/example-repo#243',
+      sessionId: 'sess-issue-243',
+      workstreamId: 'ws-243',
+      personaId: 'persona-gh',
+      owner: 'router',
+      metadata: {
+        decisionId: 'dec-243',
+        level: 'act',
+      },
+    });
+
+    let unclaimedCalls = 0;
+    const offUnclaimed = service.onUnclaimedEvent(async () => {
+      unclaimedCalls += 1;
+      return { handled: true };
+    });
+
+    const prRes = await service.ingest(
+      makeEvent({
+        id: 'evt-pr-246-review-1',
+        type: 'github.pr.comment',
+        threadKey: 'github:example-owner/example-repo#246',
+        entityKey: 'github:example-owner/example-repo#246',
+        summary: '[src/panel.ts:42] Please adjust the button padding and add a screenshot.',
+        payload: {
+          body: 'Please adjust the button padding and add a screenshot.',
+          path: 'src/panel.ts',
+          line: 42,
+          linkedIssues: [243],
+        },
+        rawRef: {
+          repo: 'example-owner/example-repo',
+          number: 246,
+          url: 'https://github.com/example-owner/example-repo/pull/246#discussion_r1',
+        },
+      }),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(prRes.accepted, true);
+    assert.equal(prRes.routedVia, 'subscription');
+    assert.equal(unclaimedCalls, 0);
+
+    const inheritedSub = service.resolveSubscription('github', 'github:example-owner/example-repo#246');
+    assert.ok(inheritedSub);
+    assert.equal(inheritedSub.sessionId, 'sess-issue-243');
+    assert.equal(inheritedSub.workstreamId, 'ws-243');
+    assert.equal(inheritedSub.personaId, 'persona-gh');
+    assert.equal(inheritedSub.owner, 'router');
+    assert.equal(inheritedSub.metadata.decisionId, 'dec-243');
+    assert.equal(inheritedSub.metadata.level, 'act');
+    assert.equal(inheritedSub.metadata.linkedFromThreadKey, 'github:example-owner/example-repo#243');
+
+    assert.equal(sent.length, 1);
+    assert.equal(sent[0]?.sessionId, 'sess-issue-243');
+    const firstPrompt = readDeliveredText(sent[0]?.message);
+    assert.match(firstPrompt, /"summary": "\[src\/panel\.ts:42\] Please adjust the button padding and add a screenshot\."/);
+    assert.match(firstPrompt, /"path": "src\/panel\.ts"/);
+    assert.match(firstPrompt, /"line": 42/);
+    assert.match(firstPrompt, /decisionId: dec-243/);
+    assert.match(firstPrompt, /github:example-owner\/example-repo#243/);
+    assert.match(firstPrompt, /router_report_result/);
+    assert.match(firstPrompt, /imagePath/);
+
+    const followUpRes = await service.ingest(
+      makeEvent({
+        id: 'evt-pr-246-approved-empty-body',
+        type: 'github.pr.comment',
+        threadKey: 'github:example-owner/example-repo#246',
+        entityKey: 'github:example-owner/example-repo#246',
+        summary: '[APPROVED] example-reviewer approved PR #246',
+        payload: {
+          body: '',
+          reviewState: 'APPROVED',
+        },
+      }),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(followUpRes.accepted, true);
+    assert.equal(followUpRes.routedVia, 'subscription');
+    assert.equal(unclaimedCalls, 0);
+    assert.equal(sent.length, 2);
+    assert.equal(sent[1]?.sessionId, 'sess-issue-243');
+    const secondPrompt = readDeliveredText(sent[1]?.message);
+    assert.match(secondPrompt, /"summary": "\[APPROVED\] example-reviewer approved PR #246"/);
+    assert.match(secondPrompt, /"body": "\[APPROVED\] example-reviewer approved PR #246"/);
+    assert.match(secondPrompt, /"reviewState": "APPROVED"/);
+    assert.match(secondPrompt, /decisionId: dec-243/);
+    assert.match(secondPrompt, /router_report_result/);
+
+    const linkedFromRes = await service.ingest(
+      makeEvent({
+        id: 'evt-pr-247-linked-from',
+        type: 'pull_request_review',
+        threadKey: 'github:example-owner/example-repo#247',
+        entityKey: 'github:example-owner/example-repo#247',
+        summary: 'Linked PR #247 via linkedFromIssue',
+        payload: {
+          body: 'Checking linkedFromIssue compatibility.',
+          linkedFromIssue: 243,
+        },
+      }),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(linkedFromRes.accepted, true);
+    assert.equal(linkedFromRes.routedVia, 'subscription');
+    assert.equal(unclaimedCalls, 0);
+    const inheritedFromSingle = service.resolveSubscription('github', 'github:example-owner/example-repo#247');
+    assert.equal(inheritedFromSingle?.sessionId, 'sess-issue-243');
+    assert.equal(inheritedFromSingle?.metadata.linkedFromThreadKey, 'github:example-owner/example-repo#243');
+
+    service.registerSubscription({
+      source: 'github',
+      threadKey: 'github:example-owner/example-repo#300',
+      sessionId: 'sess-manual',
+      owner: 'manual',
+      metadata: {
+        decisionId: 'ignored-for-non-router',
+      },
+    });
+    const manualRes = await service.ingest(
+      makeEvent({
+        id: 'evt-manual-300',
+        threadKey: 'github:example-owner/example-repo#300',
+        entityKey: 'github:example-owner/example-repo#300',
+        payload: { body: 'Manual watch event' },
+      }),
+    );
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(manualRes.routedVia, 'subscription');
+    const manualPrompt = readDeliveredText(sent[sent.length - 1]?.message);
+    assert.doesNotMatch(manualPrompt, /router_report_result/);
+    assert.match(manualPrompt, /watch_stage_draft/);
+
+    offUnclaimed();
+  } finally {
+    db.close();
+  }
+});
