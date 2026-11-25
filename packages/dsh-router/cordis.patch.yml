@@ -1,0 +1,4 @@
+# @local/dsh-router Cordis mount manifest
+- insert:
+    - id: router
+      name: "@local/dsh-router"

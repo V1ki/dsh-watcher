@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib",
+    "module": "none",
+    "moduleResolution": "classic",
+    "moduleDetection": "legacy",
+    "verbatimModuleSyntax": false,
+    "declaration": true,
+    "types": []
+  },
+  "include": ["src/client.ts"],
+  "exclude": []
+}
