@@ -219,15 +219,16 @@ function nativeFixture(options: NativeFixtureOptions = {}) {
     }
     if (m === 'findText') {
       const mention = p.text === '群中备注';
+      const quoteMenu = p.text === '引用' || (p.text === '' && p.limit === 60);
       const matches: FindTextMatch[] = Array.from(
         { length: mention && options.duplicatePicker ? 2 : 1 },
         () => ({
           windowId: 1,
-          confidence: !mention && p.text !== '引用' && options.lowQuoteConfidence ? 0.5 : 1,
-          text: mention ? String(p.text) : p.text === '引用' ? '引用' : '约在下午三点,带上资料',
+          confidence: !mention && !quoteMenu && options.lowQuoteConfidence ? 0.5 : 1,
+          text: mention ? String(p.text) : quoteMenu ? '引用' : '约在下午三点,带上资料',
           rect: mention
             ? { x: 300, y: 560, width: 60, height: 20 }
-            : p.text === '引用'
+            : quoteMenu
               ? { x: 400, y: 400, width: 40, height: 20 }
               : { x: 320, y: 220, width: 180, height: 20 },
         }),
@@ -555,7 +556,7 @@ test('long Chinese nickname uses wider/taller OCR band, retries animating picker
       };
     }
     if (m === 'findText') {
-      if (p.text === '引用') {
+      if (p.text === '引用' || (p.text === '' && p.limit === 60)) {
         result = {
           matches: [{ windowId: 1, confidence: 1, text: '引用', rect: { x: 400, y: 400, width: 40, height: 20 } }],
         };
@@ -710,7 +711,7 @@ test('mention failure cleanup re-focuses editor if Escape blurs it, then clears 
       };
     }
     if (m === 'findText') {
-      if (p.text === '引用') {
+      if (p.text === '引用' || (p.text === '' && p.limit === 60)) {
         result = {
           matches: [{ windowId: 1, confidence: 1, text: '引用', rect: { x: 400, y: 400, width: 40, height: 20 } }],
         };

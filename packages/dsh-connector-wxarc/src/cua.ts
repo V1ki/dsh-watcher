@@ -35,7 +35,7 @@ export interface CuaAppState {
     };
     window?: CuaWindowInfo;
   };
-  windows?: Array<{ id?: number; title?: string }>;
+  windows?: Array<{ id?: number; title?: string; isFocused?: boolean }>;
   text?: string;
   accessibility?: {
     nodes?: CuaNode[];
@@ -139,7 +139,80 @@ const exec: CuaRunner = async (file, args, options) => {
 };
 const APP = 'com.tencent.xinWeChat';
 
-class QuoteLocationUnavailable extends Error {}
+class QuoteUnavailableError extends Error {
+  readonly menuOpened: boolean;
+  readonly clickedMenu: boolean;
+  readonly windowId?: number;
+  readonly fallbackDetail: string;
+
+  constructor(
+    message: string,
+    options: {
+      menuOpened: boolean;
+      clickedMenu?: boolean;
+      windowId?: number;
+      fallbackDetail: string;
+    },
+  ) {
+    super(message);
+    this.menuOpened = options.menuOpened;
+    this.clickedMenu = Boolean(options.clickedMenu);
+    this.windowId = options.windowId;
+    this.fallbackDetail = options.fallbackDetail;
+  }
+}
+
+const QUOTE_MENU_ITEM_RE = /^[\p{P}\p{S}口□回日白品目OQGD0689]{0,4}引用$/u;
+const QUOTE_MENU_NEIGHBOR_RE =
+  /^[\p{P}\p{S}口□回日白品目OQGD0689]{0,4}(?:复制|转发|收藏|多选|搜一搜|翻译|删除|撤回|提醒)$/u;
+const MAX_MENU_LINE_HEIGHT = 44;
+const MENU_COLUMN_TOLERANCE_PX = 60;
+
+const compactOcr = (text?: string): string =>
+  (text || '').normalize('NFKC').replace(/\s+/g, '');
+
+const isSingleLineMatch = (m: CuaOcrMatch): boolean =>
+  Boolean(m.rect && m.rect.width > 0 && m.rect.height > 0 && m.rect.height <= MAX_MENU_LINE_HEIGHT);
+
+const menuColumnX = (items: CuaOcrMatch[]): number | null => {
+  if (items.length === 0) return null;
+  let bestCluster: CuaOcrMatch[] = [];
+  for (const anchor of items) {
+    const cluster = items.filter(
+      (item) => Math.abs(item.rect.x - anchor.rect.x) <= MENU_COLUMN_TOLERANCE_PX,
+    );
+    if (cluster.length > bestCluster.length) bestCluster = cluster;
+  }
+  const xs = bestCluster.map((item) => item.rect.x).sort((a, b) => a - b);
+  return xs[Math.floor(xs.length / 2)];
+};
+
+const evaluateQuoteMenu = (
+  matches: CuaOcrMatch[],
+): { match?: CuaOcrMatch; ambiguous: boolean; hasNeighbors: boolean } => {
+  const validLines = matches.filter(isSingleLineMatch);
+  const neighbors = validLines.filter((m) => QUOTE_MENU_NEIGHBOR_RE.test(compactOcr(m.text)));
+  const rawQuotes = validLines.filter((m) => QUOTE_MENU_ITEM_RE.test(compactOcr(m.text)));
+  const colX = menuColumnX(neighbors);
+  const candidates =
+    colX === null
+      ? rawQuotes
+      : rawQuotes.filter((m) => Math.abs(m.rect.x - colX) <= MENU_COLUMN_TOLERANCE_PX);
+  return {
+    match: candidates.length === 1 ? candidates[0] : undefined,
+    ambiguous: candidates.length > 1,
+    hasNeighbors: neighbors.length > 0,
+  };
+};
+
+const summarizeOcr = (matches: CuaOcrMatch[]): string => {
+  const items = matches
+    .map((m) => String(m.text || '').replace(/\s+/g, ' ').trim())
+    .filter(Boolean);
+  if (items.length === 0) return '空';
+  const joined = items.slice(0, 12).join(' | ');
+  return joined.length > 160 ? joined.slice(0, 157) + '...' : joined;
+};
 
 const quoteEvent = (job: { quoteEvent?: CuaEvent; event: CuaEvent }): CuaEvent =>
   job.quoteEvent || job.event;
@@ -970,68 +1043,165 @@ export class SwiftCua {
     return undefined;
   }
 
+  async ensureMainWindowFocused(
+    state: CuaAppState,
+    title: string,
+    signal: AbortSignal,
+  ): Promise<CuaAppState> {
+    const w = state.info?.window;
+    if (!w) return state;
+    const windows = state.windows || [];
+    if (windows.length === 0) return state;
+    const mainWin = windows.find((win) => win.id === w.id);
+    const otherFocused = windows.some((win) => win.id !== w.id && win.isFocused === true);
+    const hasFocusFlag = windows.some((win) => typeof win.isFocused === 'boolean');
+    const needsRaise =
+      mainWin?.isFocused === false || otherFocused || (hasFocusFlag && !mainWin?.isFocused);
+    if (!needsRaise) return state;
+    const winNodes = flatten(state.accessibility?.nodes).filter(
+      (n) => n.role === 'AXWindow' && Number.isInteger(n.index),
+    );
+    if (winNodes.length === 1) {
+      await this.call(
+        'axAction',
+        { elementIndex: winNodes[0].index, windowId: w.id, action: 'AXRaise' },
+        signal,
+        true,
+      );
+      await this.pause(150, signal);
+      state = await this.state(signal);
+    } else {
+      const { input } = this.chat(state, title);
+      if (input.frame) {
+        await this.clickFrame(input.frame, signal);
+        await this.pause(150, signal);
+        state = await this.state(signal);
+      }
+    }
+    const refreshed = this.chat(state, title);
+    if (refreshed.input.value || refreshed.nodes.some((n) => n.title === '删除引用消息')) {
+      throw Error('聚焦微信主窗口后出现了草稿或引用，未覆盖');
+    }
+    return state;
+  }
+
   async prepareQuote(job: CuaJob, state: CuaAppState, signal: AbortSignal): Promise<CuaAppState> {
     const event = quoteEvent(job);
     const typedEvent = event as { kind: string; local_type: number; text: string };
     if (event.local_type !== 1 && !isQuote(typedEvent)) {
-      throw new Error('当前仅支持原生引用文字消息');
+      throw new QuoteUnavailableError('当前仅支持原生引用文字消息', {
+        menuOpened: false,
+        fallbackDetail: '当前仅支持原生引用文字消息，已取消引用并直接回复',
+      });
     }
+    state = await this.ensureMainWindowFocused(state, job.rule.title, signal);
     state = await this.focusInput(state, job.rule.title, signal);
     const body = messageBody(typedEvent);
     const { nodes } = this.chat(state, job.rule.title);
-    const bubble = one(
-      nodes,
+    const bubbles = nodes.filter(
       (n) =>
         n.identifier === 'chat_bubble_item_view' &&
         (n.title === body ||
           Boolean(n.title?.startsWith(body + '\n引用 ')) ||
           (isQuote(typedEvent) && Boolean(n.title?.startsWith(body + '\n')))),
-      '无法唯一定位需要引用的原消息',
     );
+    if (bubbles.length !== 1) {
+      throw new QuoteUnavailableError('无法唯一定位需要引用的原消息', {
+        menuOpened: false,
+        fallbackDetail: '无法唯一定位需要引用的原消息，已取消引用并直接回复',
+      });
+    }
+    const bubble = bubbles[0];
     const list = one(nodes, (n) => n.identifier === 'chat_message_list', '找不到聊天消息列表');
     if (!this.inside(bubble.frame, list.frame)) {
-      throw new Error('需要引用的消息没有完整显示');
+      throw new QuoteUnavailableError('需要引用的消息没有完整显示', {
+        menuOpened: false,
+        fallbackDetail: '需要引用的消息没有完整显示，已取消引用并直接回复',
+      });
     }
     const hits = await this.visibleText(state, body.slice(0, 4), bubble.frame, signal);
     const candidates = hits.filter(
       (m) => (m.confidence ?? 0) >= 0.85 && ocrText(body).startsWith(ocrText(m.text)),
     );
     if (candidates.length !== 1) {
-      throw new QuoteLocationUnavailable('无法确定原消息气泡中的文字位置');
+      throw new QuoteUnavailableError('无法确定原消息气泡中的文字位置', {
+        menuOpened: false,
+        fallbackDetail: '原消息引用位置无法可靠识别，已取消引用并直接回复',
+      });
     }
     const hit = candidates[0];
     const w = state.info?.window;
     if (!w) throw new Error('缺少微信窗口标识');
     const x = hit.rect.x + hit.rect.width / 2;
     const y = hit.rect.y + hit.rect.height / 2;
-    await this.call(
-      'click',
-      { x, y, windowId: w.id, coordinateSpace: 'window', strategy: 'coordinate', mouseButton: 'right' },
-      signal,
-      true,
-    );
-    await this.pause(200, signal);
-    const found = (await this.call(
-      'findText',
-      {
-        text: '引用',
-        ocrOnly: true,
-        composited: true,
-        windowId: w.id,
-        region: {
-          x: Math.max(0, w.bounds.x + x - 220),
-          y: Math.max(0, w.bounds.y + y - 400),
-          width: 460,
-          height: 800,
+    const region: Rect = {
+      x: Math.max(0, w.bounds.x + x - 220),
+      y: Math.max(0, w.bounds.y + y - 400),
+      width: 460,
+      height: 800,
+    };
+    const scanMenu = async (): Promise<CuaOcrMatch[]> => {
+      const found = (await this.call(
+        'findText',
+        {
+          text: '',
+          exact: false,
+          ocrOnly: true,
+          composited: true,
+          windowId: w.id,
+          region,
+          limit: 60,
         },
-      },
-      signal,
-    )) as { matches?: CuaOcrMatch[] };
-    const menu = one(
-      found.matches || [],
-      (m) => m.windowId === w.id && /^[\p{P}\p{S}\s]*引用$/u.test(m.text),
-      '找不到微信原生引用菜单',
-    );
+        signal,
+      )) as { matches?: CuaOcrMatch[] };
+      return (found.matches || []).filter((m) => m.windowId === w.id);
+    };
+    let menu: CuaOcrMatch | undefined;
+    let lastObserved = '空';
+    let lastAmbiguous = false;
+    for (let step = 0; step < 3; step++) {
+      if (step === 0) {
+        await this.call(
+          'click',
+          { x, y, windowId: w.id, coordinateSpace: 'window', strategy: 'coordinate', mouseButton: 'right' },
+          signal,
+          true,
+        );
+        await this.pause(250, signal);
+      } else if (step === 1) {
+        await this.pause(250, signal);
+      } else {
+        await this.call(
+          'click',
+          { x, y, windowId: w.id, coordinateSpace: 'window', strategy: 'coordinate', mouseButton: 'right' },
+          signal,
+          true,
+        );
+        await this.pause(300, signal);
+      }
+      const matches = await scanMenu();
+      lastObserved = summarizeOcr(matches);
+      const evaluated = evaluateQuoteMenu(matches);
+      if (evaluated.match) {
+        menu = evaluated.match;
+        break;
+      }
+      lastAmbiguous = evaluated.ambiguous;
+      if (evaluated.hasNeighbors) {
+        break;
+      }
+    }
+    if (!menu) {
+      const reason = lastAmbiguous
+        ? `找不到微信原生引用菜单（命中多项，OCR=${lastObserved}）`
+        : `找不到微信原生引用菜单（OCR=${lastObserved}）`;
+      throw new QuoteUnavailableError(reason, {
+        menuOpened: true,
+        clickedMenu: false,
+        windowId: w.id,
+        fallbackDetail: `${reason}，已取消引用并直接回复`,
+      });
+    }
     await this.call(
       'click',
       {
@@ -1046,7 +1216,18 @@ export class SwiftCua {
     );
     await this.pause(200, signal);
     const prepared = await this.state(signal);
-    this.quotePreview(prepared, job);
+    this.chat(prepared, job.rule.title);
+    try {
+      this.quotePreview(prepared, job);
+    } catch (previewError) {
+      const reason = previewError instanceof Error ? previewError.message : String(previewError);
+      throw new QuoteUnavailableError(reason, {
+        menuOpened: true,
+        clickedMenu: true,
+        windowId: w.id,
+        fallbackDetail: `${reason}，已取消引用并直接回复`,
+      });
+    }
     return prepared;
   }
 
@@ -1449,30 +1630,69 @@ export class SwiftCua {
     }
     if (!hasTrigger(state, quoteEvent(job))) {
       const { replyTo, ...decision } = job.decision;
+      const note = replyTo
+        ? '当前会话未显示触发原消息，已取消引用并直接回复'
+        : '当前会话未显示触发原消息，已直接回复';
       job = {
         ...job,
         decision,
-        deliveryDetail: replyTo
-          ? '当前会话未显示触发原消息，已取消引用并直接回复'
-          : '当前会话未显示触发原消息，已直接回复',
+        deliveryDetail: [job.deliveryDetail, note].filter(Boolean).join('；'),
       };
     }
     if (job.decision.replyTo === 'current') {
       try {
         state = await this.prepareQuote(job, state, signal);
       } catch (error) {
-        if (!(error instanceof QuoteLocationUnavailable)) throw error;
+        if (!(error instanceof QuoteUnavailableError)) throw error;
         signal.throwIfAborted();
-        state = await this.state(signal);
-        const checked = this.chat(state, job.rule.title);
-        if (checked.input.value || checked.nodes.some((n) => n.title === '删除引用消息')) {
-          throw Error('引用定位失败后出现了草稿或引用，未覆盖');
+        if (error.menuOpened) {
+          await this.call(
+            'pressKey',
+            { key: 'Escape', ...(error.windowId ? { windowId: error.windowId } : {}) },
+            signal,
+            true,
+          );
+          await this.pause(150, signal);
+          state = await this.state(signal);
+          let checked = this.chat(state, job.rule.title);
+          if (checked.input.value) {
+            throw Error('引用失败清理前出现了草稿或引用，未覆盖');
+          }
+          const removeButtons = checked.nodes.filter((n) => n.title === '删除引用消息');
+          if (removeButtons.length > 0) {
+            if (!error.clickedMenu) {
+              throw Error('引用失败清理前出现了草稿或引用，未覆盖');
+            }
+            if (removeButtons.length !== 1) {
+              throw Error('引用失败后无法唯一清理错误引用，未覆盖');
+            }
+            await this.clickFrame(removeButtons[0].frame, signal);
+            await this.pause(150, signal);
+            state = await this.state(signal);
+            checked = this.chat(state, job.rule.title);
+            if (checked.input.value || checked.nodes.some((n) => n.title === '删除引用消息')) {
+              throw Error('引用失败后未能安全清理错误引用，未覆盖');
+            }
+          }
+          await this.clickFrame(checked.input.frame, signal);
+          await this.pause(100, signal);
+          state = await this.state(signal);
+          checked = this.chat(state, job.rule.title);
+          if (checked.input.value || checked.nodes.some((n) => n.title === '删除引用消息')) {
+            throw Error('引用失败清理后出现了草稿或引用，未覆盖');
+          }
+        } else {
+          state = await this.state(signal);
+          const checked = this.chat(state, job.rule.title);
+          if (checked.input.value || checked.nodes.some((n) => n.title === '删除引用消息')) {
+            throw Error('引用定位失败后出现了草稿或引用，未覆盖');
+          }
         }
         const { replyTo: _removedReplyTo, ...decision } = job.decision;
         job = {
           ...job,
           decision,
-          deliveryDetail: '原消息引用位置无法可靠识别，已取消引用并直接回复',
+          deliveryDetail: [job.deliveryDetail, error.fallbackDetail].filter(Boolean).join('；'),
         };
       }
     }

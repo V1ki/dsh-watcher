@@ -2072,8 +2072,10 @@ export class Automation {
         }
         const fresh = await this.identify(target.event, signal);
         freshEvent = fresh;
-        if (target.quote && fresh.mentions?.quoteUnique === false) {
-          throw Error('原文在本会话重复，无法唯一定位对应的引用消息');
+        let useQuote = target.quote;
+        if (useQuote && fresh.mentions?.quoteUnique === false) {
+          useQuote = false;
+          detailPartsInit.unshift('原文在本会话重复，已取消引用并直接回复');
         }
         const canMentionSender = Boolean(
           target.mention && fresh.senderIdentity?.uiName && fresh.senderIdentity.uniqueUiName,
@@ -2107,7 +2109,7 @@ export class Automation {
           quoteEvent: fresh,
           mention: resolvedMentions[0] ?? null,
           mentions: resolvedMentions,
-          decision: { ...decision, action: 'reply', ...(target.quote ? { replyTo: 'current' } : {}) },
+          decision: { ...decision, action: 'reply', ...(useQuote ? { replyTo: 'current' } : {}) },
           ...(baseDetail ? { deliveryDetail: baseDetail } : {}),
         };
         job.event = {
@@ -2117,7 +2119,7 @@ export class Automation {
             sourceKey: fresh.sourceKey,
             senderId: fresh.senderId,
             mention: resolvedMentions.length > 0,
-            quote: target.quote,
+            quote: useQuote,
           },
           ...(resolvedMentions.length
             ? {

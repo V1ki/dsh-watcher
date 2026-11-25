@@ -20,12 +20,29 @@ interface OriginalMsgRow {
 
 export const OBSTRUCTED = '微信会话列表被遮挡，没有可核对的点击位置；未点击或发送';
 
-export const retryableDetail = (detail: string): boolean =>
-  [
-    OBSTRUCTED,
-    '当前会话中未找到触发回复的原消息',
-    '无法确定原消息气泡中的文字位置',
-  ].includes(detail);
+const RETRYABLE_EXACT_DETAILS = [
+  OBSTRUCTED,
+  '当前会话中未找到触发回复的原消息',
+  '无法确定原消息气泡中的文字位置',
+  '原文在本会话重复，无法唯一定位对应的引用消息',
+  '无法唯一定位需要引用的原消息',
+  '需要引用的消息没有完整显示',
+  '没有唯一的微信引用框',
+  '微信引用框中的发言人或原文不一致',
+];
+
+const RETRYABLE_DETAIL_PREFIXES = [
+  '找不到微信原生引用菜单',
+  '无法唯一确认微信原生引用菜单',
+];
+
+export const retryableDetail = (detail: string): boolean => {
+  const text = (detail || '').trim();
+  if (!text) return false;
+  if (RETRYABLE_EXACT_DETAILS.includes(text)) return true;
+  if (text.includes('未覆盖') || text.includes('无法安全清理')) return false;
+  return RETRYABLE_DETAIL_PREFIXES.some((prefix) => text.startsWith(prefix));
+};
 
 export function archiveHistory(
   home: string,

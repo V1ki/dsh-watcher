@@ -1246,6 +1246,35 @@ test('multiple native mentions skip quotation in delivery but retain the selecte
   assert.equal(f.auto.job(j.id).status, 'sent');
 });
 
+test('duplicate quote source degrades safely by dropping replyTo while preserving native mention and reply text', async (t) => {
+  const f = debounced(t);
+  nativeMentions(f);
+  const identify = f.auto.identify;
+  f.auto.identify = async (e) => {
+    const r = await identify(e);
+    r.mentions.quoteUnique = false;
+    return r;
+  };
+  f.push(1, 'a', '@小助手 收到请回复');
+  await f.auto.collect();
+  f.advance(10000);
+  await f.auto.process();
+  const j = f.auto.jobs().find((job) => job.status === 'agent_running')!;
+  f.done(
+    f.bridge.run(j.event.dshRunId)!,
+    '{"action":"reply","text":"好的，马上安排。","replyTo":"message:1"}',
+  );
+  await f.auto.process();
+  assert.equal(f.sent.length, 1);
+  assert.equal(f.sent[0].mention.id, 'a');
+  assert.equal(f.sent[0].decision.text, '好的，马上安排。');
+  assert.equal(f.sent[0].decision.replyTo, undefined);
+  assert.equal(f.sent[0].deliveryDetail, '原文在本会话重复，已取消引用并直接回复');
+  assert.equal(f.auto.job(j.id).event.deliveryReplyTarget.quote, false);
+  assert.equal(f.auto.job(j.id).status, 'sent');
+  assert.match(f.auto.job(j.id).detail, /原文在本会话重复，已取消引用并直接回复/);
+});
+
 test('single unbatched mention receives compact numbering and fixed rules only in system prompt', async (t) => {
   const f = setup(t);
   const e = {
