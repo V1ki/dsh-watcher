@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "src",
+    "outDir": "lib",
+    "module": "none",
+    "moduleResolution": "classic",
+    "moduleDetection": "legacy",
+    "verbatimModuleSyntax": false,
+    "declaration": true,
+    "removeComments": true,
+    "types": []
+  },
+  "include": ["src/client.ts"],
+  "exclude": []
+}

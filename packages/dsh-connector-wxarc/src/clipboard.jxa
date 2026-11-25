@@ -1,0 +1,46 @@
+// macOS JXA bridge: preserve all clipboard representations, not just plain text.
+ObjC.import('AppKit');
+ObjC.import('Foundation');
+function run() {
+  const data=$.NSFileHandle.fileHandleWithStandardInput.readDataToEndOfFile;
+  const request=JSON.parse(ObjC.unwrap($.NSString.alloc.initWithDataEncoding(data,$.NSUTF8StringEncoding)));
+  const pb=$.NSPasteboard.generalPasteboard;
+  if(request.action==='snapshot') {
+    const saved=[],items=pb.pasteboardItems;
+    for(let i=0;i<items.count;i++) {
+      const item=items.objectAtIndex(i),types=item.types,result={};
+      for(let j=0;j<types.count;j++) { const type=types.objectAtIndex(j),bytes=item.dataForType(type);if(bytes && typeof bytes.base64EncodedStringWithOptions==="function")result[ObjC.unwrap(type)]=ObjC.unwrap(bytes.base64EncodedStringWithOptions(0)); }
+      saved.push(result);
+    }
+    return JSON.stringify({count:Number(pb.changeCount),items:saved});
+  }
+  if(request.action==='read')return JSON.stringify({count:Number(pb.changeCount),text:ObjC.unwrap(pb.stringForType($.NSPasteboardTypeString))||''});
+  if(request.action==='image'){
+    const bytes=pb.dataForType($.NSPasteboardTypeTIFF);
+    if(!bytes || !Number(bytes.length)||Number(bytes.length)>24*1024*1024)throw Error('图片剪贴板格式或大小无效');
+    return JSON.stringify({count:Number(pb.changeCount),data:ObjC.unwrap(bytes.base64EncodedStringWithOptions(0))});
+  }
+  if(request.action==='count')return JSON.stringify({count:Number(pb.changeCount)});
+  if(request.action==='setImage'){
+    const bytes=$.NSData.alloc.initWithBase64EncodedStringOptions($(request.data),0);
+    if(!bytes || !['public.png','public.jpeg'].includes(request.type))throw Error('invalid image');
+    const img=$.NSBitmapImageRep.imageRepWithData(bytes);
+    if(!img || !(img.pixelsWide>0&&img.pixelsHigh>0))throw Error('cannot decode image');
+    if(Number(pb.changeCount)!==request.count)throw Error('clipboard changed');
+    pb.clearContents;
+    if(!pb.setDataForType(img.TIFFRepresentation,$.NSPasteboardTypeTIFF)||!pb.setDataForType(bytes,$(request.type)))throw Error('cannot write image');
+    return JSON.stringify({count:Number(pb.changeCount)});
+  }
+  if(request.action==='restore') {
+    if(request.count!==undefined&&Number(pb.changeCount)!==request.count)return JSON.stringify({restored:false});
+    const items=$.NSMutableArray.array;
+    for(const raw of request.items) {
+      const item=$.NSPasteboardItem.alloc.init;
+      for(const type of Object.keys(raw))item.setDataForType($.NSData.alloc.initWithBase64EncodedStringOptions($(raw[type]),0),$(type));
+      items.addObject(item);
+    }
+    pb.clearContents;if(items.count)pb.writeObjects(items);
+    return JSON.stringify({restored:true});
+  }
+  throw new Error('unsupported clipboard operation');
+}

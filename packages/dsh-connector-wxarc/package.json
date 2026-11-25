@@ -1,0 +1,72 @@
+{
+  "name": "@local/dsh-connector-wxarc",
+  "version": "0.1.0",
+  "description": "DSH Hub WeChat Connector — wxarc listener, DSH AI automation, SwiftCUA reply, Dual-Mode WechatTransport, wxarc.send Sink & Web UI",
+  "type": "module",
+  "private": true,
+  "license": "MIT",
+  "main": "lib/index.js",
+  "types": "lib/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./lib/index.d.ts",
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./send-sink": {
+      "types": "./lib/send-sink.d.ts",
+      "default": "./lib/send-sink.js"
+    },
+    "./transport": {
+      "types": "./lib/transport.d.ts",
+      "default": "./lib/transport.js"
+    },
+    "./host-side-bridge": {
+      "types": "./lib/host-side-bridge.d.ts",
+      "default": "./lib/host-side-bridge.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "scripts": {
+    "copy:assets": "node scripts/copy-assets.ts lib",
+    "copy:test-assets": "node scripts/copy-assets.ts lib-test/src",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.client.json && pnpm run copy:assets",
+    "test": "tsc -p tsconfig.client.json && tsc -p tsconfig.test.json && pnpm run copy:test-assets && node --test \"lib-test/test/**/*.test.js\""
+  },
+  "engines": {
+    "node": ">=24.9.0",
+    "dsh": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "devDependencies": {
+    "@local/dsh-hub": "workspace:*",
+    "@deepseek-ai/schemastery": "^3.18.5"
+  },
+  "peerDependencies": {
+    "@local/dsh-hub": "^0.1.0",
+    "@deepseek-ai/cordis": "^4.0.0",
+    "@deepseek-ai/schemastery": "^3.18.5",
+    "@deepseek-ai/dsh-scope": ">=0.2.2-rc.1 <0.3.0"
+  },
+  "dsh": {
+    "manifestVersion": 1,
+    "bundle": {
+      "patch": "./cordis.patch.yml",
+      "platforms": [
+        "darwin"
+      ]
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-renderer",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar",
+        "@deepseek-ai/dsh-client-ui-workspace"
+      ]
+    }
+  }
+}

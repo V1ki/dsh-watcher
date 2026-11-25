@@ -1,0 +1,18 @@
+// WindowServer supplies front-to-back order and global coordinates, including floating panels.
+ObjC.import('Cocoa'); ObjC.import('CoreGraphics');
+function run(args) {
+  const screens=$.NSScreen.screens, top=screens.objectAtIndex(0).frame.size.height;
+  const rect=f=>({x:f.origin.x,y:top-f.origin.y-f.size.height,width:f.size.width,height:f.size.height});
+  const usable=[], full=[];
+  for(let i=0;i<screens.count;i++){const s=screens.objectAtIndex(i);usable.push(rect(s.visibleFrame));full.push(rect(s.frame));}
+  const windows=ObjC.deepUnwrap(ObjC.castRefToObject($.CGWindowListCopyWindowInfo(17,0)));
+  const index=windows.findIndex(w=>w.kCGWindowNumber===Number(args[0]));
+  if(index<0)throw Error('微信窗口不在当前桌面');
+  const box=w=>{const b=w.kCGWindowBounds;return {x:b.X,y:b.Y,width:b.Width,height:b.Height}};
+  const covers=windows.slice(0,index).filter(w=>{
+    if(w.kCGWindowAlpha===0)return false;
+    // Dock also publishes a transparent whole-display surface; its actual panels have smaller frames.
+    const b=box(w);return !(w.kCGWindowLayer===20 && ['Dock','程序坞'].includes(w.kCGWindowOwnerName) && full.some(r=>Object.keys(r).every(k=>r[k]===b[k])));
+  }).map(box);
+  return JSON.stringify({bounds:box(windows[index]),usable,covers});
+}

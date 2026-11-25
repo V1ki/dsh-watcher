@@ -1,0 +1,3 @@
+- insert:
+    - id: connector-wxarc
+      name: "@local/dsh-connector-wxarc"
