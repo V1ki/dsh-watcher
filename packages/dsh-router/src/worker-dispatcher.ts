@@ -6,7 +6,12 @@ import type {
   DynamicPersonaCard,
   HubService,
   NormalizedEvent,
+  PersonaWardrobe,
+  SessionVaultTier,
   ThreadSubscription,
+  ToolExecutionContext,
+  TrustLevel,
+  VaultVisibility,
 } from '@local/dsh-hub/contracts';
 import type { RouterDecisionRecord, WorkerReportInput, WorkerReportMode } from './contracts.js';
 
@@ -31,8 +36,19 @@ export interface WorkspaceRegistryLike {
 
 export interface SessionAgentLike {
   id?: string;
-  session?: unknown;
+  session?: {
+    id?: string;
+    header?: {
+      cwd?: string;
+      delegationDepth?: number;
+      origin?: string;
+      parentSession?: string;
+      parentSessionId?: string;
+      rootSessionId?: string;
+    };
+  };
   followup?: (message: unknown) => void;
+  inject?: (message: unknown) => void;
 }
 
 export interface SessionControllerLike {
@@ -43,6 +59,7 @@ export interface SessionControllerLike {
   resolveAgent?: (
     sessionId: string,
   ) => Promise<{ agent?: SessionAgentLike; error?: { code?: string; message?: string } } | SessionAgentLike>;
+  prompt?: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
 }
 
 export interface ToolDefinitionLike {
@@ -54,7 +71,7 @@ export interface ToolDefinitionLike {
     schema: Record<string, unknown>;
     render: (args: unknown, value: unknown) => Array<{ type: string; text: string }>;
   };
-  execute: (args: Record<string, unknown>) => Promise<unknown>;
+  execute: (args: Record<string, unknown>, exec?: ToolExecutionContext) => Promise<unknown>;
 }
 
 export interface ToolsRegistryLike {
@@ -69,6 +86,18 @@ export interface WorkerDispatcherContext {
   workspaceRegistry?: WorkspaceRegistryLike;
   sessionController?: SessionControllerLike;
   tools?: ToolsRegistryLike;
+  permissionPresets?: {
+    set?: (session: unknown, preset: string) => Promise<unknown> | unknown;
+  };
+  sandboxPolicy?: {
+    setMode?: (session: unknown, mode: string) => Promise<unknown> | unknown;
+  };
+  approval?: {
+    setPolicy?: (target: unknown, policy: string) => Promise<unknown> | unknown;
+  };
+  agents?: {
+    get?: (sessionId: string) => SessionAgentLike | undefined;
+  };
 }
 
 export interface DispatchWorkerInput {
@@ -86,21 +115,200 @@ export interface DispatchWorkerResult {
   workspacePath: string;
   delivered: boolean;
   personaId: string | null;
+  tier: SessionVaultTier;
+  targetCircle: VaultVisibility;
+  sandboxMode: 'read-only' | 'workspace-write';
+}
+
+export interface WorkerPrincipalSpecInput {
+  source: string;
+  threadKey: string;
+  actor?: string | null;
+  trustLevel?: TrustLevel | null;
+  repo?: string | null;
+  payload?: Record<string, unknown>;
+  targetCircleHint?: VaultVisibility | null;
+}
+
+export interface WorkerPrincipalSpec {
+  tier: SessionVaultTier;
+  trustLevel: TrustLevel;
+  targetCircle: VaultVisibility;
+  repoName: string | null;
+}
+
+export interface RouterTasksToolInput {
+  status?: 'active' | 'all';
+  limit?: number;
+}
+
+export interface RouterSendToTaskToolInput {
+  action?: 'message' | 'approve_draft' | 'discard_draft' | 'resolve';
+  taskRef?: string;
+  message?: string;
+  draftId?: string;
+  reason?: string;
 }
 
 export interface RouterToolCallbacks {
+  hub: HubService;
   submitWorkerReport: (input: WorkerReportInput) => Promise<RouterDecisionRecord> | RouterDecisionRecord;
+  listTasks?: (input: RouterTasksToolInput) => Promise<Record<string, unknown>> | Record<string, unknown>;
+  sendToTask?: (input: RouterSendToTaskToolInput) => Promise<Record<string, unknown>> | Record<string, unknown>;
 }
 
 function readOptionalService<T>(
   ctx: WorkerDispatcherContext | undefined,
-  key: 'workspaceController' | 'workspaceRegistry' | 'sessionController' | 'tools',
+  key:
+    | 'workspaceController'
+    | 'workspaceRegistry'
+    | 'sessionController'
+    | 'tools'
+    | 'permissionPresets'
+    | 'sandboxPolicy'
+    | 'approval'
+    | 'agents',
 ): T | undefined {
   if (!ctx) return undefined;
   if (typeof ctx.get === 'function') {
     return ctx.get(key) as T | undefined;
   }
   return ctx[key] as T | undefined;
+}
+
+const WORK_SOURCES = new Set(['dingtalk', 'feishu', 'lark', 'jira', 'linear', 'slack', 'work']);
+
+function extractRepoFromThreadKey(source: string, threadKey: string): string | null {
+  if (source !== 'github') return null;
+  const trimmed = threadKey.trim().replace(/^github:/i, '');
+  const hashIdx = trimmed.indexOf('#');
+  const candidate = hashIdx > 0 ? trimmed.slice(0, hashIdx) : trimmed;
+  return /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(candidate) ? candidate : null;
+}
+
+function readLabeledCircleFromWardrobe(
+  wardrobe: PersonaWardrobe | null,
+  roomKey: string,
+): VaultVisibility | null {
+  if (!wardrobe || !roomKey) return null;
+  const ext = wardrobe as PersonaWardrobe & {
+    resolveChatCircle?: (key: string) => { circle?: string; labeled?: boolean } | null;
+  };
+  if (typeof ext.resolveChatCircle === 'function') {
+    const rec = ext.resolveChatCircle(roomKey);
+    if (rec?.labeled === true) {
+      if (
+        rec.circle === 'external' ||
+        rec.circle === 'work' ||
+        rec.circle === 'family' ||
+        rec.circle === 'owner_private'
+      ) {
+        return rec.circle;
+      }
+    }
+    return null;
+  }
+  if (typeof wardrobe.resolveVaultVisibility === 'function') {
+    const vis = wardrobe.resolveVaultVisibility(roomKey);
+    if (vis === 'external' || vis === 'work' || vis === 'family') {
+      return vis;
+    }
+  }
+  return null;
+}
+
+export async function resolveWorkerPrincipalSpec(
+  hub: HubService,
+  input: WorkerPrincipalSpecInput,
+): Promise<WorkerPrincipalSpec> {
+  const sourceLower = input.source.trim().toLowerCase();
+  const payload = input.payload ?? {};
+  const repoName =
+    (typeof input.repo === 'string' && input.repo.trim()) ||
+    (typeof payload.repo === 'string' && payload.repo.trim()) ||
+    extractRepoFromThreadKey(sourceLower, input.threadKey);
+
+  let matchedRepoSensitive = false;
+  let isConfiguredOwner = false;
+  try {
+    const githubAdmin = hub.getGitHubAdmin?.();
+    if (githubAdmin) {
+      const cfg = await githubAdmin.getConfig();
+      if (repoName && Array.isArray(cfg.repos)) {
+        const lower = repoName.toLowerCase();
+        const matched = cfg.repos.find((r) => r.repo.toLowerCase() === lower);
+        if (matched?.sensitive === true) {
+          matchedRepoSensitive = true;
+        }
+      }
+      const actorLower = (input.actor ?? '').trim().toLowerCase();
+      if (actorLower) {
+        const owners = [...(cfg.ownerLogins ?? []), ...(cfg.autoSendOwners ?? [])]
+          .map((o) => String(o ?? '').trim().toLowerCase())
+          .filter(Boolean);
+        if (owners.includes(actorLower)) {
+          isConfiguredOwner = true;
+        }
+      }
+    }
+  } catch {
+  }
+
+  const isPrivatePayload =
+    payload.private === true ||
+    payload.repoPrivate === true ||
+    payload.isPrivate === true ||
+    (typeof payload.visibility === 'string' && payload.visibility.trim().toLowerCase() === 'private') ||
+    (typeof payload.repoVisibility === 'string' &&
+      payload.repoVisibility.trim().toLowerCase() === 'private');
+
+  const isWorkSource =
+    WORK_SOURCES.has(sourceLower) ||
+    sourceLower.startsWith('dingtalk') ||
+    sourceLower.startsWith('feishu');
+
+  const circleKey =
+    sourceLower === 'github' && repoName
+      ? `github:${repoName}`
+      : `${sourceLower}:${input.threadKey}`;
+  const labeledCircle = readLabeledCircleFromWardrobe(hub.getWardrobe?.() ?? null, circleKey);
+
+  let targetCircle: VaultVisibility;
+  if (input.targetCircleHint) {
+    targetCircle = input.targetCircleHint;
+  } else if (labeledCircle) {
+    targetCircle = labeledCircle;
+  } else if (sourceLower === 'github') {
+    targetCircle = matchedRepoSensitive || isPrivatePayload ? 'work' : 'external';
+  } else if (isWorkSource) {
+    targetCircle = 'work';
+  } else {
+    targetCircle = input.trustLevel === 'owner' ? 'work' : 'external';
+  }
+
+  const trustLevel: TrustLevel =
+    input.trustLevel ?? (isConfiguredOwner ? 'owner' : 'triage');
+
+  let tier: SessionVaultTier;
+  if (trustLevel === 'owner' || isConfiguredOwner) {
+    tier = 3;
+  } else if (
+    targetCircle === 'work' ||
+    isWorkSource ||
+    matchedRepoSensitive ||
+    isPrivatePayload
+  ) {
+    tier = 2;
+  } else {
+    tier = 1;
+  }
+
+  return {
+    tier,
+    trustLevel,
+    targetCircle,
+    repoName,
+  };
 }
 
 function expandPath(rawPath: string, homeDir?: string): string {
@@ -240,13 +448,48 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
     input.personaId,
     input.homeDir,
   );
+  const principalSpec = await resolveWorkerPrincipalSpec(hub, {
+    source: event.source,
+    threadKey: event.threadKey,
+    actor: event.actor.login ?? event.actor.displayName ?? event.actor.id,
+    trustLevel: event.trustLevel,
+    repo:
+      (typeof event.rawRef?.repo === 'string' && event.rawRef.repo.trim()) ||
+      (typeof event.payload?.repo === 'string' && event.payload.repo.trim()) ||
+      null,
+    payload: event.payload,
+  });
 
   const wsController = readOptionalService<WorkspaceControllerLike>(ctx, 'workspaceController');
   const registry = readOptionalService<WorkspaceRegistryLike>(ctx, 'workspaceRegistry');
   const controller = readOptionalService<SessionControllerLike>(ctx, 'sessionController');
+  const permissionPresets = readOptionalService<WorkerDispatcherContext['permissionPresets']>(
+    ctx,
+    'permissionPresets',
+  );
+  const sandboxPolicy = readOptionalService<WorkerDispatcherContext['sandboxPolicy']>(
+    ctx,
+    'sandboxPolicy',
+  );
 
   const sessionTitle = `Router · ${event.source} · ${event.threadKey}`.slice(0, 80);
-  let sessionId = `worker_${randomUUID().slice(0, 8)}`;
+  const desiredSessionId: string = randomUUID();
+  let sessionId: string = desiredSessionId;
+
+  const registerWorkerPrincipal = (sid: string): (() => void) | undefined =>
+    hub.registerSessionPrincipal?.({
+      sessionId: sid,
+      role: 'worker',
+      tier: principalSpec.tier,
+      trustLevel: principalSpec.trustLevel,
+      boundSource: event.source,
+      boundThreadKey: event.threadKey,
+      boundDecisionId: decision.id,
+      boundRepo: principalSpec.repoName,
+      targetCircle: principalSpec.targetCircle,
+    });
+
+  let offPrePrincipal = registerWorkerPrincipal(desiredSessionId);
 
   if (wsController?.create && controller?.create) {
     try {
@@ -256,7 +499,6 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
       if (wsRes?.created && workspaceId && wsController.rename) {
         await wsController.rename({ workspaceId, title: sessionTitle }).catch(() => {});
       }
-      const desiredSessionId = randomUUID();
       const created = await controller.create({
         sessionId: desiredSessionId,
         cwd: workspacePath,
@@ -270,16 +512,49 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
         await controller.rename({ sessionId, title: sessionTitle }).catch(() => {});
       }
     } catch {
+      sessionId = `worker_${desiredSessionId.slice(0, 8)}`;
     }
   } else if (registry?.resolveByPath && registry?.create && controller?.create) {
     try {
       const ws = (await registry.resolveByPath(workspacePath)) ?? (await registry.create(workspacePath));
       const created = await controller.create({
+        sessionId: desiredSessionId,
         workspaceId: ws.id,
         agentPreset: 'standard',
       });
       if (created?.sessionId) {
         sessionId = created.sessionId;
+      }
+    } catch {
+      sessionId = `worker_${desiredSessionId.slice(0, 8)}`;
+    }
+  } else {
+    sessionId = `worker_${desiredSessionId.slice(0, 8)}`;
+  }
+
+  if (sessionId !== desiredSessionId) {
+    offPrePrincipal?.();
+    offPrePrincipal = registerWorkerPrincipal(sessionId);
+  }
+
+  const sandboxMode: 'read-only' | 'workspace-write' =
+    decision.level === 'act' ? 'workspace-write' : 'read-only';
+
+  if (controller?.resolveAgent && (permissionPresets?.set || sandboxPolicy?.setMode)) {
+    try {
+      const resolved = await controller.resolveAgent(sessionId);
+      const agent =
+        resolved && typeof resolved === 'object' && 'agent' in resolved
+          ? resolved.agent
+          : (resolved as SessionAgentLike | undefined);
+      const targetSession = agent?.session ?? agent;
+      if (targetSession) {
+        if (permissionPresets?.set) {
+          await permissionPresets.set(targetSession, sandboxMode);
+        }
+        if (sandboxPolicy?.setMode) {
+          await sandboxPolicy.setMode(targetSession, sandboxMode);
+        }
       }
     } catch {
     }
@@ -294,6 +569,9 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
     metadata: {
       decisionId: decision.id,
       level: decision.level,
+      tier: principalSpec.tier,
+      targetCircle: principalSpec.targetCircle,
+      sandboxMode,
     },
   });
 
@@ -319,7 +597,27 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
     workspacePath,
     delivered,
     personaId,
+    tier: principalSpec.tier,
+    targetCircle: principalSpec.targetCircle,
+    sandboxMode,
   };
+}
+
+function assertOwnerBridgeCaller(hub: HubService, exec: ToolExecutionContext | undefined, toolName: string): void {
+  if (!exec) {
+    throw new Error(`${toolName}_forbidden: missing execution context`);
+  }
+  const principal = hub.resolveSessionPrincipal?.(exec);
+  if (
+    !principal ||
+    (principal.role !== 'owner_session' && principal.role !== 'interactive') ||
+    principal.delegationDepth !== 0 ||
+    principal.isSubagent
+  ) {
+    throw new Error(
+      `${toolName}_forbidden: requires top-level owner_session or interactive caller`,
+    );
+  }
 }
 
 function registerOnToolsRegistry(
@@ -327,7 +625,8 @@ function registerOnToolsRegistry(
   callbacks: RouterToolCallbacks,
 ): () => void {
   if (!tools?.register) return () => {};
-  const schema = {
+  const disposers: Array<() => void> = [];
+  const reportSchema = {
     type: 'object',
     required: ['decisionId', 'conclusion'],
     additionalProperties: false,
@@ -378,21 +677,33 @@ function registerOnToolsRegistry(
       },
     },
   };
-  const dispose = tools.register({
+  const offReport = tools.register({
     name: 'router_report_result',
     description:
       'Submit a concise Worker report back to DSH Router for owner review in WeChat. conclusion MUST be plain Simplified Chinese strictly <= 200 chars (conclusion, risk, decision point only — no function-name laundry list). draftText is ONLY shown to the owner in WeChat for approval and is NEVER posted to GitHub automatically (publish only after owner confirmation via explicit GitHub write tools); keep draftText human and concise (3-6 sentences, <= 500-600 chars, no line-by-line code recap or titled AI essays).',
-    parameters: schema,
-    inputSchema: schema,
+    parameters: reportSchema,
+    inputSchema: reportSchema,
     output: {
       schema: { type: 'object', additionalProperties: true },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
     },
-    execute: async (args) => {
+    execute: async (args, exec) => {
       const decisionId = typeof args.decisionId === 'string' ? args.decisionId.trim() : '';
       const conclusion = typeof args.conclusion === 'string' ? args.conclusion.trim() : '';
       if (!decisionId || !conclusion) {
         throw new Error('router_report_result requires non-empty decisionId and conclusion');
+      }
+      if (exec !== undefined && typeof callbacks.hub.resolveSessionPrincipal === 'function') {
+        const principal = callbacks.hub.resolveSessionPrincipal(exec);
+        if (
+          principal.role !== 'worker' ||
+          principal.isSubagent ||
+          principal.boundDecisionId !== decisionId
+        ) {
+          throw new Error(
+            'router_report_result_forbidden: caller must be the bound worker for this decisionId',
+          );
+        }
       }
       const rawMode = typeof args.mode === 'string' ? args.mode.trim() : '';
       const mode: WorkerReportMode | undefined =
@@ -423,7 +734,115 @@ function registerOnToolsRegistry(
       return { ok: true, decision };
     },
   });
-  return typeof dispose === 'function' ? dispose : () => {};
+  if (typeof offReport === 'function') disposers.push(offReport);
+
+  if (callbacks.listTasks) {
+    const tasksSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['active', 'all'],
+          description: 'Filter tasks: active (default) or all',
+        },
+        limit: {
+          type: 'number',
+          description: 'Maximum number of tasks to return (default 20, max 50)',
+        },
+      },
+    };
+    const offTasks = tools.register({
+      name: 'router_tasks',
+      description:
+        'List active Router background tasks, deferred notifications, pending Hub outbound drafts, and pending approval requests for the owner.',
+      parameters: tasksSchema,
+      inputSchema: tasksSchema,
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      execute: async (args, exec) => {
+        assertOwnerBridgeCaller(callbacks.hub, exec, 'router_tasks');
+        const status = args.status === 'all' ? 'all' : 'active';
+        const limit =
+          typeof args.limit === 'number' && Number.isFinite(args.limit)
+            ? Math.max(1, Math.min(50, Math.floor(args.limit)))
+            : 20;
+        return callbacks.listTasks!({ status, limit });
+      },
+    });
+    if (typeof offTasks === 'function') disposers.push(offTasks);
+  }
+
+  if (callbacks.sendToTask) {
+    const sendSchema = {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: {
+          type: 'string',
+          enum: ['message', 'approve_draft', 'discard_draft', 'resolve'],
+          description:
+            'Action to perform: message (default, forward instruction to task Worker), approve_draft, discard_draft, or resolve',
+        },
+        taskRef: {
+          type: 'string',
+          description: 'Task short ID (e.g. 247 or #247) or full decisionId',
+        },
+        message: {
+          type: 'string',
+          description: 'Owner instruction to forward asynchronously to the task Worker',
+        },
+        draftId: {
+          type: 'string',
+          description: 'Hub staged draft ID for approve_draft or discard_draft',
+        },
+        reason: {
+          type: 'string',
+          description: 'Optional reason when discarding a draft',
+        },
+      },
+    };
+    const offSend = tools.register({
+      name: 'router_send_to_task',
+      description:
+        'Forward an owner instruction asynchronously to a specific Router task Worker (with single-turn tier-3 elevation), mark a task resolved, or approve/discard a pending Hub outbound draft.',
+      parameters: sendSchema,
+      inputSchema: sendSchema,
+      output: {
+        schema: { type: 'object', additionalProperties: true },
+        render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
+      },
+      execute: async (args, exec) => {
+        assertOwnerBridgeCaller(callbacks.hub, exec, 'router_send_to_task');
+        const rawAction = typeof args.action === 'string' ? args.action.trim() : 'message';
+        const action =
+          rawAction === 'approve_draft' ||
+          rawAction === 'discard_draft' ||
+          rawAction === 'resolve'
+            ? rawAction
+            : 'message';
+        return callbacks.sendToTask!({
+          action,
+          taskRef: typeof args.taskRef === 'string' ? args.taskRef.trim() : undefined,
+          message: typeof args.message === 'string' ? args.message.trim() : undefined,
+          draftId: typeof args.draftId === 'string' ? args.draftId.trim() : undefined,
+          reason: typeof args.reason === 'string' ? args.reason.trim() : undefined,
+        });
+      },
+    });
+    if (typeof offSend === 'function') disposers.push(offSend);
+  }
+
+  return () => {
+    while (disposers.length > 0) {
+      try {
+        disposers.pop()?.();
+      } catch {
+      }
+    }
+  };
 }
 
 export function registerRouterTools(

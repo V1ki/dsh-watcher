@@ -1,13 +1,23 @@
 import { randomUUID } from 'node:crypto';
+import { PUBLIC_TAINT_WARNING_TEXT } from '@local/dsh-hub';
 import type {
   AdminWechatHandleResult,
   AdminWechatMessage,
   HubService,
   IngestResult,
   NormalizedEvent,
+  SessionVaultTier,
+  ThreadLifecycleEvent,
   ThreadSubscription,
+  ToolExecutionContext,
   TrustLevel,
+  VaultVisibility,
 } from '@local/dsh-hub/contracts';
+import {
+  RouterApprovals,
+  type RouterApprovalExecutionLike,
+  type RouterApprovalRequestLike,
+} from './approvals.js';
 import type {
   AttentionDecision,
   AttentionPolicy,
@@ -20,6 +30,7 @@ import type {
   WorkerReportInput,
 } from './contracts.js';
 import type { ListDecisionsFilter, ListNotificationsFilter, RouterDb } from './db.js';
+import { OwnerSessionBridge, type OwnerSessionContextLike } from './owner-session.js';
 import {
   DEFAULT_ATTENTION_POLICY,
   computeNextWorkStartIso,
@@ -27,35 +38,41 @@ import {
   normalizeAttentionPolicy,
   resolveAttentionDestination,
 } from './policy.js';
+import { isReadOnlyBash, taskReusable, withinWorkspace } from './task-permissions.js';
 import { triageEvent, type TriageLlmLike, type TriageLoggerLike } from './triage.js';
 import {
   dispatchWorker,
   registerRouterTools,
+  resolveWorkerPrincipalSpec,
   sendWorkerFollowup,
-  type WorkerDispatcherContext,
+  type RouterSendToTaskToolInput,
+  type RouterTasksToolInput,
 } from './worker-dispatcher.js';
 
 const POLICY_META_KEY = 'attention_policy';
-const FOCUS_META_KEY = 'focused_decision_id';
-const FOCUS_AT_META_KEY = 'focused_decision_at';
-const FOCUS_TTL_MS = 24 * 60 * 60 * 1000;
+const OWNER_TURN_OVERRIDE_TTL_MS = 15 * 60_000;
+const BATCH_SUMMARY_THRESHOLD = 3;
 
 const LIST_COMMANDS = new Set(['列表', '还有啥', '在忙啥', '任务', 'list']);
-const DEFER_COMMANDS = new Set(['先放着', '先跳过', '延后', '待会看']);
-const CLOSE_COMMANDS = new Set([
-  '下一个',
-  '下一条',
-  '跳过',
-  '完成',
-  '已处理',
-  '关闭',
-  '关掉这条',
-  '结束',
-  '结束了',
-  '不用管了',
-  'next',
-  'skip',
-  'done',
+
+const OWNER_SAFE_READ_TOOLS = new Set([
+  'read',
+  'read_image',
+  'grep',
+  'glob',
+  'find',
+  'ls',
+  'vault_search',
+  'vault_context',
+  'router_tasks',
+  'router_send_to_task',
+  'web_search',
+  'ask_user_question',
+  'wxarc_sticker_search',
+  'watcher_memo_add',
+  'watcher_memo_list',
+  'watcher_memo_cancel',
+  'job_output',
 ]);
 
 function extractShortId(decision: Pick<RouterDecisionRecord, 'id' | 'threadKey'>): string {
@@ -96,7 +113,7 @@ function parseQuotedTaskRef(quotedText?: string): string | null {
   return match ? match[1] : null;
 }
 
-export interface RouterServiceContext extends WorkerDispatcherContext {
+export interface RouterServiceContext extends OwnerSessionContextLike {
   llm?: TriageLlmLike;
   logger?: TriageLoggerLike;
 }
@@ -108,6 +125,8 @@ export interface RouterRuntimeOptions {
   llm?: TriageLlmLike | null;
   now?: () => Date;
   homeDir?: string;
+  ownerDebounceMs?: number;
+  approvalTtlMs?: number;
   initialPolicy?: Partial<AttentionPolicy>;
 }
 
@@ -138,6 +157,8 @@ interface RouteDeliveryOutcome {
 export class RouterRuntime {
   readonly hub: HubService;
   readonly db: RouterDb;
+  readonly approvals: RouterApprovals;
+  readonly ownerSession: OwnerSessionBridge;
   private readonly ctx?: RouterServiceContext;
   private readonly llmOverride?: TriageLlmLike | null;
   private readonly nowFn: () => Date;
@@ -155,10 +176,57 @@ export class RouterRuntime {
     this.homeDir = options.homeDir;
     this.policy = this.loadInitialPolicy(options.initialPolicy);
 
+    this.approvals = new RouterApprovals({
+      db: this.db,
+      hub: this.hub,
+      resolveOwnerId: () => this.resolveWechatTarget(),
+      now: () => this.nowFn().getTime(),
+      ttlMs: options.approvalTtlMs,
+    });
+
+    this.ownerSession = new OwnerSessionBridge({
+      hub: this.hub,
+      db: this.db,
+      ctx: this.ctx,
+      homeDir: this.homeDir,
+      debounceMs: options.ownerDebounceMs,
+      resolveOwnerTarget: () => this.resolveWechatTarget(),
+      onTurnEnded: ({ runId }) => {
+        this.approvals.revoke(runId);
+      },
+    });
+
+    this.warmupWorkerPrincipalsSync();
+    void this.warmupWorkerPrincipalsAsync();
+
     const offUnclaimed = this.hub.onUnclaimedEvent((event, meta) =>
       this.handleUnclaimedEvent(event, meta),
     );
     this.disposers.push(offUnclaimed);
+
+    if (typeof this.hub.onThreadLifecycle === 'function') {
+      const offLifecycle = this.hub.onThreadLifecycle((lifecycle) =>
+        this.handleThreadLifecycle(lifecycle),
+      );
+      this.disposers.push(offLifecycle);
+    }
+
+    if (typeof this.hub.guard?.registerGuard === 'function') {
+      const offTurnResetGuard = this.hub.guard.registerGuard({
+        name: 'router-turn-override-reset',
+        beforeEnterRoom: (guardCtx) => {
+          const incoming = guardCtx.event;
+          if (incoming && incoming.trustLevel !== 'owner') {
+            const sub = this.hub.resolveSubscription(incoming.source, incoming.threadKey);
+            if (sub?.sessionId) {
+              this.hub.clearSessionTurnOverride?.(sub.sessionId);
+            }
+          }
+          return { allow: true };
+        },
+      });
+      this.disposers.push(offTurnResetGuard);
+    }
 
     if (typeof this.hub.registerConnector === 'function') {
       const offConnector = this.hub.registerConnector({
@@ -181,9 +249,14 @@ export class RouterRuntime {
     }
 
     const offTools = registerRouterTools(this.ctx, {
+      hub: this.hub,
       submitWorkerReport: (report) => this.submitWorkerReport(report),
+      listTasks: (input) => this.handleListTasksTool(input),
+      sendToTask: (input) => this.handleSendToTaskTool(input),
     });
     this.disposers.push(offTools);
+
+    this.mountExecutionGuards();
 
     if (typeof this.hub.registerAdminWechatHandler === 'function') {
       const offAdminWechat = this.hub.registerAdminWechatHandler((msg) =>
@@ -247,33 +320,284 @@ export class RouterRuntime {
     return configured || 'filehelper';
   }
 
-  private getActiveFocus(): RouterDecisionRecord | null {
-    const id = this.db.getMeta(FOCUS_META_KEY)?.trim();
-    if (!id) return null;
-    const atRaw = this.db.getMeta(FOCUS_AT_META_KEY)?.trim();
-    if (atRaw) {
-      const atMs = Date.parse(atRaw);
-      if (!Number.isNaN(atMs) && this.nowFn().getTime() - atMs >= FOCUS_TTL_MS) {
-        this.clearFocus();
-        return null;
+  private inferHistoricalPrincipal(decision: RouterDecisionRecord): {
+    tier: SessionVaultTier;
+    trustLevel: TrustLevel;
+    targetCircle: VaultVisibility;
+    repoName: string | null;
+  } {
+    const sourceLower = decision.source.trim().toLowerCase();
+    const normalizedThreadKey =
+      sourceLower === 'github'
+        ? decision.threadKey.trim().replace(/^github:/i, '')
+        : decision.threadKey.trim();
+    const hashIdx = normalizedThreadKey.indexOf('#');
+    const repoCandidate =
+      hashIdx > 0 ? normalizedThreadKey.slice(0, hashIdx) : normalizedThreadKey;
+    const repoName =
+      sourceLower === 'github' && /^[a-zA-Z0-9._-]+\/[a-zA-Z0-9._-]+$/.test(repoCandidate)
+        ? repoCandidate
+        : null;
+    const isWorkSource =
+      sourceLower === 'dingtalk' ||
+      sourceLower.startsWith('dingtalk') ||
+      sourceLower === 'feishu' ||
+      sourceLower === 'lark' ||
+      sourceLower === 'jira' ||
+      sourceLower === 'linear' ||
+      sourceLower === 'slack' ||
+      sourceLower === 'work';
+    const targetCircle: VaultVisibility =
+      decision.targetCircle ?? (sourceLower === 'github' ? 'external' : isWorkSource ? 'work' : 'external');
+    const trustLevel: TrustLevel = decision.trustLevel ?? 'triage';
+    const tier: SessionVaultTier =
+      trustLevel === 'owner' ? 3 : targetCircle === 'work' || isWorkSource ? 2 : 1;
+    return { tier, trustLevel, targetCircle, repoName };
+  }
+
+  private warmupWorkerPrincipalsSync(): void {
+    if (typeof this.hub.registerSessionPrincipal !== 'function') return;
+    const rows = this.db.listDecisionsWithWorkerSession();
+    const seen = new Set<string>();
+    for (const decision of rows) {
+      const sid = decision.workerSessionId?.trim();
+      if (!sid || seen.has(sid)) continue;
+      seen.add(sid);
+      const spec = this.inferHistoricalPrincipal(decision);
+      this.hub.registerSessionPrincipal({
+        sessionId: sid,
+        role: 'worker',
+        tier: spec.tier,
+        trustLevel: spec.trustLevel,
+        boundSource: decision.source,
+        boundThreadKey: decision.threadKey,
+        boundDecisionId: decision.id,
+        boundRepo: spec.repoName,
+        targetCircle: spec.targetCircle,
+      });
+    }
+  }
+
+  private async warmupWorkerPrincipalsAsync(): Promise<void> {
+    if (this.disposed || typeof this.hub.registerSessionPrincipal !== 'function') return;
+    const rows = this.db.listDecisionsWithWorkerSession();
+    const seen = new Set<string>();
+    for (const decision of rows) {
+      if (this.disposed) return;
+      const sid = decision.workerSessionId?.trim();
+      if (!sid || seen.has(sid)) continue;
+      seen.add(sid);
+      try {
+        const spec = await resolveWorkerPrincipalSpec(this.hub, {
+          source: decision.source,
+          threadKey: decision.threadKey,
+          actor: decision.actor,
+          trustLevel: decision.trustLevel ?? undefined,
+          targetCircleHint: decision.targetCircle ?? undefined,
+        });
+        this.hub.registerSessionPrincipal({
+          sessionId: sid,
+          role: 'worker',
+          tier: spec.tier,
+          trustLevel: spec.trustLevel,
+          boundSource: decision.source,
+          boundThreadKey: decision.threadKey,
+          boundDecisionId: decision.id,
+          boundRepo: spec.repoName,
+          targetCircle: spec.targetCircle,
+        });
+      } catch {
       }
     }
-    const decision = this.db.getDecision(id);
-    if (!decision || decision.status === 'resolved' || decision.status === 'filtered') {
-      this.clearFocus();
-      return null;
+  }
+
+  private handleThreadLifecycle(lifecycle: ThreadLifecycleEvent): void {
+    if (this.disposed) return;
+    if (
+      lifecycle.state !== 'closed' &&
+      lifecycle.state !== 'merged' &&
+      lifecycle.state !== 'ended'
+    ) {
+      return;
     }
-    return decision;
+    const nowIso = this.nowFn().toISOString();
+    const result = this.db.resolveDecisionsByThread(
+      lifecycle.source,
+      lifecycle.threadKey,
+      nowIso,
+    );
+    for (const workerSid of result.workerSessionIds) {
+      this.hub.clearSessionTurnOverride?.(workerSid);
+    }
+    if (lifecycle.subscription?.sessionId) {
+      this.hub.clearSessionTurnOverride?.(lifecycle.subscription.sessionId);
+    }
   }
 
-  private setFocus(decisionId: string): void {
-    this.db.setMeta(FOCUS_META_KEY, decisionId);
-    this.db.setMeta(FOCUS_AT_META_KEY, this.nowFn().toISOString());
+  private mountExecutionGuards(): void {
+    if (typeof this.ctx?.on !== 'function') return;
+
+    const offPre = this.ctx.on(
+      'tools/pre-execute',
+      async (
+        exec: RouterApprovalExecutionLike & ToolExecutionContext,
+        next: () => Promise<{ kind: string; reason?: string }>,
+      ) => this.handlePreExecuteTool(exec, next),
+    );
+    if (typeof offPre === 'function') this.disposers.push(offPre as () => void);
+
+    const offResult = this.ctx.on(
+      'tools/result',
+      (exec: RouterApprovalExecutionLike) => {
+        this.approvals.release(exec);
+      },
+    );
+    if (typeof offResult === 'function') this.disposers.push(offResult as () => void);
+
+    const offApproval = this.ctx.on(
+      'approval/request',
+      (req: RouterApprovalRequestLike, next: () => Promise<string>) => {
+        if (!req?.agent?.id) return next();
+        const principal = this.hub.resolveSessionPrincipal?.({ agent: req.agent });
+        if (!principal || principal.role !== 'owner_session') {
+          return next();
+        }
+        const rootId = principal.rootSessionId ?? principal.sessionId ?? req.agent.id;
+        const runId = this.ownerSession.getActiveRunId() ?? `owner:${rootId}`;
+        return this.approvals.request(req, next, { id: runId });
+      },
+      { prepend: true },
+    );
+    if (typeof offApproval === 'function') this.disposers.push(offApproval as () => void);
+
+    const offInbox = this.ctx.on(
+      'agent/inbox/inserted',
+      (payloadArg: Record<string, unknown> | undefined) => {
+        const payload = payloadArg ?? {};
+        const agentObj = payload.agent as { id?: string } | undefined;
+        const sessionId =
+          agentObj?.id ?? (typeof payload.sessionId === 'string' ? payload.sessionId : '');
+        if (!sessionId) return;
+        const principal = this.hub.getSessionPrincipal?.(sessionId);
+        if (!principal || principal.role !== 'worker') return;
+        const message = (payload.message ?? payload.item) as Record<string, unknown> | undefined;
+        const source = message?.source as { kind?: string; source?: string; trust?: string } | undefined;
+        const isOwnerInitiated =
+          (source?.kind === 'dsh-router:worker' &&
+            (source.source === 'wechat-admin' || source.source === 'owner-bridge')) ||
+          source?.trust === 'owner';
+        if (!isOwnerInitiated) {
+          this.hub.clearSessionTurnOverride?.(sessionId);
+        }
+      },
+    );
+    if (typeof offInbox === 'function') this.disposers.push(offInbox as () => void);
   }
 
-  private clearFocus(): void {
-    this.db.setMeta(FOCUS_META_KEY, '');
-    this.db.setMeta(FOCUS_AT_META_KEY, '');
+  private async handlePreExecuteTool(
+    exec: RouterApprovalExecutionLike & ToolExecutionContext,
+    next: () => Promise<{ kind: string; reason?: string }>,
+  ): Promise<{ kind: string; reason?: string }> {
+    const principal = this.hub.resolveSessionPrincipal?.(exec);
+    if (!principal || (principal.role !== 'owner_session' && principal.role !== 'worker')) {
+      return next();
+    }
+    const rootId = principal.rootSessionId ?? principal.sessionId ?? '';
+
+    if (principal.role === 'worker') {
+      const isTainted =
+        principal.tainted || (rootId ? this.hub.isSessionTainted?.(rootId) === true : false);
+      if (isTainted) {
+        if (exec.name === 'web_fetch' || exec.name === 'web_search') {
+          return {
+            kind: 'deny',
+            reason: '后台任务会话已读取内部/私人记录（tainted），禁止调用外部联网工具（web_fetch / web_search）。',
+          };
+        }
+        if (exec.arguments?.sandbox_permissions === 'require_escalated') {
+          return {
+            kind: 'deny',
+            reason: '后台任务会话已读取内部/私人记录（tainted），禁止申请沙箱提权（require_escalated）。',
+          };
+        }
+      }
+      return next();
+    }
+
+    this.approvals.capture(exec);
+    const runId = this.ownerSession.getActiveRunId() ?? `owner:${rootId}`;
+    const run = { id: runId };
+
+    if (exec.name === 'wxarc_proactive_send') {
+      this.approvals.eligible(exec, false);
+      return {
+        kind: 'ask',
+        reason: '跨群或主动发送微信消息需要主人微信确认码。',
+      };
+    }
+
+    if (exec.name === 'web_fetch') {
+      const turnPrivateRead =
+        principal.turnPrivateRead || (rootId ? this.hub.isTurnPrivateRead?.(rootId) === true : false);
+      if (turnPrivateRead) {
+        this.approvals.eligible(exec, false);
+        return {
+          kind: 'ask',
+          reason: '本轮已读取内部/私人记录，调用 web_fetch 访问外部链接需要主人微信确认码。',
+        };
+      }
+      return next();
+    }
+
+    if (exec.name === 'bash') {
+      const command = exec.arguments?.command;
+      if (isReadOnlyBash(command, exec.arguments)) {
+        return next();
+      }
+      this.approvals.eligible(exec, false);
+      return {
+        kind: 'ask',
+        reason: '非只读终端命令需要主人微信确认码。',
+      };
+    }
+
+    if (exec.name === 'write' || exec.name === 'edit') {
+      const targetPath =
+        exec.arguments?.file_path ?? exec.arguments?.path ?? exec.arguments?.target_file;
+      if (withinWorkspace(this.ownerSession.workspacePath, targetPath)) {
+        return next();
+      }
+      this.approvals.eligible(exec, false);
+      return {
+        kind: 'ask',
+        reason: '写入或编辑个人工作区外的文件需要主人微信确认码。',
+      };
+    }
+
+    if (OWNER_SAFE_READ_TOOLS.has(exec.name)) {
+      return next();
+    }
+
+    const baseDecision = await next();
+    if (baseDecision.kind !== 'allow') {
+      return baseDecision;
+    }
+
+    this.approvals.eligible(exec, taskReusable(exec));
+    if (this.approvals.allows(exec, run)) {
+      return baseDecision;
+    }
+    return {
+      kind: 'ask',
+      reason: `调用 ${exec.name} 需要主人微信确认码。`,
+    };
+  }
+
+  private listActiveDecisions(limit = 20): RouterDecisionRecord[] {
+    const all = this.db.listDecisions({ limit: Math.max(limit * 3, 60) });
+    return all
+      .filter((d) => d.status !== 'resolved' && d.status !== 'filtered')
+      .slice(0, limit);
   }
 
   private listQueuedDecisions(excludeId?: string, limit = 5): RouterDecisionRecord[] {
@@ -302,27 +626,163 @@ export class RouterRuntime {
     return queued;
   }
 
-  private popNextQueuedDecision(excludeId?: string): RouterDecisionRecord | null {
-    return this.listQueuedDecisions(excludeId, 1)[0] ?? null;
+  private handleListTasksTool(input: RouterTasksToolInput): Record<string, unknown> {
+    const limit = input.limit ?? 20;
+    const decisions =
+      input.status === 'all'
+        ? this.db.listDecisions({ limit })
+        : this.listActiveDecisions(limit);
+    const deferredNotifs = this.db.listNotifications({ status: 'deferred', limit: 100, order: 'asc' });
+    const pendingDrafts = this.hub.listDrafts({ status: 'pending_approval' });
+    const pendingApprovals = this.approvals.listPending();
+
+    return {
+      ok: true,
+      tasks: decisions.map((d) => ({
+        shortId: extractShortId(d),
+        id: d.id,
+        source: d.source,
+        threadKey: d.threadKey,
+        status: d.status,
+        level: d.level,
+        summary: d.summary,
+        question: d.question,
+        options: d.options,
+        draftText: d.draftText ?? null,
+        hasWorker: Boolean(d.workerSessionId),
+        workerSessionId: d.workerSessionId,
+        tainted: Boolean(d.workerSessionId && this.hub.isSessionTainted?.(d.workerSessionId)),
+        rawUrl: d.rawUrl,
+        updatedAt: d.updatedAt,
+      })),
+      deferredCount: deferredNotifs.length,
+      pendingDrafts: pendingDrafts.map((dr) => ({
+        id: dr.id,
+        sinkId: dr.sinkId,
+        action: dr.action,
+        previewText: dr.previewText,
+        createdAt: dr.createdAt,
+      })),
+      pendingApprovals: pendingApprovals.map((ap) => ({
+        code: ap.code,
+        tool: ap.tool,
+        expiresAt: new Date(ap.expires_at).toISOString(),
+      })),
+    };
+  }
+
+  private async handleSendToTaskTool(
+    input: RouterSendToTaskToolInput,
+  ): Promise<Record<string, unknown>> {
+    const action = input.action ?? 'message';
+    if (action === 'approve_draft') {
+      if (!input.draftId) {
+        throw new Error('router_send_to_task requires draftId for approve_draft');
+      }
+      const res = await this.hub.approveDraft(input.draftId);
+      return { ok: true, action, draftId: input.draftId, result: res };
+    }
+    if (action === 'discard_draft') {
+      if (!input.draftId) {
+        throw new Error('router_send_to_task requires draftId for discard_draft');
+      }
+      await this.hub.discardDraft(input.draftId, input.reason);
+      return { ok: true, action, draftId: input.draftId, discarded: true };
+    }
+
+    const cleanRef = (input.taskRef ?? '').replace(/^\[?#?/, '').replace(/\]$/, '').trim();
+    if (!cleanRef) {
+      throw new Error('router_send_to_task requires taskRef');
+    }
+    const target = this.findDecisionByRef(cleanRef);
+    if (!target) {
+      throw new Error(`decision_not_found:${cleanRef}`);
+    }
+
+    if (action === 'resolve') {
+      const nowIso = this.nowFn().toISOString();
+      this.db.upsertDecision({ ...target, status: 'resolved', updatedAt: nowIso });
+      this.markDecisionDeferredNotifications(target.id, 'read', nowIso);
+      if (target.workerSessionId) {
+        this.hub.clearSessionTurnOverride?.(target.workerSessionId);
+      }
+      return { ok: true, action, decisionId: target.id, shortId: extractShortId(target) };
+    }
+
+    if (!input.message?.trim()) {
+      throw new Error('router_send_to_task requires non-empty message');
+    }
+    if (!target.workerSessionId) {
+      return {
+        ok: false,
+        decisionId: target.id,
+        shortId: extractShortId(target),
+        error: 'no_worker_session',
+      };
+    }
+
+    this.hub.setSessionTurnOverride?.(target.workerSessionId, 3, OWNER_TURN_OVERRIDE_TTL_MS);
+    const shortId = extractShortId(target);
+    const text = [
+      `[主人个人会话转达][#${shortId}]`,
+      `decisionId: ${target.id}`,
+      `threadKey: ${target.threadKey}`,
+      `主人指示: ${input.message.trim()}`,
+      '',
+      '请按主人指示处理，完成后调用 `router_report_result` 回报精炼结论。',
+    ].join('\n');
+    const delivered = await sendWorkerFollowup(this.ctx, target.workerSessionId, text, {
+      decisionId: target.id,
+      source: 'owner-bridge',
+      trust: 'owner',
+    });
+    return {
+      ok: delivered,
+      action,
+      decisionId: target.id,
+      shortId,
+      workerSessionId: target.workerSessionId,
+      delivered,
+    };
+  }
+
+  private shouldShowPublicTaintWarning(decision: RouterDecisionRecord): boolean {
+    if (!decision.draftText?.trim()) return false;
+    const workerSessionId = decision.workerSessionId?.trim();
+    if (!workerSessionId) return false;
+    if (this.hub.isSessionTainted?.(workerSessionId) !== true) return false;
+    const principalCircle = this.hub.getSessionPrincipal?.(workerSessionId)?.targetCircle ?? null;
+    const effectiveCircle =
+      principalCircle ??
+      decision.targetCircle ??
+      (decision.source.trim().toLowerCase() === 'github' ? 'external' : null);
+    return effectiveCircle === 'external';
   }
 
   private findDecisionByRef(ref: string): RouterDecisionRecord | null {
     const lowerRef = ref.trim().toLowerCase();
     if (!lowerRef) return null;
     const decisions = this.db.listDecisions({ limit: 200 });
-    let fallbackMatch: RouterDecisionRecord | null = null;
+    let exactFallback: RouterDecisionRecord | null = null;
+    let prefixActive: RouterDecisionRecord | null = null;
+    let prefixFallback: RouterDecisionRecord | null = null;
     for (const decision of decisions) {
       const shortId = extractShortId(decision).toLowerCase();
-      const matched = shortId === lowerRef || decision.id.toLowerCase().startsWith(lowerRef);
-      if (!matched) continue;
-      if (decision.status !== 'resolved' && decision.status !== 'filtered') {
-        return decision;
+      const isActive = decision.status !== 'resolved' && decision.status !== 'filtered';
+      if (shortId === lowerRef) {
+        if (isActive) return decision;
+        if (!exactFallback) exactFallback = decision;
+        continue;
       }
-      if (!fallbackMatch) {
-        fallbackMatch = decision;
+      if (decision.id.toLowerCase().startsWith(lowerRef)) {
+        if (isActive && !prefixActive) {
+          prefixActive = decision;
+        } else if (!isActive && !prefixFallback) {
+          prefixFallback = decision;
+        }
       }
     }
-    return fallbackMatch;
+    return exactFallback ?? prefixActive ?? prefixFallback;
   }
 
   private markDecisionDeferredNotifications(
@@ -376,13 +836,14 @@ export class RouterRuntime {
       '- 改界面请截一张实际运行图填 `imagePath`；处理完调用 `router_report_result` 回他微信。',
     );
 
+    this.hub.setSessionTurnOverride?.(target.workerSessionId, 3, OWNER_TURN_OVERRIDE_TTL_MS);
     const ok = await sendWorkerFollowup(this.ctx, target.workerSessionId, lines.join('\n'), {
       decisionId: target.id,
       source: 'wechat-admin',
+      trust: 'owner',
       senderId: msg.senderId,
       session: msg.session,
     });
-    this.setFocus(target.id);
     if (!ok) {
       return {
         handled: true,
@@ -394,143 +855,127 @@ export class RouterRuntime {
 
   async handleAdminWechatMessage(msg: AdminWechatMessage): Promise<AdminWechatHandleResult> {
     const rawText = (msg.text ?? '').trim();
-    if (!rawText) {
+    const hasMultimodal = Boolean(
+      msg.imagePath?.trim() ||
+        msg.voiceTranscript?.trim() ||
+        msg.articleSummary?.trim() ||
+        (Array.isArray(msg.mediaPaths) && msg.mediaPaths.some((p) => p.trim())),
+    );
+    if (!rawText && !hasMultimodal) {
       return { handled: false };
     }
-    const cmd = normalizeAdminCommand(rawText);
 
-    if (LIST_COMMANDS.has(cmd)) {
-      const activeFocus = this.getActiveFocus();
-      const queued = this.listQueuedDecisions(activeFocus?.id, 5);
-      if (!activeFocus && queued.length === 0) {
+    if (rawText) {
+      const approvalRes = this.approvals.consume(msg);
+      if (approvalRes.matched) {
         return {
           handled: true,
-          replyText: '现在没有正在聊的事，队列里也是空的。',
+          ...(approvalRes.replyText ? { replyText: approvalRes.replyText } : {}),
         };
       }
-      const lines: string[] = [];
-      if (activeFocus) {
-        lines.push('正在聊：');
-        lines.push(`[#${extractShortId(activeFocus)}] ${shortLine(activeFocus.summary)}`);
-      }
-      if (queued.length > 0) {
-        lines.push(activeFocus ? '排在后面：' : '待处理：');
-        for (const item of queued) {
-          lines.push(`[#${extractShortId(item)}] ${shortLine(item.summary)}`);
+
+      const cmd = normalizeAdminCommand(rawText);
+      if (LIST_COMMANDS.has(cmd)) {
+        const active = this.listActiveDecisions(8);
+        const queued = this.listQueuedDecisions(undefined, 8);
+        const pendingDrafts = this.hub.listDrafts({ status: 'pending_approval' });
+        const pendingApprovals = this.approvals.listPending();
+
+        const seenIds = new Set<string>();
+        const ordered: RouterDecisionRecord[] = [];
+        for (const item of [...queued, ...active]) {
+          if (seenIds.has(item.id)) continue;
+          seenIds.add(item.id);
+          ordered.push(item);
         }
-      }
-      lines.push('回 #编号 可以切过去聊；回“下一个”切下一条。');
-      return {
-        handled: true,
-        replyText: lines.join('\n'),
-      };
-    }
 
-    const activeFocus = this.getActiveFocus();
-
-    if (DEFER_COMMANDS.has(cmd) || CLOSE_COMMANDS.has(cmd)) {
-      if (!activeFocus) {
-        return { handled: false };
-      }
-      const nowIso = this.nowFn().toISOString();
-      const isDefer = DEFER_COMMANDS.has(cmd);
-      this.db.upsertDecision({
-        ...activeFocus,
-        status: isDefer ? 'deferred' : 'resolved',
-        updatedAt: nowIso,
-      });
-      if (!isDefer) {
-        this.markDecisionDeferredNotifications(activeFocus.id, 'read', nowIso);
-      }
-      this.clearFocus();
-
-      const next = this.popNextQueuedDecision(activeFocus.id);
-      if (!next) {
-        return {
-          handled: true,
-          replyText: '这条先收起了，后面暂时没有别的事。',
-        };
-      }
-      const target = await this.resolveWechatTarget();
-      this.setFocus(next.id);
-      const activated = this.db.upsertDecision({
-        ...next,
-        destination: 'wechat',
-        status: 'notified',
-        updatedAt: nowIso,
-      });
-      this.markDecisionDeferredNotifications(activated.id, 'delivered', nowIso, 'wechat', target);
-      return {
-        handled: true,
-        replyText: this.formatNotificationText(activated),
-        ...(activated.imagePath?.trim() ? { imagePath: activated.imagePath.trim() } : {}),
-      };
-    }
-
-    const prefixRef = parsePrefixTaskRef(rawText);
-    if (prefixRef) {
-      const target = this.findDecisionByRef(prefixRef.ref);
-      if (target) {
-        const nowIso = this.nowFn().toISOString();
-        const wechatTarget = await this.resolveWechatTarget();
-        this.setFocus(target.id);
-        let current = target;
-        if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
-          current = this.db.upsertDecision({
-            ...target,
-            destination: 'wechat',
-            status: 'notified',
-            updatedAt: nowIso,
-          });
-        }
-        this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
-        if (!prefixRef.rest) {
+        if (ordered.length === 0 && pendingDrafts.length === 0 && pendingApprovals.length === 0) {
           return {
             handled: true,
-            replyText: this.formatNotificationText(current),
-            ...(current.imagePath?.trim() ? { imagePath: current.imagePath.trim() } : {}),
+            replyText: '现在没有待处理任务或草稿，队列是空的。',
           };
         }
-        return this.forwardAdminReplyToWorker(current, prefixRef.rest, msg);
-      }
-      if (/^\d+$/.test(prefixRef.ref) && activeFocus) {
+        const lines: string[] = [];
+        if (ordered.length > 0) {
+          lines.push('待处理任务：');
+          for (const item of ordered.slice(0, 8)) {
+            lines.push(`[#${extractShortId(item)}] ${shortLine(item.summary)}`);
+          }
+        }
+        if (pendingDrafts.length > 0) {
+          lines.push(`待审草稿：${pendingDrafts.length} 条`);
+        }
+        if (pendingApprovals.length > 0) {
+          lines.push(
+            `待确认操作：${pendingApprovals.map((a) => `${a.code}(${a.tool})`).join('、')}`,
+          );
+        }
+        lines.push('引用对应卡片或回 #编号 可直接继续处理。');
         return {
           handled: true,
-          replyText: `没找到 #${prefixRef.ref} 对应的任务，回“列表”可以看当前排队。`,
+          replyText: lines.join('\n'),
         };
       }
-    }
 
-    const quotedRef = parseQuotedTaskRef(msg.quotedText);
-    if (quotedRef) {
-      const target = this.findDecisionByRef(quotedRef);
-      if (target) {
-        const nowIso = this.nowFn().toISOString();
-        const wechatTarget = await this.resolveWechatTarget();
-        this.setFocus(target.id);
-        let current = target;
-        if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
-          current = this.db.upsertDecision({
-            ...target,
-            destination: 'wechat',
-            status: 'notified',
-            updatedAt: nowIso,
-          });
+      const prefixRef = parsePrefixTaskRef(rawText);
+      if (prefixRef) {
+        const target = this.findDecisionByRef(prefixRef.ref);
+        if (target) {
+          const nowIso = this.nowFn().toISOString();
+          const wechatTarget = await this.resolveWechatTarget();
+          let current = target;
+          if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
+            current = this.db.upsertDecision({
+              ...target,
+              destination: 'wechat',
+              status: 'notified',
+              updatedAt: nowIso,
+            });
+          }
+          this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
+          if (!prefixRef.rest) {
+            return {
+              handled: true,
+              replyText: this.formatNotificationText(current),
+              ...(current.imagePath?.trim() ? { imagePath: current.imagePath.trim() } : {}),
+            };
+          }
+          return this.forwardAdminReplyToWorker(current, prefixRef.rest, msg);
         }
-        this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
-        return this.forwardAdminReplyToWorker(current, rawText, msg);
+      }
+
+      const quotedRef = parseQuotedTaskRef(msg.quotedText);
+      if (quotedRef) {
+        const target = this.findDecisionByRef(quotedRef);
+        if (target) {
+          const nowIso = this.nowFn().toISOString();
+          const wechatTarget = await this.resolveWechatTarget();
+          let current = target;
+          if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
+            current = this.db.upsertDecision({
+              ...target,
+              destination: 'wechat',
+              status: 'notified',
+              updatedAt: nowIso,
+            });
+          }
+          this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
+          return this.forwardAdminReplyToWorker(current, rawText, msg);
+        }
       }
     }
 
-    return { handled: false };
+    this.ownerSession.enqueueMessage(msg);
+    return { handled: true };
   }
 
-  private formatNotificationText(
-    decision: RouterDecisionRecord,
-    opts?: { compact?: boolean },
-  ): string {
+  private formatNotificationText(decision: RouterDecisionRecord): string {
     const tag = `[#${extractShortId(decision)}]`;
-    const lines: string[] = [`${tag} ${decision.summary}`];
+    const lines: string[] = [];
+    if (this.shouldShowPublicTaintWarning(decision)) {
+      lines.push(PUBLIC_TAINT_WARNING_TEXT);
+    }
+    lines.push(`${tag} ${decision.summary}`);
     if (decision.draftText?.trim()) {
       lines.push(`拟发草稿：\n${decision.draftText.trim()}`);
     }
@@ -550,17 +995,16 @@ export class RouterRuntime {
       });
       lines.push(`可选：${formatted.join(' / ')}`);
     }
-    if (opts?.compact !== true) {
-      if (decision.rawUrl) {
-        lines.push(decision.rawUrl);
-      }
-      lines.push(`引用本条或回 #${extractShortId(decision)} 接着聊；回“下一个”切下一条`);
+    if (decision.rawUrl) {
+      lines.push(decision.rawUrl);
     }
+    lines.push(`引用本条或回 #${extractShortId(decision)} 接着聊`);
     return lines.join('\n');
   }
 
-  private upsertDeferredWechatNotification(input: {
+  private upsertDeferredNotification(input: {
     decision: RouterDecisionRecord;
+    channel: NotifyChannel;
     target: string;
     title: string;
     summary: string;
@@ -570,7 +1014,6 @@ export class RouterRuntime {
   }): RouterNotificationRecord {
     const existing = this.db.listNotifications({
       decisionId: input.decision.id,
-      channel: 'wechat',
       status: 'deferred',
       limit: 50,
       order: 'asc',
@@ -587,7 +1030,7 @@ export class RouterRuntime {
       }
       return this.db.upsertNotification({
         ...primary,
-        channel: 'wechat',
+        channel: input.channel,
         target: input.target,
         title: input.title,
         summary: input.summary,
@@ -601,7 +1044,7 @@ export class RouterRuntime {
     return this.db.upsertNotification({
       id: randomUUID(),
       decisionId: input.decision.id,
-      channel: 'wechat',
+      channel: input.channel,
       target: input.target,
       title: input.title,
       summary: input.summary,
@@ -636,6 +1079,33 @@ export class RouterRuntime {
         mode: 'send',
         reason,
         ...(trimmedImage ? { imagePath: trimmedImage } : {}),
+      });
+      return res.status === 'sent' || res.status === 'staged';
+    } catch {
+      return false;
+    }
+  }
+
+  private async deliverBatchSummaryToWechat(
+    target: string,
+    decisions: RouterDecisionRecord[],
+    idempotencyKey: string,
+  ): Promise<boolean> {
+    const transport = this.hub.getWechatTransport?.();
+    if (!transport) return false;
+    const lines: string[] = [`你有 ${decisions.length} 条待处理更新：`];
+    for (const decision of decisions) {
+      const prefix = this.shouldShowPublicTaintWarning(decision) ? '⚠️ ' : '';
+      lines.push(`${prefix}[#${extractShortId(decision)}] ${shortLine(decision.summary, 80)}`);
+    }
+    lines.push('引用或回 #编号 可直接处理对应任务');
+    try {
+      const res = await transport.send({
+        chatId: target,
+        text: lines.join('\n'),
+        idempotencyKey,
+        mode: 'send',
+        reason: 'deferred_batch_summary',
       });
       return res.status === 'sent' || res.status === 'staged';
     } catch {
@@ -701,22 +1171,7 @@ export class RouterRuntime {
 
     if (attention.destination === 'wechat') {
       const target = await this.resolveWechatTarget();
-      const activeFocus = this.getActiveFocus();
-      if (activeFocus && activeFocus.id !== decision.id && !options.urgent) {
-        const notif = this.upsertDeferredWechatNotification({
-          decision,
-          target,
-          title,
-          summary,
-          reason: `${reason};queued_behind_focus`,
-          dueAt: nowIso,
-          nowIso,
-        });
-        return { attention, notification: notif, deferred: true };
-      }
-
-      const isSameFocusFollowup = activeFocus !== null && activeFocus.id === decision.id;
-      const text = this.formatNotificationText(decision, { compact: isSameFocusFollowup });
+      const text = this.formatNotificationText(decision);
       const imagePath = options.imagePath ?? decision.imagePath ?? undefined;
       const sent = await this.deliverToWechat(
         decision,
@@ -727,7 +1182,6 @@ export class RouterRuntime {
         imagePath,
       );
       if (sent) {
-        this.setFocus(decision.id);
         this.markDecisionDeferredNotifications(decision.id, 'read', nowIso);
         const notif = this.db.upsertNotification({
           id: randomUUID(),
@@ -743,11 +1197,13 @@ export class RouterRuntime {
           createdAt: nowIso,
           updatedAt: nowIso,
         });
+        await this.ownerSession.injectPushReceipt(decision);
         return { attention, notification: notif, deferred: false };
       }
       const fallbackDue = computeNextWorkStartIso(now, this.policy);
-      const notif = this.upsertDeferredWechatNotification({
+      const notif = this.upsertDeferredNotification({
         decision,
+        channel: 'wechat',
         target,
         title,
         summary,
@@ -758,19 +1214,15 @@ export class RouterRuntime {
       return { attention, notification: notif, deferred: true };
     }
 
-    const notif = this.db.upsertNotification({
-      id: randomUUID(),
-      decisionId: decision.id,
+    const notif = this.upsertDeferredNotification({
+      decision,
       channel: 'defer',
       target: 'web',
       title,
       summary,
       reason,
-      rawUrl: decision.rawUrl,
-      status: 'deferred',
       dueAt: attention.dueAt,
-      createdAt: nowIso,
-      updatedAt: nowIso,
+      nowIso,
     });
     return { attention, notification: notif, deferred: true };
   }
@@ -819,6 +1271,7 @@ export class RouterRuntime {
       subscriptionId: null,
       triageRestored: false,
       rawUrl: event.rawRef?.url ?? null,
+      trustLevel: event.trustLevel,
       createdAt: nowIso,
       updatedAt: nowIso,
     };
@@ -849,6 +1302,7 @@ export class RouterRuntime {
         ...saved,
         workerSessionId: dispatched.sessionId,
         subscriptionId: dispatched.subscription.id,
+        targetCircle: dispatched.targetCircle,
         updatedAt: this.nowFn().toISOString(),
       };
       const routed = await this.routeNotification(linked, {
@@ -1001,6 +1455,8 @@ export class RouterRuntime {
       ...prepared,
       workerSessionId: dispatched.sessionId,
       subscriptionId: dispatched.subscription.id,
+      trustLevel: 'owner',
+      targetCircle: dispatched.targetCircle,
       updatedAt: this.nowFn().toISOString(),
     });
   }
@@ -1020,11 +1476,9 @@ export class RouterRuntime {
       status: 'resolved',
       updatedAt: this.nowFn().toISOString(),
     });
-    if (this.db.getMeta(FOCUS_META_KEY)?.trim() === updated.id) {
-      this.clearFocus();
-    }
 
     if (updated.workerSessionId) {
+      this.hub.setSessionTurnOverride?.(updated.workerSessionId, 3, OWNER_TURN_OVERRIDE_TTL_MS);
       const followupText = [
         '[DSH Router Owner Decision]',
         `decisionId: ${updated.id}`,
@@ -1035,6 +1489,8 @@ export class RouterRuntime {
       await sendWorkerFollowup(this.ctx, updated.workerSessionId, followupText, {
         decisionId: updated.id,
         selectedOption: chosen,
+        source: 'wechat-admin',
+        trust: 'owner',
       });
     }
 
@@ -1087,6 +1543,10 @@ export class RouterRuntime {
       imagePath: imagePath ?? undefined,
     });
 
+    if (existing.workerSessionId) {
+      this.hub.clearSessionTurnOverride?.(existing.workerSessionId);
+    }
+
     return this.db.upsertDecision({
       ...updatedBase,
       destination: routed.attention.destination,
@@ -1124,14 +1584,14 @@ export class RouterRuntime {
     let processed = 0;
     let delivered = 0;
 
-    if (attention.destination === 'wechat' && this.getActiveFocus()) {
-      return { processed: 0, delivered: 0 };
-    }
-
-    let resolvedWechatTarget: string | null = null;
+    const webItems: Array<{ notif: RouterNotificationRecord; decision: RouterDecisionRecord }> = [];
+    const wechatGroupMap = new Map<
+      string,
+      { decision: RouterDecisionRecord; notifs: RouterNotificationRecord[] }
+    >();
 
     for (const notif of deferredList) {
-      const dueReached = notif.dueAt !== null && Date.parse(notif.dueAt) <= nowMs;
+      const dueReached = notif.dueAt === null || Date.parse(notif.dueAt) <= nowMs;
       const webPresentDelivery = attention.destination === 'web';
       const activeChannelDelivery =
         dueReached && (attention.destination === 'web' || attention.destination === 'wechat');
@@ -1150,7 +1610,6 @@ export class RouterRuntime {
         continue;
       }
 
-      processed += 1;
       let nextChannel: NotifyChannel = attention.destination;
       const isOrdinaryInform =
         nextChannel === 'wechat' &&
@@ -1161,62 +1620,141 @@ export class RouterRuntime {
         nextChannel = 'web';
       }
 
-      let target = 'web';
-      let ok = false;
-
       if (nextChannel === 'web') {
-        ok = true;
+        webItems.push({ notif, decision });
       } else if (nextChannel === 'wechat') {
-        if (resolvedWechatTarget === null) {
-          resolvedWechatTarget = await this.resolveWechatTarget();
+        const existingGroup = wechatGroupMap.get(decision.id);
+        if (existingGroup) {
+          existingGroup.notifs.push(notif);
+        } else {
+          wechatGroupMap.set(decision.id, { decision, notifs: [notif] });
         }
-        target = resolvedWechatTarget;
-        const text = this.formatNotificationText(decision);
-        ok = await this.deliverToWechat(
-          decision,
-          target,
-          text,
-          notif.reason,
-          `deferred:${notif.id}`,
-          decision.imagePath ?? undefined,
-        );
       }
+    }
 
-      if (ok) {
-        delivered += 1;
-        this.db.upsertNotification({
-          ...notif,
-          channel: nextChannel,
-          target,
-          status: 'delivered',
-          dueAt: null,
+    for (const { notif, decision } of webItems) {
+      processed += 1;
+      delivered += 1;
+      this.db.upsertNotification({
+        ...notif,
+        channel: 'web',
+        target: 'web',
+        status: 'delivered',
+        dueAt: null,
+        updatedAt: nowIso,
+      });
+      if (decision.status === 'deferred') {
+        this.db.upsertDecision({
+          ...decision,
+          destination: 'web',
+          status: 'notified',
           updatedAt: nowIso,
         });
-        if (decision.status === 'deferred') {
-          this.db.upsertDecision({
-            ...decision,
-            destination: nextChannel,
-            status: 'notified',
-            updatedAt: nowIso,
-          });
+      }
+    }
+
+    const wechatGroups = [...wechatGroupMap.values()];
+    if (wechatGroups.length > 0) {
+      const target = await this.resolveWechatTarget();
+
+      if (wechatGroups.length >= BATCH_SUMMARY_THRESHOLD) {
+        const batchDecisions = wechatGroups.map((g) => g.decision);
+        const allNotifs = wechatGroups.flatMap((g) => g.notifs);
+        processed += allNotifs.length;
+        const batchKey = `router-batch:${allNotifs.map((n) => n.id.slice(0, 6)).join(',')}:${nowMs}`;
+        const ok = await this.deliverBatchSummaryToWechat(target, batchDecisions, batchKey);
+        if (ok) {
+          delivered += batchDecisions.length;
+          for (const group of wechatGroups) {
+            for (const notif of group.notifs) {
+              this.db.upsertNotification({
+                ...notif,
+                channel: 'wechat',
+                target,
+                status: 'delivered',
+                dueAt: null,
+                updatedAt: nowIso,
+              });
+            }
+            if (group.decision.status === 'deferred') {
+              this.db.upsertDecision({
+                ...group.decision,
+                destination: 'wechat',
+                status: 'notified',
+                updatedAt: nowIso,
+              });
+            }
+          }
+          await this.ownerSession.injectReceiptLines(
+            batchDecisions.map(
+              (d) => `[已推送给主人] [#${extractShortId(d)}] ${shortLine(d.summary, 120)}`,
+            ),
+          );
+        } else {
+          for (const notif of allNotifs) {
+            const failReason = notif.reason.includes('wechat_delivery_failed')
+              ? notif.reason
+              : `${notif.reason};wechat_delivery_failed`;
+            this.db.upsertNotification({
+              ...notif,
+              channel: 'wechat',
+              target,
+              reason: failReason,
+              status: 'deferred',
+              updatedAt: nowIso,
+            });
+          }
         }
-        if (nextChannel === 'wechat') {
-          this.setFocus(decision.id);
-          this.markDecisionDeferredNotifications(decision.id, 'delivered', nowIso, 'wechat', target);
-          break;
+      } else {
+        for (const group of wechatGroups) {
+          const primary = group.notifs[0]!;
+          processed += group.notifs.length;
+          const text = this.formatNotificationText(group.decision);
+          const ok = await this.deliverToWechat(
+            group.decision,
+            target,
+            text,
+            primary.reason,
+            `deferred:${primary.id}`,
+            group.decision.imagePath ?? undefined,
+          );
+          if (ok) {
+            delivered += 1;
+            for (const notif of group.notifs) {
+              this.db.upsertNotification({
+                ...notif,
+                channel: 'wechat',
+                target,
+                status: 'delivered',
+                dueAt: null,
+                updatedAt: nowIso,
+              });
+            }
+            if (group.decision.status === 'deferred') {
+              this.db.upsertDecision({
+                ...group.decision,
+                destination: 'wechat',
+                status: 'notified',
+                updatedAt: nowIso,
+              });
+            }
+            await this.ownerSession.injectPushReceipt(group.decision);
+          } else {
+            for (const notif of group.notifs) {
+              const failReason = notif.reason.includes('wechat_delivery_failed')
+                ? notif.reason
+                : `${notif.reason};wechat_delivery_failed`;
+              this.db.upsertNotification({
+                ...notif,
+                channel: 'wechat',
+                target,
+                reason: failReason,
+                status: 'deferred',
+                updatedAt: nowIso,
+              });
+            }
+          }
         }
-      } else if (nextChannel === 'wechat') {
-        const failReason = notif.reason.includes('wechat_delivery_failed')
-          ? notif.reason
-          : `${notif.reason};wechat_delivery_failed`;
-        this.db.upsertNotification({
-          ...notif,
-          channel: 'wechat',
-          target,
-          reason: failReason,
-          status: 'deferred',
-          updatedAt: nowIso,
-        });
       }
     }
 
@@ -1264,6 +1802,8 @@ export class RouterRuntime {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.ownerSession.dispose();
+    this.approvals.close();
     while (this.disposers.length > 0) {
       try {
         this.disposers.pop()?.();

@@ -11,6 +11,8 @@ export const inject = ['hub'] as const;
 
 export interface RouterPluginConfig extends RouterDbOptions {
   tickIntervalMs?: number;
+  ownerDebounceMs?: number;
+  approvalTtlMs?: number;
   initialPolicy?: Partial<AttentionPolicy>;
   llm?: TriageLlmLike | null;
   now?: () => Date;
@@ -23,7 +25,11 @@ export interface CordisRouterContext extends RouterServiceContext, RouterHttpCon
   set?: (key: string, value: unknown) => void;
   inject?: (deps: readonly string[], callback: (subCtx: CordisRouterContext) => void) => unknown;
   effect?: (callback: () => (() => void) | void) => unknown;
-  on?: (event: string, listener: () => void) => unknown;
+  on?: (
+    event: string,
+    listener: (...args: any[]) => any,
+    options?: { prepend?: boolean },
+  ) => unknown;
 }
 
 export function apply(ctx: CordisRouterContext, config: RouterPluginConfig = {}): RouterRuntime {
@@ -39,6 +45,7 @@ export function apply(ctx: CordisRouterContext, config: RouterPluginConfig = {})
     stateDir: config.stateDir,
     homeDir: config.homeDir,
     inMemory: config.inMemory,
+    legacyWxarcDbPath: config.legacyWxarcDbPath,
   });
 
   const service = createRouterRuntime({
@@ -48,6 +55,8 @@ export function apply(ctx: CordisRouterContext, config: RouterPluginConfig = {})
     llm: config.llm,
     now: config.now,
     homeDir: config.homeDir,
+    ownerDebounceMs: config.ownerDebounceMs,
+    approvalTtlMs: config.approvalTtlMs,
     initialPolicy: config.initialPolicy,
   });
 
@@ -101,6 +110,9 @@ export {
 } from './db.js';
 export * from './policy.js';
 export * from './triage.js';
+export * from './task-permissions.js';
+export * from './approvals.js';
+export * from './owner-session.js';
 export * from './worker-dispatcher.js';
 export * from './service.js';
 export * from './http-routes.js';

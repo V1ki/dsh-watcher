@@ -1,3 +1,5 @@
+import type { TrustLevel, VaultVisibility } from '@local/dsh-hub/contracts';
+
 export type RouterActionLevel = 'ignore' | 'inform' | 'prepare' | 'act';
 
 export type PresenceMode = 'auto' | 'present' | 'away';
@@ -74,6 +76,8 @@ export interface RouterDecisionRecord {
   draftText?: string | null;
   blindspot?: string | null;
   reportMode?: WorkerReportMode | null;
+  trustLevel?: TrustLevel | null;
+  targetCircle?: VaultVisibility | null;
   createdAt: string;
   updatedAt: string;
 }
