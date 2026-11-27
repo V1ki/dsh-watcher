@@ -886,10 +886,14 @@ export class Automation {
       let source: any;
       let problem: string | undefined;
       let pendingAdminReply: { replyText?: string; imagePath?: string } | null = null;
+      const baseLocalType =
+        typeof event.local_type === 'number' ? event.local_type % 4294967296 : 0;
+      const isSupportedTextType = [1, 3, 34, 43, 47, 49].includes(baseLocalType);
+      const hasContent = Boolean(event.text) || baseLocalType === 34 || baseLocalType === 43;
       if (
         (inPolicyScope || isAdminSession) &&
-        event.text &&
-        (event.kind === 'sns' || [1, 3, 47, 49].includes(event.local_type % 4294967296)) &&
+        hasContent &&
+        (event.kind === 'sns' || isSupportedTextType) &&
         (manualAt || this.now() / 1000 - event.ts <= policy.maxAgeSeconds) &&
         event.ts <= this.now() / 1000 + 30
       ) {
@@ -1088,10 +1092,14 @@ export class Automation {
       (selected.kind === 'sns'
         ? p.moments !== 'off'
         : p.allChats && selected.session !== 'filehelper' && !selected.session?.startsWith('gh_'));
+    const selectedBaseType =
+      typeof selected.local_type === 'number' ? selected.local_type % 4294967296 : 0;
+    const selectedHasContent =
+      Boolean(selected.text) || selectedBaseType === 34 || selectedBaseType === 43;
     if (
       !scope ||
-      !selected.text ||
-      (selected.kind !== 'sns' && ![1, 3, 47, 49].includes(selected.local_type % 4294967296)) ||
+      !selectedHasContent ||
+      (selected.kind !== 'sns' && ![1, 3, 34, 43, 47, 49].includes(selectedBaseType)) ||
       (!allowHistorical && this.now() / 1000 - selected.ts > p.maxAgeSeconds)
     ) {
       throw new Error('这条消息不在当前范围或时效内');
@@ -1328,8 +1336,8 @@ export class Automation {
       this.store.db
         .prepare('INSERT INTO automation_attempts(job_id,at) VALUES (?,?)')
         .run(job.id, this.now());
-      if ([3, 47].includes(job.event.local_type % 4294967296)) {
-        throw new Error('图片消息需要 DSH 原生 Agent');
+      if ([3, 43, 47].includes(job.event.local_type % 4294967296)) {
+        throw new Error('图片或视频消息需要 DSH 原生 Agent');
       }
       const decision = await decide(
         this.llm,

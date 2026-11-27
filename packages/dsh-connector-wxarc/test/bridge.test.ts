@@ -366,7 +366,15 @@ test('/wxarc/bridge/* enforces Bearer auth and loopback host, provides wxarcBrid
       retain: 1000,
       bridgeToken: secretToken,
     });
-    assert.deepEqual(registeredTools, ['wxarc_sticker_search', 'wxarc_status', 'wxarc_messages']);
+    assert.deepEqual(registeredTools, [
+      'wxarc_sticker_search',
+      'wxarc_status',
+      'wxarc_messages',
+      'wxarc_targets',
+      'wxarc_nas_search',
+    ]);
+    assert.equal(typeof provided.get('wxarcMemoPrincipal'), 'function');
+    assert.equal(typeof provided.get('wxarcTargetDirectory'), 'function');
     const cordisBridge = provided.get('wxarcBridge') as ReturnType<typeof createWxarcBridge>;
     assert.ok(cordisBridge);
     assert.equal(typeof cordisBridge.send, 'function');

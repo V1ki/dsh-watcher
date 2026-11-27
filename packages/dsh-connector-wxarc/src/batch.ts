@@ -61,6 +61,7 @@ export interface BatchContentPart {
 
 export interface BatchImageProvider {
   part(event: WxarcEvent): BatchContentPart;
+  videoParts?(event: WxarcEvent): BatchContentPart[];
 }
 
 export const messagesOf = (event: WxarcEvent): WxarcEvent[] => event.batch?.messages || [event];
@@ -459,6 +460,16 @@ export function batchContent(event: WxarcEvent, images?: BatchImageProvider): Ba
       );
       flush();
       parts.push(images!.part(e));
+    }
+    if (typeof e.local_type === 'number' && e.local_type % 4294967296 === 43 && images?.videoParts) {
+      const videoParts = images.videoParts(e);
+      if (videoParts.length > 0) {
+        lines.push(`第 ${i + 1} 条消息的视频画面（封面或关键帧，共 ${videoParts.length} 张）：`);
+        flush();
+        for (const vp of videoParts) {
+          parts.push(vp);
+        }
+      }
     }
   }
   flush();

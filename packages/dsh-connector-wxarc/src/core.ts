@@ -62,7 +62,35 @@ export interface EventImage {
   sticker?: boolean;
   thumbnailOnly?: boolean;
   variant?: 'high' | 'image' | 'thumb';
+  dhash?: string;
   [key: string]: unknown;
+}
+
+export interface EventVoice {
+  kind: 'voice';
+  status: 'transcribed' | 'decoded' | 'pending' | 'unavailable';
+  transcript?: string;
+  wavPath?: string;
+  durationSec?: number;
+  source?: string;
+  hash?: string;
+  detail?: string;
+  usedCloudAsr?: boolean;
+  nasDegraded?: boolean;
+}
+
+export interface EventVideo {
+  kind: 'video';
+  status: 'ready' | 'poster_only' | 'pending' | 'unavailable';
+  poster?: EventImage & { path?: string; hash?: string; mediaType?: string; bytes?: number };
+  keyframes?: Array<EventImage & { path?: string; hash?: string; mediaType?: string; bytes?: number }>;
+  transcript?: string;
+  durationSec?: number;
+  source?: string;
+  hash?: string;
+  detail?: string;
+  keyframesSkippedReason?: string;
+  nasDegraded?: boolean;
 }
 
 export interface EventBatch {
@@ -111,6 +139,9 @@ export interface WxarcEvent {
   batch?: EventBatch;
   article?: EventArticle;
   image?: EventImage;
+  voice?: EventVoice;
+  video?: EventVideo;
+  multimodalRecall?: Record<string, unknown>;
   manualRequestedAt?: number;
   dshRunId?: string;
   memoTrigger?: MemoTriggerContext;
@@ -233,10 +264,30 @@ export function quoteData(row: Record<string, unknown>): QuoteData | null {
   return out;
 }
 
-export function messageBody(event: { kind?: string; local_type?: number; text?: string }): string {
-  return isQuote(event)
-    ? (event.text ?? '').replace(/^\[(?:引用|链接\/文件)\]\s?/, '')
-    : (event.text as string);
+export function messageBody(event: {
+  kind?: string;
+  local_type?: number;
+  text?: string;
+  voice?: { transcript?: string };
+  video?: { transcript?: string };
+}): string {
+  if (isQuote(event)) {
+    return (event.text ?? '').replace(/^\[(?:引用|链接\/文件)\]\s?/, '');
+  }
+  const baseType = typeof event.local_type === 'number' ? event.local_type % 4294967296 : 0;
+  if (event.kind === 'text' && baseType === 34) {
+    const transcript = event.voice?.transcript?.trim();
+    if (transcript) {
+      return `[语音转写] ${transcript}`;
+    }
+    return event.text || '[语音]';
+  }
+  if (event.kind === 'text' && baseType === 43) {
+    const baseText = event.text || '[视频]';
+    const transcript = event.video?.transcript?.trim();
+    return transcript ? `${baseText}\n[视频画外音转写] ${transcript}` : baseText;
+  }
+  return event.text as string;
 }
 
 export function endpoint(value: string): string {

@@ -119,7 +119,7 @@ test('ignores own, stale, unlisted and non-text messages', async (t) => {
   f.append(1, { sender: 'wxid_me' });
   f.append(2, { ts: 1 });
   f.append(3, { session: 'other' });
-  f.append(4, { local_type: 43 });
+  f.append(4, { local_type: 10000 });
   await f.auto.collect();
   assert.equal(f.auto.jobs().length, 0);
 });

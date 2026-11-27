@@ -97,6 +97,10 @@ export interface CordisWxarcBridgeLike {
 export interface FetchResponseLike {
   status: number;
   ok: boolean;
+  headers?: {
+    get?: (name: string) => string | null;
+    getSetCookie?: () => string[];
+  };
   json(): Promise<unknown>;
   text?: () => Promise<string>;
 }

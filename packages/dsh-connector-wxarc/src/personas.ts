@@ -340,8 +340,11 @@ CREATE TABLE IF NOT EXISTS persona_memory(id INTEGER PRIMARY KEY,persona_id TEXT
         .all(id, scopeFor(event)) as unknown as PersonaMemoryContextItem[]
     ).reverse();
     const owner = policy.controllerId;
+    const isGroup = Boolean(event.session?.endsWith('@chatroom'));
     if (
       owner &&
+      !isGroup &&
+      !event.memoTrigger &&
       (ownerPreview || (event.kind === 'text' && event.session === owner && event.senderId === owner))
     ) {
       const rows = this.store.db

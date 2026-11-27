@@ -128,7 +128,13 @@ test('mounted plugin exposes read-only HTTP and tools, reports unavailable sourc
     );
     assert.deepEqual(
       definitions.map((d) => d.name),
-      ['wxarc_sticker_search', 'wxarc_status', 'wxarc_messages'],
+      [
+        'wxarc_sticker_search',
+        'wxarc_status',
+        'wxarc_messages',
+        'wxarc_targets',
+        'wxarc_nas_search',
+      ],
     );
     assert.equal(
       (await definitions.find((d) => d.name === 'wxarc_status')!.execute({})).automaticAI,

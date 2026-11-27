@@ -44,6 +44,17 @@ export interface EnrichedImage {
   width?: number;
   height?: number;
   thumbnailOnly?: boolean;
+  dhash?: string;
+}
+
+export interface ReferenceCardImageInput {
+  id?: string;
+  entityName?: string;
+  label?: string;
+  thumbnailPath?: string;
+  imagePath?: string;
+  thumbnailBase64?: string;
+  mediaType?: string;
 }
 
 export interface ImageEvent {
@@ -219,6 +230,41 @@ export function imageDimensions(
   return null;
 }
 
+const MAX_REFERENCE_CARD_BYTES = 2 * 1024 * 1024;
+
+export function loadReferenceCardPart(card: ReferenceCardImageInput): ImagePart | null {
+  try {
+    let bytes: Buffer | null = null;
+    if (typeof card.thumbnailBase64 === 'string' && card.thumbnailBase64.trim()) {
+      const cleaned = card.thumbnailBase64.trim().replace(/^data:image\/[a-zA-Z0-9+.-]+;base64,/, '');
+      bytes = Buffer.from(cleaned, 'base64');
+    } else {
+      const pathCandidate = (card.thumbnailPath || card.imagePath || '').trim();
+      if (!pathCandidate) {
+        return null;
+      }
+      const st = statSync(pathCandidate);
+      if (!st.isFile() || st.size <= 0 || st.size > MAX_REFERENCE_CARD_BYTES) {
+        return null;
+      }
+      bytes = readFileSync(pathCandidate);
+    }
+    if (!bytes || bytes.length === 0 || bytes.length > MAX_REFERENCE_CARD_BYTES) {
+      return null;
+    }
+    const mediaType = imageType(bytes);
+    const label = (card.entityName || card.label || card.id || 'ref').replace(/[^\p{L}\p{N}_-]+/gu, '_');
+    return {
+      type: 'image',
+      mediaType,
+      data: bytes.toString('base64'),
+      name: `参考小图-${label}.${EXT_BY_TYPE[mediaType]}`,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export class ImageReader {
   listener: ImageListener;
   dir: string;
@@ -377,5 +423,9 @@ export class ImageReader {
       data: bytes.toString('base64'),
       name: `微信图片-${event.id}.${v.path.split('.').at(-1)}`,
     };
+  }
+
+  referencePart(card: ReferenceCardImageInput): ImagePart | null {
+    return loadReferenceCardPart(card);
   }
 }
