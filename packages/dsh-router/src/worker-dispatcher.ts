@@ -189,11 +189,11 @@ function buildWorkerBrief(
     '',
     '处理要求：',
     '1. 直接在当前工作区查清情况或准备好改动；不要往业务仓库里乱写分析报告或临时 .md 文件。',
-    '2. 汇报给管理员时全程说人话、讲重点，正文控制在 200 字以内；不要硬凑 4 选 1 战略题，也不要写空话套话。',
-    '3. 如果改了界面或样式，实际跑起来截一张运行图，把图片绝对路径填到 imagePath。',
-    '4. 如果准备对外发 GitHub 评论或回复，把拟发送的原文填到 draftText，等管理员确认后再发。',
-    '5. 没实测到、或者不确定的地方，诚实写进 blindspot。',
-    `6. 查完或改完后调用 router_report_result（decisionId="${decision.id}"），填好 conclusion 以及按需填写 changes、draftText、imagePath、blindspot、question、mode。`,
+    '2. conclusion 必须用大白话、严格控制在 200 字以内：只说结论、风险和需要管理员拍板的点，不要背函数名、文件路径和代码流水账，也不要硬凑 4 选 1 战略题。',
+    '3. 如果准备对外发 GitHub 评论或回复，把拟发送原文填到 draftText：像真人维护者一样 3–6 句话说完（一般不超过 500–600 字符），只给判断和需要改的点，不要把作者刚写的代码细节逐行复述给作者听，不要写带小标题的 AI 评审长文。',
+    '4. 重要：router_report_result(draftText) 仅用于把草稿发给管理员在微信审阅确认，不会自动发到 GitHub；真要发到 GitHub 必须等管理员确认后再明确调用 GitHub 写入工具。',
+    '5. 如果改了界面或样式，实际跑起来截一张运行图，把图片绝对路径填到 imagePath；没实测到、或者不确定的地方诚实写进 blindspot。',
+    `6. 查完或改完后调用 router_report_result（decisionId="${decision.id}"），填好 conclusion 以及按需填写 draftText、imagePath、blindspot、question、mode。`,
   );
   return lines.join('\n');
 }
@@ -336,12 +336,13 @@ function registerOnToolsRegistry(
       conclusion: {
         type: 'string',
         description:
-          'Concise summary of findings or completed preparation, MUST be written in plain Simplified Chinese (简体中文); keep repo/file paths/branch names/code symbols verbatim',
+          'Plain Simplified Chinese (简体中文) summary strictly <= 200 chars: state ONLY the conclusion, risk, and what needs owner sign-off; do NOT list function names or code play-by-play',
       },
       changes: {
         type: 'array',
         items: { type: 'string' },
-        description: 'Optional list of prepared changes or artifacts, MUST be written in Simplified Chinese (简体中文)',
+        description:
+          'Optional short metadata list of touched items in Simplified Chinese (简体中文); NOT appended to the WeChat summary',
       },
       question: {
         type: 'string',
@@ -363,7 +364,8 @@ function registerOnToolsRegistry(
       },
       draftText: {
         type: 'string',
-        description: 'Optional exact draft text proposed for an outbound comment or reply',
+        description:
+          'Optional outbound GitHub comment/reply draft for owner review in WeChat ONLY — calling router_report_result NEVER posts to GitHub automatically (you must wait for owner confirmation and explicitly invoke a GitHub write tool to publish). Write like a real human maintainer in 3-6 concise sentences (typically <= 500-600 chars) stating judgment and required edits; do NOT recap the author\'s code line by line or write titled AI review essays.',
       },
       blindspot: {
         type: 'string',
@@ -379,7 +381,7 @@ function registerOnToolsRegistry(
   const dispose = tools.register({
     name: 'router_report_result',
     description:
-      'Submit a concise Worker report (conclusion, optional changes, draftText, imagePath, blindspot, question, options, mode) back to DSH Router. All owner-facing text fields MUST be plain, concise Simplified Chinese (<= 200 chars).',
+      'Submit a concise Worker report back to DSH Router for owner review in WeChat. conclusion MUST be plain Simplified Chinese strictly <= 200 chars (conclusion, risk, decision point only — no function-name laundry list). draftText is ONLY shown to the owner in WeChat for approval and is NEVER posted to GitHub automatically (publish only after owner confirmation via explicit GitHub write tools); keep draftText human and concise (3-6 sentences, <= 500-600 chars, no line-by-line code recap or titled AI essays).',
     parameters: schema,
     inputSchema: schema,
     output: {

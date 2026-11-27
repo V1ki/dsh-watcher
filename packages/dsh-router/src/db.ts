@@ -24,6 +24,7 @@ export interface ListDecisionsFilter {
   level?: RouterActionLevel;
   since?: string;
   limit?: number;
+  order?: 'asc' | 'desc';
 }
 
 export interface ListNotificationsFilter {
@@ -31,6 +32,7 @@ export interface ListNotificationsFilter {
   channel?: NotifyChannel;
   decisionId?: string;
   limit?: number;
+  order?: 'asc' | 'desc';
 }
 
 type SqlRow = Record<string, unknown>;
@@ -375,8 +377,10 @@ export class RouterDb {
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const limit = Math.max(1, Math.min(500, Number(filter.limit ?? 100) || 100));
     params.push(limit);
+    const orderClause =
+      filter.order === 'asc' ? 'ORDER BY created_at ASC, rowid ASC' : 'ORDER BY updated_at DESC, created_at DESC';
     const rows = this.db
-      .prepare(`SELECT * FROM router_decisions ${where} ORDER BY updated_at DESC, created_at DESC LIMIT ?`)
+      .prepare(`SELECT * FROM router_decisions ${where} ${orderClause} LIMIT ?`)
       .all(...params) as SqlRow[];
     return rows.map(mapDecisionRow);
   }
@@ -452,8 +456,10 @@ export class RouterDb {
     const where = clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : '';
     const limit = Math.max(1, Math.min(500, Number(filter.limit ?? 100) || 100));
     params.push(limit);
+    const orderClause =
+      filter.order === 'asc' ? 'ORDER BY created_at ASC, rowid ASC' : 'ORDER BY created_at DESC, rowid DESC';
     const rows = this.db
-      .prepare(`SELECT * FROM router_notifications ${where} ORDER BY created_at DESC LIMIT ?`)
+      .prepare(`SELECT * FROM router_notifications ${where} ${orderClause} LIMIT ?`)
       .all(...params) as SqlRow[];
     return rows.map(mapNotificationRow);
   }
@@ -463,7 +469,7 @@ export class RouterDb {
       .prepare(
         `SELECT * FROM router_notifications
          WHERE status = 'deferred' AND (due_at IS NULL OR due_at <= ?)
-         ORDER BY created_at ASC`,
+         ORDER BY created_at ASC, rowid ASC`,
       )
       .all(nowIso) as SqlRow[];
     return rows.map(mapNotificationRow);

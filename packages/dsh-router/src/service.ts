@@ -27,7 +27,7 @@ import {
   normalizeAttentionPolicy,
   resolveAttentionDestination,
 } from './policy.js';
-import { triageEvent, type TriageLlmLike } from './triage.js';
+import { triageEvent, type TriageLlmLike, type TriageLoggerLike } from './triage.js';
 import {
   dispatchWorker,
   registerRouterTools,
@@ -84,6 +84,7 @@ function parseQuotedTaskRef(quotedText?: string): string | null {
 
 export interface RouterServiceContext extends WorkerDispatcherContext {
   llm?: TriageLlmLike;
+  logger?: TriageLoggerLike;
 }
 
 export interface RouterRuntimeOptions {
@@ -207,6 +208,15 @@ export class RouterRuntime {
     return this.ctx.llm ?? null;
   }
 
+  private resolveLogger(): TriageLoggerLike | null {
+    if (!this.ctx) return null;
+    if (typeof this.ctx.get === 'function') {
+      const fromGet = this.ctx.get('logger') as TriageLoggerLike | undefined;
+      if (fromGet) return fromGet;
+    }
+    return this.ctx.logger ?? null;
+  }
+
   private async resolveWechatTarget(): Promise<string> {
     const configured = this.policy.wechatTarget?.trim() ?? '';
     if (configured && configured !== 'filehelper') {
@@ -257,7 +267,7 @@ export class RouterRuntime {
     if (excludeId) seen.add(excludeId);
     const queued: RouterDecisionRecord[] = [];
 
-    const deferredNotifs = this.db.listNotifications({ status: 'deferred', limit: 200 });
+    const deferredNotifs = this.db.listNotifications({ status: 'deferred', limit: 200, order: 'asc' });
     for (const notif of deferredNotifs) {
       if (seen.has(notif.decisionId)) continue;
       const decision = this.db.getDecision(notif.decisionId);
@@ -267,7 +277,7 @@ export class RouterRuntime {
       if (queued.length >= limit) return queued;
     }
 
-    const deferredDecisions = this.db.listDecisions({ status: 'deferred', limit: 50 });
+    const deferredDecisions = this.db.listDecisions({ status: 'deferred', limit: 50, order: 'asc' });
     for (const decision of deferredDecisions) {
       if (seen.has(decision.id)) continue;
       seen.add(decision.id);
@@ -345,7 +355,11 @@ export class RouterRuntime {
     lines.push(
       `管理员原话: ${userText}`,
       '',
-      '管理员在微信里回复了你，请用大白话接着聊/改；改界面请截一张实际运行图填 `imagePath`；处理完调用 `router_report_result` 回他微信。',
+      '管理员在微信里回复了你，请用大白话接着聊/改：',
+      '- `conclusion` 严格控制在 200 字以内，只说结论、风险和需要管理员拍板的点，不要背函数名和代码流水账；',
+      '- 若需拟发 GitHub 评论填 `draftText`，像真人维护者一样 3–6 句话说完（一般不超过 500–600 字符），只给判断和需要改的点，不要逐行复述作者代码，不要写带小标题的评审长文；',
+      '- 注意：`router_report_result(draftText)` 仅用于给管理员在微信审阅确认，不会自动发到 GitHub；若管理员已明确同意对外发送，请直接调用 GitHub 写入工具发送后再汇报结果；',
+      '- 改界面请截一张实际运行图填 `imagePath`；处理完调用 `router_report_result` 回他微信。',
     );
 
     const ok = await sendWorkerFollowup(this.ctx, target.workerSessionId, lines.join('\n'), {
@@ -444,20 +458,18 @@ export class RouterRuntime {
       const target = this.findDecisionByRef(prefixRef.ref);
       if (target) {
         const nowIso = this.nowFn().toISOString();
+        const wechatTarget = await this.resolveWechatTarget();
         this.setFocus(target.id);
         let current = target;
         if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
-          const wechatTarget = await this.resolveWechatTarget();
           current = this.db.upsertDecision({
             ...target,
             destination: 'wechat',
             status: 'notified',
             updatedAt: nowIso,
           });
-          if (target.status === 'deferred') {
-            this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
-          }
         }
+        this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
         if (!prefixRef.rest) {
           return {
             handled: true,
@@ -480,20 +492,18 @@ export class RouterRuntime {
       const target = this.findDecisionByRef(quotedRef);
       if (target) {
         const nowIso = this.nowFn().toISOString();
+        const wechatTarget = await this.resolveWechatTarget();
         this.setFocus(target.id);
         let current = target;
         if (target.status === 'deferred' || target.status === 'resolved' || target.status === 'filtered') {
-          const wechatTarget = await this.resolveWechatTarget();
           current = this.db.upsertDecision({
             ...target,
             destination: 'wechat',
             status: 'notified',
             updatedAt: nowIso,
           });
-          if (target.status === 'deferred') {
-            this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
-          }
         }
+        this.markDecisionDeferredNotifications(current.id, 'delivered', nowIso, 'wechat', wechatTarget);
         return this.forwardAdminReplyToWorker(current, rawText, msg);
       }
     }
@@ -537,6 +547,61 @@ export class RouterRuntime {
       lines.push('直接回复就能接着聊；回“下一个”切下一条');
     }
     return lines.join('\n');
+  }
+
+  private upsertDeferredWechatNotification(input: {
+    decision: RouterDecisionRecord;
+    target: string;
+    title: string;
+    summary: string;
+    reason: string;
+    dueAt: string | null;
+    nowIso: string;
+  }): RouterNotificationRecord {
+    const existing = this.db.listNotifications({
+      decisionId: input.decision.id,
+      channel: 'wechat',
+      status: 'deferred',
+      limit: 50,
+      order: 'asc',
+    });
+    if (existing.length > 0) {
+      const [primary, ...duplicates] = existing;
+      for (const dup of duplicates) {
+        this.db.upsertNotification({
+          ...dup,
+          status: 'read',
+          dueAt: null,
+          updatedAt: input.nowIso,
+        });
+      }
+      return this.db.upsertNotification({
+        ...primary,
+        channel: 'wechat',
+        target: input.target,
+        title: input.title,
+        summary: input.summary,
+        reason: input.reason,
+        rawUrl: input.decision.rawUrl,
+        status: 'deferred',
+        dueAt: input.dueAt,
+        updatedAt: input.nowIso,
+      });
+    }
+    return this.db.upsertNotification({
+      id: randomUUID(),
+      decisionId: input.decision.id,
+      channel: 'wechat',
+      target: input.target,
+      title: input.title,
+      summary: input.summary,
+      reason: input.reason,
+      rawUrl: input.decision.rawUrl,
+      status: 'deferred',
+      dueAt: input.dueAt,
+      createdAt: input.nowIso,
+      updatedAt: input.nowIso,
+    });
   }
 
   private async deliverToWechat(
@@ -628,19 +693,14 @@ export class RouterRuntime {
       const target = await this.resolveWechatTarget();
       const activeFocus = this.getActiveFocus();
       if (activeFocus && activeFocus.id !== decision.id && !options.urgent) {
-        const notif = this.db.upsertNotification({
-          id: randomUUID(),
-          decisionId: decision.id,
-          channel: 'wechat',
+        const notif = this.upsertDeferredWechatNotification({
+          decision,
           target,
           title,
           summary,
           reason: `${reason};queued_behind_focus`,
-          rawUrl: decision.rawUrl,
-          status: 'deferred',
           dueAt: nowIso,
-          createdAt: nowIso,
-          updatedAt: nowIso,
+          nowIso,
         });
         return { attention, notification: notif, deferred: true };
       }
@@ -658,6 +718,7 @@ export class RouterRuntime {
       );
       if (sent) {
         this.setFocus(decision.id);
+        this.markDecisionDeferredNotifications(decision.id, 'read', nowIso);
         const notif = this.db.upsertNotification({
           id: randomUUID(),
           decisionId: decision.id,
@@ -675,19 +736,14 @@ export class RouterRuntime {
         return { attention, notification: notif, deferred: false };
       }
       const fallbackDue = computeNextWorkStartIso(now, this.policy);
-      const notif = this.db.upsertNotification({
-        id: randomUUID(),
-        decisionId: decision.id,
-        channel: 'wechat',
+      const notif = this.upsertDeferredWechatNotification({
+        decision,
         target,
         title,
         summary,
         reason: `${reason};wechat_unavailable_deferred`,
-        rawUrl: decision.rawUrl,
-        status: 'deferred',
         dueAt: fallbackDue,
-        createdAt: nowIso,
-        updatedAt: nowIso,
+        nowIso,
       });
       return { attention, notification: notif, deferred: true };
     }
@@ -727,6 +783,7 @@ export class RouterRuntime {
       policy: this.policy,
       recentDecisions,
       llm: this.resolveLlm(),
+      logger: this.resolveLogger(),
     });
 
     const actor = event.actor.login ?? event.actor.displayName ?? event.actor.id;
@@ -979,9 +1036,6 @@ export class RouterRuntime {
     if (!existing) {
       throw new Error(`decision_not_found:${input.decisionId}`);
     }
-    const changes = Array.isArray(input.changes)
-      ? input.changes.map((item) => String(item).trim()).filter(Boolean)
-      : [];
     const options = Array.isArray(input.options)
       ? input.options.map((item) => String(item).trim()).filter(Boolean)
       : [];
@@ -993,8 +1047,7 @@ export class RouterRuntime {
       input.recommendedIndex < options.length
         ? input.recommendedIndex
         : null;
-    const summaryText =
-      changes.length > 0 ? `${input.conclusion.trim()} (${changes.join('; ')})` : input.conclusion.trim();
+    const summaryText = input.conclusion.trim();
 
     const imagePath = input.imagePath?.trim() || null;
     const draftText = input.draftText?.trim() || null;
@@ -1052,7 +1105,7 @@ export class RouterRuntime {
     const now = this.nowFn();
     const nowMs = now.getTime();
     const nowIso = now.toISOString();
-    const deferredList = this.db.listNotifications({ status: 'deferred', limit: 200 });
+    const deferredList = this.db.listNotifications({ status: 'deferred', limit: 200, order: 'asc' });
     if (deferredList.length === 0) {
       return { processed: 0, delivered: 0 };
     }
@@ -1142,6 +1195,18 @@ export class RouterRuntime {
           this.markDecisionDeferredNotifications(decision.id, 'delivered', nowIso, 'wechat', target);
           break;
         }
+      } else if (nextChannel === 'wechat') {
+        const failReason = notif.reason.includes('wechat_delivery_failed')
+          ? notif.reason
+          : `${notif.reason};wechat_delivery_failed`;
+        this.db.upsertNotification({
+          ...notif,
+          channel: 'wechat',
+          target,
+          reason: failReason,
+          status: 'deferred',
+          updatedAt: nowIso,
+        });
       }
     }
 

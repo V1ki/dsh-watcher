@@ -513,7 +513,8 @@ describe('@local/dsh-router backend', () => {
       });
 
       const reported = router.listDecisions().find((d) => d.id === decision.id)!;
-      assert.match(reported.summary, /Root cause isolated/);
+      assert.equal(reported.summary, 'Root cause isolated and patch staged');
+      assert.equal(reported.summary.includes('src/cache.ts'), false);
       assert.equal(reported.options.length, 3);
       assert.equal(reported.recommendedIndex, 0);
 
@@ -1079,8 +1080,9 @@ describe('@local/dsh-router backend', () => {
       assert.equal(afterTimeoutTick.delivered, 1);
       assert.equal(sentWechat.length, 3);
       assert.equal(sentWechat[2].chatId, 'wxid_admin_demo');
-      assert.match(String(sentWechat[2].text), /^\[#153\]/);
-      assert.equal(router.db.getMeta('focused_decision_id'), dec153.id);
+      assert.match(String(sentWechat[2].text), /^\[#152\]/);
+      assert.equal(sentWechat[2].imagePath, '/tmp/metrics-v1.png');
+      assert.equal(router.db.getMeta('focused_decision_id'), dec152.id);
 
       const doneRes = await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
@@ -1088,9 +1090,9 @@ describe('@local/dsh-router backend', () => {
         text: '完成',
       });
       assert.equal(doneRes.handled, true);
-      assert.equal(router.listDecisions().find((d) => d.id === dec153.id)?.status, 'resolved');
-      assert.match(doneRes.replyText ?? '', /\[#152\]/);
-      assert.equal(doneRes.imagePath, '/tmp/metrics-v1.png');
+      assert.equal(router.listDecisions().find((d) => d.id === dec152.id)?.status, 'resolved');
+      assert.match(doneRes.replyText ?? '', /\[#153\]/);
+      assert.equal(doneRes.imagePath, undefined);
 
       const doneEmpty = await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
@@ -1370,6 +1372,370 @@ describe('@local/dsh-router backend', () => {
       assert.match(msg6, /^\[#162\] 排队项等待弹出/);
       assert.equal(msg6.includes('https://github.com/org/repo/pull/162'), true);
       assert.equal(msg6.includes(footer), true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('keeps submitWorkerReport summary slim without appending changes and enforces concise brief/tool/followup rules', async () => {
+    const sentWechat: WechatSendInput[] = [];
+    const { hub, router, env, cleanup } = createHarness({
+      initialPolicy: { presenceMode: 'away' },
+      controllerId: 'wxid_admin_demo',
+      wechatSend: async (input) => {
+        sentWechat.push(input);
+        return { status: 'sent' };
+      },
+    });
+    try {
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-slim-210',
+          threadKey: 'org/repo#210',
+          type: 'github.pr_review_requested',
+          summary: 'Check PR #210 error handling',
+        }),
+      );
+      const dec210 = router.listDecisions().find((d) => d.threadKey === 'org/repo#210')!;
+      assert.ok(dec210);
+
+      const briefText = (env.followups[0].message as { content?: Array<{ text?: string }> }).content?.[0]?.text ?? '';
+      assert.match(briefText, /200 字以内/);
+      assert.match(briefText, /3–6 句话/);
+      assert.match(briefText, /500–600 字符/);
+      assert.match(briefText, /不会自动发到 GitHub/);
+
+      const reportTool = env.tools.get('router_report_result')!;
+      assert.match(reportTool.description, /200 chars/);
+      assert.match(reportTool.description, /NEVER posted to GitHub automatically/);
+      const props = (reportTool.inputSchema as { properties?: Record<string, { description?: string }> }).properties!;
+      assert.match(props.conclusion.description ?? '', /200 chars/);
+      assert.match(props.draftText.description ?? '', /3-6 concise sentences/);
+      assert.match(props.draftText.description ?? '', /NEVER posts to GitHub automatically/);
+
+      const reported = await router.submitWorkerReport({
+        decisionId: dec210.id,
+        conclusion: '已定位空指针风险，建议先补空值保护再合并。',
+        changes: [
+          'packages/core/src/long-path/handler.ts: handleEvent()',
+          'packages/core/test/long-path/handler.test.ts: added 5 cases',
+        ],
+        draftText: '空指针路径还没兜底，建议在 parsePayload 里加空值判断并补一条回归测试，改完就能合。',
+        mode: 'review_draft',
+      });
+
+      assert.equal(reported.summary, '已定位空指针风险，建议先补空值保护再合并。');
+      assert.equal(reported.summary.includes('handler.ts'), false);
+      assert.equal(sentWechat.length, 1);
+      assert.equal(String(sentWechat[0].text).includes('handler.ts'), false);
+      assert.match(String(sentWechat[0].text), /^\[#210\] 已定位空指针风险，建议先补空值保护再合并。/);
+
+      const followupCount = env.followups.length;
+      const adminReply = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '语气再直接一点',
+      });
+      assert.equal(adminReply.handled, true);
+      assert.equal(env.followups.length, followupCount + 1);
+      const followupText =
+        (env.followups[env.followups.length - 1].message as { content?: Array<{ text?: string }> }).content?.[0]?.text ??
+        '';
+      assert.match(followupText, /200 字以内/);
+      assert.match(followupText, /3–6 句话/);
+      assert.match(followupText, /不会自动发到 GitHub/);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('uses 2400 maxTokens, retries once on invalid JSON, logs bounded snippet, and fails open to prepare for open GitHub updates while keeping guardrails', async () => {
+    const seenMaxTokens: Array<number | undefined> = [];
+    let attemptCount = 0;
+    const warnings: string[] = [];
+
+    const retrySuccessLlm: TriageLlmLike = {
+      prepareCall: async (cfg) => {
+        seenMaxTokens.push(cfg.maxTokens);
+        return {
+          config: cfg,
+          async *stream() {
+            attemptCount += 1;
+            if (attemptCount === 1) {
+              yield { type: 'text-delta', text: '{"level":"prepare","summary":"truncated without closing brace' };
+              return;
+            }
+            yield {
+              type: 'text-delta',
+              text: JSON.stringify({
+                level: 'prepare',
+                summary: 'Issue #249 crash bug confirmed',
+                reason: 'llm_retry_ok',
+                shouldDispatchWorker: true,
+                urgent: false,
+                personaId: null,
+                question: null,
+                options: [],
+                recommendedIndex: null,
+              }),
+            };
+          },
+        };
+      },
+    };
+
+    const retryOk = await triageEvent({
+      event: makeEvent({
+        id: 'evt-retry-ok',
+        type: 'github.issue.updated',
+        threadKey: 'org/repo#249',
+        payload: { state: 'open' },
+      }),
+      policy: DEFAULT_ATTENTION_POLICY,
+      llm: retrySuccessLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.deepEqual(seenMaxTokens, [2400, 2400]);
+    assert.equal(attemptCount, 2);
+    assert.equal(retryOk.usedLlm, true);
+    assert.equal(retryOk.level, 'prepare');
+    assert.equal(retryOk.reason, 'llm_retry_ok');
+    assert.equal(warnings.length, 0);
+
+    let failedCalls = 0;
+    const alwaysBrokenText = `not-json-${'x'.repeat(350)}`;
+    const alwaysInvalidLlm: TriageLlmLike = {
+      complete: async () => {
+        failedCalls += 1;
+        return alwaysBrokenText;
+      },
+    };
+
+    const openIssueFailOpen = await triageEvent({
+      event: makeEvent({
+        id: 'evt-failopen-issue-250',
+        type: 'github.issue.updated',
+        threadKey: 'org/repo#250',
+        trustLevel: 'untrusted',
+        payload: { state: 'open', title: 'Crash on missing CLI' },
+      }),
+      policy: { ...DEFAULT_ATTENTION_POLICY, defaultMaxLevel: 'act' },
+      llm: alwaysInvalidLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.equal(failedCalls, 2);
+    assert.equal(openIssueFailOpen.usedLlm, false);
+    assert.equal(openIssueFailOpen.level, 'prepare');
+    assert.equal(openIssueFailOpen.shouldDispatchWorker, true);
+    assert.match(openIssueFailOpen.reason, /llm_fail_open:triage_llm_invalid_json/);
+    assert.match(openIssueFailOpen.reason, /deterministic_fail_open_github\.issue\.updated/);
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0], /triage_llm_invalid_json/);
+    assert.equal(warnings[0].includes('x'.repeat(250)), false);
+
+    const openPrFailOpen = await triageEvent({
+      event: makeEvent({
+        id: 'evt-failopen-pr-251',
+        type: 'github.pr.updated',
+        threadKey: 'org/repo#251',
+        trustLevel: 'owner',
+        payload: { state: 'open', isPr: true },
+      }),
+      policy: DEFAULT_ATTENTION_POLICY,
+      llm: alwaysInvalidLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.equal(openPrFailOpen.level, 'prepare');
+    assert.equal(openPrFailOpen.shouldDispatchWorker, true);
+
+    const closedIssueFailOpen = await triageEvent({
+      event: makeEvent({
+        id: 'evt-failopen-closed-252',
+        type: 'github.issue.updated',
+        threadKey: 'org/repo#252',
+        payload: { state: 'closed' },
+      }),
+      policy: DEFAULT_ATTENTION_POLICY,
+      llm: alwaysInvalidLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.equal(closedIssueFailOpen.level, 'inform');
+    assert.equal(closedIssueFailOpen.shouldDispatchWorker, false);
+
+    const mergedPrFailOpen = await triageEvent({
+      event: makeEvent({
+        id: 'evt-failopen-merged-253',
+        type: 'github.pr.updated',
+        threadKey: 'org/repo#253',
+        payload: { state: 'closed', merged: true },
+      }),
+      policy: DEFAULT_ATTENTION_POLICY,
+      llm: alwaysInvalidLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.equal(mergedPrFailOpen.level, 'inform');
+    assert.equal(mergedPrFailOpen.shouldDispatchWorker, false);
+
+    const callsBeforeBot = failedCalls;
+    const botUpdate = await triageEvent({
+      event: makeEvent({
+        id: 'evt-failopen-bot-254',
+        type: 'github.issue.updated',
+        threadKey: 'org/repo#254',
+        actor: { id: 'gh-bot', login: 'github-actions[bot]', isBot: true },
+        payload: { state: 'open' },
+      }),
+      policy: DEFAULT_ATTENTION_POLICY,
+      llm: alwaysInvalidLlm,
+      logger: { warn: (msg) => warnings.push(msg) },
+    });
+    assert.equal(failedCalls, callsBeforeBot);
+    assert.equal(botUpdate.level, 'ignore');
+    assert.equal(botUpdate.reason, 'bot_self_filtered');
+  });
+
+  it('dequeues deferred tasks in strict FIFO order, deduplicates queued_behind_focus rows, and keeps deferred status when WeChat delivery fails', async () => {
+    let currentNow = new Date('2026-06-10T06:00:00.000Z');
+    let failWechat = false;
+    const sentWechat: WechatSendInput[] = [];
+    const { hub, router, cleanup } = createHarness({
+      now: () => currentNow,
+      initialPolicy: { presenceMode: 'away' },
+      controllerId: 'wxid_admin_demo',
+      wechatSend: async (input) => {
+        if (failWechat) {
+          return { status: 'failed', detail: 'simulated_send_error' };
+        }
+        sentWechat.push(input);
+        return { status: 'sent' };
+      },
+    });
+    try {
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-fifo-240',
+          threadKey: 'org/repo#240',
+          type: 'github.pr_review_requested',
+          summary: 'Active focus PR #240',
+        }),
+      );
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-fifo-241',
+          threadKey: 'org/repo#241',
+          type: 'github.pr_review_requested',
+          summary: 'Earlier queued PR #241',
+        }),
+      );
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-fifo-248',
+          threadKey: 'org/repo#248',
+          type: 'github.pr_review_requested',
+          summary: 'Later queued PR #248',
+        }),
+      );
+
+      const dec240 = router.listDecisions().find((d) => d.threadKey === 'org/repo#240')!;
+      const dec241 = router.listDecisions().find((d) => d.threadKey === 'org/repo#241')!;
+      const dec248 = router.listDecisions().find((d) => d.threadKey === 'org/repo#248')!;
+
+      await router.submitWorkerReport({
+        decisionId: dec240.id,
+        conclusion: '正在处理 #240',
+      });
+      assert.equal(sentWechat.length, 1);
+      assert.equal(router.db.getMeta('focused_decision_id'), dec240.id);
+
+      currentNow = new Date('2026-06-10T06:01:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec241.id,
+        conclusion: '#241 第一版汇报',
+      });
+      const first241Notifs = router.listNotifications({ decisionId: dec241.id, status: 'deferred' });
+      assert.equal(first241Notifs.length, 1);
+      const first241Id = first241Notifs[0].id;
+      const first241CreatedAt = first241Notifs[0].createdAt;
+
+      currentNow = new Date('2026-06-10T06:02:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec248.id,
+        conclusion: '#248 后来插队的汇报',
+      });
+
+      currentNow = new Date('2026-06-10T06:03:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec241.id,
+        conclusion: '#241 第二版汇报',
+      });
+      currentNow = new Date('2026-06-10T06:04:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec241.id,
+        conclusion: '#241 最新第三版汇报',
+      });
+
+      const deduped241Notifs = router.listNotifications({ decisionId: dec241.id, status: 'deferred' });
+      assert.equal(deduped241Notifs.length, 1);
+      assert.equal(deduped241Notifs[0].id, first241Id);
+      assert.equal(deduped241Notifs[0].createdAt, first241CreatedAt);
+      assert.equal(deduped241Notifs[0].summary, '#241 最新第三版汇报');
+      assert.equal(deduped241Notifs[0].updatedAt, '2026-06-10T06:04:00.000Z');
+      assert.equal(deduped241Notifs[0].dueAt, '2026-06-10T06:04:00.000Z');
+      assert.match(deduped241Notifs[0].reason, /queued_behind_focus/);
+
+      const listReply = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '列表',
+      });
+      assert.equal(listReply.handled, true);
+      const idx241 = (listReply.replyText ?? '').indexOf('[#241]');
+      const idx248 = (listReply.replyText ?? '').indexOf('[#248]');
+      assert.ok(idx241 >= 0 && idx248 >= 0 && idx241 < idx248);
+
+      const nextReply = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '下一个',
+      });
+      assert.equal(nextReply.handled, true);
+      assert.match(nextReply.replyText ?? '', /^\[#241\] #241 最新第三版汇报/);
+      assert.equal(router.db.getMeta('focused_decision_id'), dec241.id);
+
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-fifo-249',
+          threadKey: 'org/repo#249',
+          type: 'github.pr_review_requested',
+          summary: 'Third queued PR #249',
+        }),
+      );
+      const dec249 = router.listDecisions().find((d) => d.threadKey === 'org/repo#249')!;
+      currentNow = new Date('2026-06-10T06:05:00.000Z');
+      await router.submitWorkerReport({
+        decisionId: dec249.id,
+        conclusion: '#249 第三个排队的汇报',
+      });
+
+      currentNow = new Date('2026-06-11T07:00:00.000Z');
+      failWechat = true;
+      const failedTick = await router.tickDeferred();
+      assert.equal(failedTick.delivered, 0);
+      assert.equal(router.db.getMeta('focused_decision_id'), '');
+      const failed248Notif = router.listNotifications({ decisionId: dec248.id, status: 'deferred' })[0];
+      assert.ok(failed248Notif);
+      assert.match(failed248Notif.reason, /wechat_delivery_failed/);
+      assert.equal(router.listDecisions().find((d) => d.id === dec248.id)?.status, 'deferred');
+
+      failWechat = false;
+      currentNow = new Date('2026-06-11T07:01:00.000Z');
+      const recoveredTick = await router.tickDeferred();
+      assert.equal(recoveredTick.delivered, 1);
+      assert.equal(sentWechat.length, 2);
+      assert.match(String(sentWechat[1].text), /^\[#248\] #248 后来插队的汇报/);
+      assert.equal(router.db.getMeta('focused_decision_id'), dec248.id);
+      assert.equal(router.listNotifications({ decisionId: dec248.id, status: 'deferred' }).length, 0);
+      assert.equal(router.listNotifications({ decisionId: dec249.id, status: 'deferred' }).length, 1);
     } finally {
       cleanup();
     }

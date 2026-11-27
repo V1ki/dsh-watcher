@@ -35,11 +35,16 @@ export interface TriageLlmLike {
   generate?: (input: { system: string; prompt: string }, signal?: AbortSignal) => Promise<unknown> | unknown;
 }
 
+export interface TriageLoggerLike {
+  warn?: (message: string) => void;
+}
+
 export interface TriageInput {
   event: NormalizedEvent;
   policy: AttentionPolicy;
   recentDecisions?: RouterDecisionRecord[];
   llm?: TriageLlmLike | null;
+  logger?: TriageLoggerLike | null;
   timeoutMs?: number;
 }
 
@@ -56,6 +61,8 @@ export interface TriageResult {
   usedLlm: boolean;
   llmError?: string;
 }
+
+const TRIAGE_MAX_TOKENS = 2400;
 
 const LEVEL_RANK: Record<RouterActionLevel, number> = {
   ignore: 0,
@@ -101,7 +108,30 @@ export function isUrgentEvent(event: NormalizedEvent): boolean {
   return false;
 }
 
-function classifyDeterministic(event: NormalizedEvent, urgent: boolean): {
+function isClosedGithubItem(event: NormalizedEvent): boolean {
+  const payload = event.payload ?? {};
+  if (payload.merged === true || payload.closed === true) return true;
+  const state = typeof payload.state === 'string' ? payload.state.trim().toLowerCase() : '';
+  if (state === 'closed' || state === 'merged') return true;
+  const action = typeof payload.action === 'string' ? payload.action.trim().toLowerCase() : '';
+  if (action === 'closed' || action === 'merged') return true;
+  return false;
+}
+
+function isOpenGithubUpdateEvent(event: NormalizedEvent): boolean {
+  if (event.actor.isBot) return false;
+  const typeLower = event.type.toLowerCase();
+  if (typeLower !== 'github.issue.updated' && typeLower !== 'github.pr.updated') {
+    return false;
+  }
+  return !isClosedGithubItem(event);
+}
+
+function classifyDeterministic(
+  event: NormalizedEvent,
+  urgent: boolean,
+  opts?: { llmFailOpen?: boolean },
+): {
   level: RouterActionLevel;
   reason: string;
   shouldDispatchWorker: boolean;
@@ -119,6 +149,13 @@ function classifyDeterministic(event: NormalizedEvent, urgent: boolean): {
     return {
       level: 'prepare',
       reason: `deterministic_actionable_${event.type}`,
+      shouldDispatchWorker: true,
+    };
+  }
+  if (opts?.llmFailOpen && isOpenGithubUpdateEvent(event)) {
+    return {
+      level: 'prepare',
+      reason: `deterministic_fail_open_${event.type}`,
       shouldDispatchWorker: true,
     };
   }
@@ -219,7 +256,7 @@ async function prepareDshCall(
     throw new Error('triage_llm_no_prepare_call');
   }
   try {
-    return await llm.prepareCall({ maxTokens: 900 }, signal);
+    return await llm.prepareCall({ maxTokens: TRIAGE_MAX_TOKENS }, signal);
   } catch (firstErr) {
     if (typeof llm.listProviders !== 'function' || typeof llm.listModels !== 'function') {
       throw firstErr;
@@ -231,7 +268,10 @@ async function prepareDshCall(
       for (const model of models) {
         if (!model?.id) continue;
         try {
-          return await llm.prepareCall({ provider: provider.id, model: model.id, maxTokens: 900 }, signal);
+          return await llm.prepareCall(
+            { provider: provider.id, model: model.id, maxTokens: TRIAGE_MAX_TOKENS },
+            signal,
+          );
         } catch {
         }
       }
@@ -364,6 +404,28 @@ const TRIAGE_SYSTEM_PROMPT = [
   'level ("ignore"|"inform"|"prepare"|"act"), summary (string), reason (string), shouldDispatchWorker (boolean), urgent (boolean), personaId (string|null), question (string|null), options (string[]), recommendedIndex (number|null).',
 ].join(' ');
 
+const TRIAGE_RETRY_SYSTEM_PROMPT = [
+  'You are the DSH Router Triage classifier.',
+  'Return ONLY a single valid JSON object with no markdown fences, no commentary, and no extra text.',
+  'Required keys: level ("ignore"|"inform"|"prepare"|"act"), summary (string), reason (string), shouldDispatchWorker (boolean), urgent (boolean), personaId (string|null), question (string|null), options (string[]), recommendedIndex (number|null).',
+].join(' ');
+
+function isValidParsedTriage(parsed: Record<string, unknown> | null): parsed is Record<string, unknown> {
+  return Boolean(
+    parsed &&
+      typeof parsed.level === 'string' &&
+      VALID_LEVELS.has(parsed.level as RouterActionLevel),
+  );
+}
+
+function logTriageWarn(logger: TriageLoggerLike | null | undefined, message: string): void {
+  if (typeof logger?.warn === 'function') {
+    logger.warn(message);
+    return;
+  }
+  console.warn(message);
+}
+
 export async function triageEvent(input: TriageInput): Promise<TriageResult> {
   const { event, policy, llm } = input;
   const recentDecisions = (input.recentDecisions ?? []).slice(0, 6);
@@ -387,14 +449,35 @@ export async function triageEvent(input: TriageInput): Promise<TriageResult> {
 
   if (llm && policy.triageFilterEnabled) {
     try {
-      const rawText = await invokeLlmWithTimeout(
+      const timeoutMs = input.timeoutMs ?? 30_000;
+      const prompt = buildTriagePrompt(event, recentDecisions);
+      const firstRawText = await invokeLlmWithTimeout(
         llm,
         TRIAGE_SYSTEM_PROMPT,
-        buildTriagePrompt(event, recentDecisions),
-        input.timeoutMs ?? 30_000,
+        prompt,
+        timeoutMs,
       );
-      const parsed = parseLlmJson(rawText);
-      if (!parsed || typeof parsed.level !== 'string' || !VALID_LEVELS.has(parsed.level as RouterActionLevel)) {
+      let rawText = firstRawText;
+      let parsed = parseLlmJson(rawText);
+      if (!isValidParsedTriage(parsed)) {
+        const retryPrompt = [
+          'Return ONLY a valid JSON object matching the required schema with no extra text.',
+          prompt,
+        ].join('\n\n');
+        rawText = await invokeLlmWithTimeout(
+          llm,
+          TRIAGE_RETRY_SYSTEM_PROMPT,
+          retryPrompt,
+          timeoutMs,
+        );
+        parsed = parseLlmJson(rawText);
+      }
+      if (!isValidParsedTriage(parsed)) {
+        const snippet = (rawText || firstRawText).slice(0, 200);
+        logTriageWarn(
+          input.logger,
+          `[dsh-router] triage_llm_invalid_json event=${event.id} type=${event.type} snippet=${JSON.stringify(snippet)}`,
+        );
         throw new Error('triage_llm_invalid_json');
       }
       const llmUrgent = urgent || parsed.urgent === true;
@@ -430,7 +513,7 @@ export async function triageEvent(input: TriageInput): Promise<TriageResult> {
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const fallback = classifyDeterministic(event, urgent);
+      const fallback = classifyDeterministic(event, urgent, { llmFailOpen: true });
       const guarded = applyProgrammaticGuards(
         maxLevel('inform', fallback.level),
         `llm_fail_open:${message};${fallback.reason}`,
