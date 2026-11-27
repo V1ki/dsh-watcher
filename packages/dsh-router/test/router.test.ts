@@ -872,7 +872,7 @@ describe('@local/dsh-router backend', () => {
       assert.match(String(sentWechat[0].text), /拟发草稿：/);
       assert.match(String(sentWechat[0].text), /还没验证：还没在窄屏下测过/);
       assert.match(String(sentWechat[0].text), /想确认下：这个草稿直接发 GitHub 行吗？/);
-      assert.match(String(sentWechat[0].text), /直接回复就能接着聊/);
+      assert.match(String(sentWechat[0].text), /引用本条或回 #150 接着聊；回“下一个”切下一条/);
       assert.ok(router.listNotifications({ channel: 'wechat', status: 'delivered' }).length >= 1);
 
       router.updatePolicy({ wechatTarget: 'wxid_explicit_group' });
@@ -1123,9 +1123,17 @@ describe('@local/dsh-router backend', () => {
       const plainAfterPrefixReopen = await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
         senderId: 'wxid_admin_demo',
-        text: '再把左边距加 4px',
+        text: '帮我查一下明天的天气',
       });
-      assert.equal(plainAfterPrefixReopen.handled, true);
+      assert.equal(plainAfterPrefixReopen.handled, false);
+      assert.equal(env.followups.length, followCountBeforeReopen);
+
+      const explicitAfterPrefixReopen = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '#150 再把左边距加 4px',
+      });
+      assert.equal(explicitAfterPrefixReopen.handled, true);
       assert.equal(env.followups.length, followCountBeforeReopen + 1);
       assert.equal(env.followups[env.followups.length - 1].sessionId, dec150.workerSessionId);
 
@@ -1144,9 +1152,18 @@ describe('@local/dsh-router backend', () => {
       const plainAfterQuoteReopen = await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
         senderId: 'wxid_admin_demo',
-        text: '改完截张新图给我',
+        text: '今晚记得提醒我买菜',
       });
-      assert.equal(plainAfterQuoteReopen.handled, true);
+      assert.equal(plainAfterQuoteReopen.handled, false);
+      assert.equal(env.followups.length, followCountBeforeQuoteNext);
+
+      const quoteAgainAfterReopen = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '改完截张新图给我',
+        quotedText: '[#152] 图表样式修好了',
+      });
+      assert.equal(quoteAgainAfterReopen.handled, true);
       assert.equal(env.followups.length, followCountBeforeQuoteNext + 1);
       assert.equal(env.followups[env.followups.length - 1].sessionId, dec152.workerSessionId);
     } finally {
@@ -1166,7 +1183,10 @@ describe('@local/dsh-router backend', () => {
         return { status: 'sent' };
       },
     });
-    const footer = '直接回复就能接着聊；回“下一个”切下一条';
+    const footerFor = (shortId: string) => `引用本条或回 #${shortId} 接着聊；回“下一个”切下一条`;
+    const footer160 = footerFor('160');
+    const footer161 = footerFor('161');
+    const footer162 = footerFor('162');
     const url160 = 'https://github.com/org/repo/pull/160';
     const url161 = 'https://github.com/org/repo/pull/161';
 
@@ -1216,7 +1236,7 @@ describe('@local/dsh-router backend', () => {
       assert.match(msg1, /可选：1\. 方案A（推荐） \/ 2\. 方案B/);
       assert.doesNotMatch(msg1, /（推荐）（推荐）/);
       assert.equal(msg1.includes(url160), true);
-      assert.equal(msg1.includes(footer), true);
+      assert.equal(msg1.includes(footer160), true);
 
       currentNow = new Date('2026-06-10T06:01:00.000Z');
       const round2 = await router.submitWorkerReport({
@@ -1240,7 +1260,7 @@ describe('@local/dsh-router backend', () => {
       assert.equal(msg2.includes('想确认下：'), false);
       assert.equal(msg2.includes('可选：'), false);
       assert.equal(msg2.includes(url160), false);
-      assert.equal(msg2.includes(footer), false);
+      assert.equal(msg2.includes(footer160), false);
 
       currentNow = new Date('2026-06-10T06:02:00.000Z');
       const round3 = await router.submitWorkerReport({
@@ -1270,7 +1290,7 @@ describe('@local/dsh-router backend', () => {
       assert.match(msg3, /可选：1\. 先留着 \/ 2\. 直接发\(推荐\) \/ 3\. 再改改/);
       assert.doesNotMatch(msg3, /\(推荐\)（推荐）/);
       assert.equal(msg3.includes(url160), false);
-      assert.equal(msg3.includes(footer), false);
+      assert.equal(msg3.includes(footer160), false);
 
       currentNow = new Date('2026-06-10T06:03:00.000Z');
       await router.submitWorkerReport({
@@ -1293,7 +1313,7 @@ describe('@local/dsh-router backend', () => {
       assert.match(switchText, /^\[#161\] 退避抖动定位清楚了/);
       assert.match(switchText, /可选：1\. 按 30s 改（推荐） \/ 2\. 改成 60s/);
       assert.equal(switchText.includes(url161), true);
-      assert.equal(switchText.includes(footer), true);
+      assert.equal(switchText.includes(footer161), true);
 
       currentNow = new Date('2026-06-10T06:04:00.000Z');
       await router.submitWorkerReport({
@@ -1305,7 +1325,7 @@ describe('@local/dsh-router backend', () => {
       const msg4 = String(sentWechat[3].text);
       assert.equal(msg4, '[#161] 已按 30s 改完并跑过测试');
       assert.equal(msg4.includes(url161), false);
-      assert.equal(msg4.includes(footer), false);
+      assert.equal(msg4.includes(footer161), false);
 
       await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
@@ -1319,7 +1339,7 @@ describe('@local/dsh-router backend', () => {
       });
       assert.equal(backTo160.handled, true);
       assert.equal((backTo160.replyText ?? '').includes(url160), true);
-      assert.equal((backTo160.replyText ?? '').includes(footer), true);
+      assert.equal((backTo160.replyText ?? '').includes(footer160), true);
 
       const nextTo161 = await hub.dispatchAdminWechatMessage!({
         session: 'wxid_admin_demo',
@@ -1330,7 +1350,7 @@ describe('@local/dsh-router backend', () => {
       const nextText = nextTo161.replyText ?? '';
       assert.match(nextText, /^\[#161\]/);
       assert.equal(nextText.includes(url161), true);
-      assert.equal(nextText.includes(footer), true);
+      assert.equal(nextText.includes(footer161), true);
 
       currentNow = new Date('2026-06-11T07:00:00.000Z');
       await hub.dispatchAdminWechatMessage!({
@@ -1346,7 +1366,7 @@ describe('@local/dsh-router backend', () => {
       const msg5 = String(sentWechat[4].text);
       assert.match(msg5, /^\[#161\] 焦点清空后再次汇报应发完整版/);
       assert.equal(msg5.includes(url161), true);
-      assert.equal(msg5.includes(footer), true);
+      assert.equal(msg5.includes(footer161), true);
 
       await hub.ingest(
         makeEvent({
@@ -1371,7 +1391,7 @@ describe('@local/dsh-router backend', () => {
       const msg6 = String(sentWechat[5].text);
       assert.match(msg6, /^\[#162\] 排队项等待弹出/);
       assert.equal(msg6.includes('https://github.com/org/repo/pull/162'), true);
-      assert.equal(msg6.includes(footer), true);
+      assert.equal(msg6.includes(footer162), true);
     } finally {
       cleanup();
     }
@@ -1435,6 +1455,7 @@ describe('@local/dsh-router backend', () => {
         session: 'wxid_admin_demo',
         senderId: 'wxid_admin_demo',
         text: '语气再直接一点',
+        quotedText: '[#210] 已定位空指针风险，建议先补空值保护再合并。',
       });
       assert.equal(adminReply.handled, true);
       assert.equal(env.followups.length, followupCount + 1);
@@ -1736,6 +1757,140 @@ describe('@local/dsh-router backend', () => {
       assert.equal(router.db.getMeta('focused_decision_id'), dec248.id);
       assert.equal(router.listNotifications({ decisionId: dec248.id, status: 'deferred' }).length, 0);
       assert.equal(router.listNotifications({ decisionId: dec249.id, status: 'deferred' }).length, 1);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it('never hijacks plain admin WeChat messages into activeFocus worker while preserving quote, #ref, and queue commands', async () => {
+    const sentWechat: WechatSendInput[] = [];
+    const { hub, router, env, cleanup } = createHarness({
+      initialPolicy: { presenceMode: 'away' },
+      controllerId: 'wxid_admin_demo',
+      wechatSend: async (input) => {
+        sentWechat.push(input);
+        return { status: 'sent' };
+      },
+    });
+    try {
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-no-hijack-247',
+          threadKey: 'org/repo#247',
+          type: 'github.pr_review_requested',
+          summary: 'Review PR #247 config migration',
+          rawRef: { url: 'https://github.com/org/repo/pull/247', repo: 'org/repo', number: 247 },
+        }),
+      );
+      await hub.ingest(
+        makeEvent({
+          id: 'evt-no-hijack-248',
+          threadKey: 'org/repo#248',
+          type: 'github.pr_review_requested',
+          summary: 'Review PR #248 retry logic',
+          rawRef: { url: 'https://github.com/org/repo/pull/248', repo: 'org/repo', number: 248 },
+        }),
+      );
+
+      const dec247 = router.listDecisions().find((d) => d.threadKey === 'org/repo#247')!;
+      const dec248 = router.listDecisions().find((d) => d.threadKey === 'org/repo#248')!;
+      const originalSummary247 = 'PR #247 配置迁移查完了，建议补一条兼容性单测。';
+
+      await router.submitWorkerReport({
+        decisionId: dec247.id,
+        conclusion: originalSummary247,
+        mode: 'discuss',
+      });
+      await router.submitWorkerReport({
+        decisionId: dec248.id,
+        conclusion: 'PR #248 重试逻辑有边界问题，已定位原因。',
+        mode: 'discuss',
+      });
+
+      assert.equal(router.db.getMeta('focused_decision_id'), dec247.id);
+      assert.equal(sentWechat.length, 1);
+      assert.match(String(sentWechat[0].text), /引用本条或回 #247 接着聊；回“下一个”切下一条/);
+
+      const followupsBeforePlain = env.followups.length;
+      const plainMessages = [
+        '帮我查一下明天的天气',
+        '帮我记一下周三上午十点开会',
+        '好的',
+        '好',
+        '行',
+        'ok',
+        '知道了',
+      ];
+      for (const text of plainMessages) {
+        const res = await hub.dispatchAdminWechatMessage!({
+          session: 'wxid_admin_demo',
+          senderId: 'wxid_admin_demo',
+          text,
+        });
+        assert.deepEqual(res, { handled: false });
+      }
+      assert.equal(env.followups.length, followupsBeforePlain);
+      assert.equal(router.db.getDecision(dec247.id)?.summary, originalSummary247);
+      assert.equal(router.db.getMeta('focused_decision_id'), dec247.id);
+
+      const quoteRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '把边界用例补全再推一版',
+        quotedText: `[#247] ${originalSummary247}`,
+      });
+      assert.equal(quoteRes.handled, true);
+      assert.equal(env.followups.length, followupsBeforePlain + 1);
+      assert.equal(env.followups[env.followups.length - 1].sessionId, dec247.workerSessionId);
+
+      const prefixRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '#247 顺手把默认超时改成 10 秒',
+      });
+      assert.equal(prefixRes.handled, true);
+      assert.equal(env.followups.length, followupsBeforePlain + 2);
+      assert.equal(env.followups[env.followups.length - 1].sessionId, dec247.workerSessionId);
+
+      const listRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '列表',
+      });
+      assert.equal(listRes.handled, true);
+      assert.match(listRes.replyText ?? '', /\[#247\]/);
+      assert.match(listRes.replyText ?? '', /\[#248\]/);
+
+      const deferRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '延后',
+      });
+      assert.equal(deferRes.handled, true);
+      assert.equal(router.db.getDecision(dec247.id)?.status, 'deferred');
+      assert.equal(router.db.getMeta('focused_decision_id'), dec248.id);
+      assert.match(deferRes.replyText ?? '', /^\[#248\]/);
+      assert.match(deferRes.replyText ?? '', /引用本条或回 #248 接着聊；回“下一个”切下一条/);
+
+      const nextRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '下一个',
+      });
+      assert.equal(nextRes.handled, true);
+      assert.equal(router.db.getDecision(dec248.id)?.status, 'resolved');
+      assert.equal(router.db.getMeta('focused_decision_id'), dec247.id);
+      assert.match(nextRes.replyText ?? '', /^\[#247\]/);
+
+      const skipRes = await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '跳过',
+      });
+      assert.equal(skipRes.handled, true);
+      assert.equal(router.db.getDecision(dec247.id)?.status, 'resolved');
+      assert.equal(router.db.getMeta('focused_decision_id'), '');
+      assert.equal(skipRes.replyText, '这条先收起了，后面暂时没有别的事。');
     } finally {
       cleanup();
     }

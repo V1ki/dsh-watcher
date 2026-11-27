@@ -41,8 +41,22 @@ const FOCUS_AT_META_KEY = 'focused_decision_at';
 const FOCUS_TTL_MS = 24 * 60 * 60 * 1000;
 
 const LIST_COMMANDS = new Set(['列表', '还有啥', '在忙啥', '任务', 'list']);
-const DEFER_COMMANDS = new Set(['先放着']);
-const CLOSE_COMMANDS = new Set(['下一个', '跳过', '完成', '关闭', '结束', 'next', 'skip', 'done']);
+const DEFER_COMMANDS = new Set(['先放着', '先跳过', '延后', '待会看']);
+const CLOSE_COMMANDS = new Set([
+  '下一个',
+  '下一条',
+  '跳过',
+  '完成',
+  '已处理',
+  '关闭',
+  '关掉这条',
+  '结束',
+  '结束了',
+  '不用管了',
+  'next',
+  'skip',
+  'done',
+]);
 
 function extractShortId(decision: Pick<RouterDecisionRecord, 'id' | 'threadKey'>): string {
   const match = /#(\d+)\b/.exec(decision.threadKey);
@@ -508,11 +522,7 @@ export class RouterRuntime {
       }
     }
 
-    if (!activeFocus) {
-      return { handled: false };
-    }
-
-    return this.forwardAdminReplyToWorker(activeFocus, rawText, msg);
+    return { handled: false };
   }
 
   private formatNotificationText(
@@ -544,7 +554,7 @@ export class RouterRuntime {
       if (decision.rawUrl) {
         lines.push(decision.rawUrl);
       }
-      lines.push('直接回复就能接着聊；回“下一个”切下一条');
+      lines.push(`引用本条或回 #${extractShortId(decision)} 接着聊；回“下一个”切下一条`);
     }
     return lines.join('\n');
   }
