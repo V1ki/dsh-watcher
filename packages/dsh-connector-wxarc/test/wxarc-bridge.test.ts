@@ -482,10 +482,33 @@ describe('wxarc.send Sink, Safety Guards & wxarc_proactive_send Tool', () => {
       const tooMany = await sink.invoke({
         action: 'send',
         target: { chatId: 'filehelper' },
-        payload: { text: ['1', '2', '3', '4', '5', '6'] },
+        payload: { text: ['1', '2', '3', '4', '5', '6', '7'] },
         idempotencyKey: 'too-many-segments',
       });
       assert.equal(tooMany.status, 'failed');
+
+      const longAutoSplit = await sink.invoke({
+        action: 'send',
+        target: { chatId: 'filehelper' },
+        payload: {
+          text: [
+            '第一段长内容。'.repeat(120),
+            '第二段长内容。'.repeat(120),
+            '第三段长内容。'.repeat(120),
+          ].join('\n\n'),
+        },
+        idempotencyKey: 'long-auto-split-1',
+      });
+      assert.equal(longAutoSplit.status, 'executed');
+
+      const overLimit = await sink.invoke({
+        action: 'send',
+        target: { chatId: 'filehelper' },
+        payload: { text: '超'.repeat(6001) },
+        idempotencyKey: 'over-6000-chars',
+      });
+      assert.equal(overLimit.status, 'failed');
+      assert.match(overLimit.detail || '', /6000/);
 
       const staged = await sink.invoke({
         action: 'send',

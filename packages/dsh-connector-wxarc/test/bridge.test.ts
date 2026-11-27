@@ -6,7 +6,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { AgentBridge } from '../src/agent.js';
-import { Automation } from '../src/automation.js';
+import {
+  Automation,
+  MAX_PROACTIVE_SEGMENTS,
+  MAX_PROACTIVE_SEGMENT_CHARS,
+  MAX_PROACTIVE_TOTAL_CHARS,
+  PROACTIVE_AUTO_SPLIT_TARGET_CHARS,
+  normalizeProactiveParts,
+} from '../src/automation.js';
 import { createWxarcBridge } from '../src/bridge.js';
 import { Store } from '../src/core.js';
 import { apply } from '../src/index.js';
@@ -18,6 +25,7 @@ function createAutomationFixture(t: TestContext) {
   let healthy = true;
   const prepared: Array<Record<string, any>> = [];
   const committed: Array<string> = [];
+  const warnLogs: string[] = [];
   const cua = {
     prepare: async (job: Record<string, any>) => {
       prepared.push(job);
@@ -50,6 +58,11 @@ function createAutomationFixture(t: TestContext) {
       wechatId: e.session,
       uniqueTitle: true,
     }),
+    logger: {
+      warn: (...values: unknown[]) => {
+        warnLogs.push(values.map((item) => String(item)).join(' '));
+      },
+    },
     now: () => clock,
   };
   const auto = new Automation(args);
@@ -80,6 +93,7 @@ function createAutomationFixture(t: TestContext) {
     listener,
     prepared,
     committed,
+    warnLogs,
     setHealthy: (v: boolean) => {
       healthy = v;
     },
@@ -822,4 +836,201 @@ test('queueMemoNudge routes reminder into original WeChat conversation with grou
   assert.equal(preparedJobs[0].mentions?.[0].name, '小周');
   assert.equal(rememberedCalls, 0);
   assert.equal(automation.job(queued.jobId!).status, 'sent');
+});
+
+test('normalizeProactiveParts auto-splits long strings by priority boundaries, accepts valid multi-segment arrays, and rejects true overflows', () => {
+  assert.equal(MAX_PROACTIVE_SEGMENTS, 6);
+  assert.equal(MAX_PROACTIVE_SEGMENT_CHARS, 1500);
+  assert.equal(PROACTIVE_AUTO_SPLIT_TARGET_CHARS, 1200);
+  assert.equal(MAX_PROACTIVE_TOTAL_CHARS, 6000);
+
+  const para1 = '一'.repeat(500);
+  const para2 = '二'.repeat(500);
+  const para3 = '三'.repeat(500);
+  const para4 = '四'.repeat(500);
+  const byBlankLine = normalizeProactiveParts([para1, para2, para3, para4].join('\n\n'));
+  assert.equal(byBlankLine.ok, true);
+  assert.equal(byBlankLine.parts.length, 2);
+  assert.equal(byBlankLine.parts[0], `${para1}\n\n${para2}`);
+  assert.equal(byBlankLine.parts[1], `${para3}\n\n${para4}`);
+
+  const lines = Array.from({ length: 6 }, (_, i) => `行${i + 1}-${'文'.repeat(490)}`);
+  const bySingleLine = normalizeProactiveParts(lines.join('\n'));
+  assert.equal(bySingleLine.ok, true);
+  assert.equal(bySingleLine.parts.length, 3);
+  assert.ok(bySingleLine.parts.every((part) => part.length <= PROACTIVE_AUTO_SPLIT_TARGET_CHARS));
+  assert.equal(bySingleLine.parts.join('\n'), lines.join('\n'));
+
+  const sentences = Array.from({ length: 30 }, (_, i) => `第${i + 1}句${'测'.repeat(92)}。`).join('');
+  assert.ok(sentences.length > 2800 && sentences.length < 3200);
+  const byPunctuation = normalizeProactiveParts(sentences);
+  assert.equal(byPunctuation.ok, true);
+  assert.ok(byPunctuation.parts.length >= 3 && byPunctuation.parts.length <= MAX_PROACTIVE_SEGMENTS);
+  assert.ok(byPunctuation.parts.every((part) => part.length <= PROACTIVE_AUTO_SPLIT_TARGET_CHARS));
+  assert.ok(byPunctuation.parts.slice(0, -1).every((part) => part.endsWith('。')));
+  assert.equal(byPunctuation.parts.join(''), sentences);
+
+  const unbrokenWithEmoji = 'a'.repeat(1199) + '😀' + 'b'.repeat(900);
+  const byHardCut = normalizeProactiveParts(unbrokenWithEmoji);
+  assert.equal(byHardCut.ok, true);
+  assert.equal(byHardCut.parts.length, 2);
+  assert.equal(byHardCut.parts[0], 'a'.repeat(1199));
+  assert.equal(byHardCut.parts[1], '😀' + 'b'.repeat(900));
+
+  const fourSegments = [
+    '甲'.repeat(1400),
+    '乙'.repeat(1400),
+    '丙'.repeat(1400),
+    '丁'.repeat(1400),
+  ];
+  const multiArrayOk = normalizeProactiveParts(fourSegments);
+  assert.equal(multiArrayOk.ok, true);
+  assert.deepEqual(multiArrayOk.parts, fourSegments);
+
+  const sevenAwkwardParagraphs = Array.from({ length: 7 }, (_, i) => `${i + 1}${'段'.repeat(779)}`).join(
+    '\n\n',
+  );
+  assert.ok(sevenAwkwardParagraphs.length > 5000 && sevenAwkwardParagraphs.length <= 6000);
+  const packed = normalizeProactiveParts(sevenAwkwardParagraphs);
+  assert.equal(packed.ok, true);
+  assert.ok(packed.parts.length <= MAX_PROACTIVE_SEGMENTS);
+  assert.ok(packed.parts.every((part) => part.length <= MAX_PROACTIVE_SEGMENT_CHARS));
+
+  const overTotal = normalizeProactiveParts('超'.repeat(MAX_PROACTIVE_TOTAL_CHARS + 1));
+  assert.equal(overTotal.ok, false);
+  assert.match(overTotal.error, /6000/);
+
+  const tooManyInputSegments = normalizeProactiveParts(['1', '2', '3', '4', '5', '6', '7']);
+  assert.equal(tooManyInputSegments.ok, false);
+  assert.match(tooManyInputSegments.error, /between 1 and 6 segments/);
+
+  const cannotFitAfterSplit = normalizeProactiveParts([
+    '段1',
+    '段2',
+    '段3',
+    '段4',
+    '段5',
+    '长'.repeat(2000),
+  ]);
+  assert.equal(cannotFitAfterSplit.ok, false);
+  assert.match(cannotFitAfterSplit.error, /exceeds maximum of 6 segments/);
+});
+
+test('sendProactive delivers 2000-3000 char auto-split strings, multi-segment arrays >1500 chars, and warns on rejected overflows', async (t) => {
+  const f = createAutomationFixture(t);
+
+  const text2000 = [
+    '第一部分：背景说明。' + '甲'.repeat(650),
+    '第二部分：问题排查。' + '乙'.repeat(650),
+    '第三部分：修复结论。' + '丙'.repeat(680),
+  ].join('\n\n');
+  assert.ok(text2000.length >= 2000);
+
+  const res2000 = await f.auto.sendProactive({
+    idempotencyKey: 'pro-2000',
+    session: 'room1@chatroom',
+    text: text2000,
+    mode: 'send',
+    reason: 'long_summary_2000',
+  });
+  assert.equal(res2000.status, 'sent');
+  assert.ok(f.committed.length >= 2 && f.committed.length <= MAX_PROACTIVE_SEGMENTS);
+  assert.ok(f.committed.every((chunk) => chunk.length <= PROACTIVE_AUTO_SPLIT_TARGET_CHARS));
+  assert.equal(f.committed.join('\n\n'), text2000);
+
+  f.committed.length = 0;
+  const text3000 = Array.from(
+    { length: 6 },
+    (_, idx) => `第${idx + 1}节汇总：` + '摘'.repeat(495),
+  ).join('\n\n');
+  assert.ok(text3000.length >= 3000);
+
+  const res3000 = await f.auto.sendProactive({
+    idempotencyKey: 'pro-3000',
+    session: 'room1@chatroom',
+    text: text3000,
+    mode: 'send',
+    reason: 'long_summary_3000',
+  });
+  assert.equal(res3000.status, 'sent');
+  assert.equal(f.committed.length, 3);
+  assert.ok(f.committed.every((chunk) => chunk.length <= PROACTIVE_AUTO_SPLIT_TARGET_CHARS));
+  assert.equal(f.committed.join('\n\n'), text3000);
+
+  f.committed.length = 0;
+  const multiSegments = ['第一段' + 'A'.repeat(1100), '第二段' + 'B'.repeat(1100), '第三段' + 'C'.repeat(1100)];
+  const resMulti = await f.auto.sendProactive({
+    idempotencyKey: 'pro-multi-3300',
+    session: 'room1@chatroom',
+    text: multiSegments,
+    mode: 'send',
+    reason: 'multi_segment_over_1500',
+  });
+  assert.equal(resMulti.status, 'sent');
+  assert.deepEqual(f.committed, multiSegments);
+
+  f.warnLogs.length = 0;
+  const resTooLong = await f.auto.sendProactive({
+    idempotencyKey: 'pro-too-long',
+    session: 'room1@chatroom',
+    text: '超'.repeat(6001),
+    mode: 'send',
+    reason: 'overflow_check',
+  });
+  assert.equal(resTooLong.status, 'failed');
+  assert.match(resTooLong.detail || '', /6000/);
+  assert.ok(
+    f.warnLogs.some((line) => line.includes('pro-too-long') && line.includes('6000')),
+  );
+
+  f.warnLogs.length = 0;
+  const resOverflowSegments = await f.auto.sendProactive({
+    idempotencyKey: 'pro-overflow-segs',
+    session: 'room1@chatroom',
+    text: ['a', 'b', 'c', 'd', 'e', '长'.repeat(2000)],
+    mode: 'send',
+    reason: 'segment_overflow_check',
+  });
+  assert.equal(resOverflowSegments.status, 'failed');
+  assert.match(resOverflowSegments.detail || '', /6 segments/);
+  assert.ok(
+    f.warnLogs.some((line) => line.includes('pro-overflow-segs') && line.includes('6 segments')),
+  );
+
+  f.auto.save(
+    {
+      ...f.auto.settings().policy,
+      controllerId: 'wxid_admin_demo',
+    },
+    f.auto.settings().revision,
+  );
+  f.auto.setAdminWechatHandler(async () => ({
+    handled: true,
+    replyText: '溢'.repeat(6005),
+  }));
+  f.warnLogs.length = 0;
+  f.store.commit(
+    'text',
+    0,
+    [
+      {
+        id: 901,
+        kind: 'text',
+        session: 'wxid_admin_demo',
+        sender: 'wxid_admin_demo',
+        text: '测试超长回报',
+        ts: Math.floor(1_700_000_000_000 / 1000) - 5,
+        local_type: 1,
+      },
+    ],
+    1000,
+  );
+  await f.auto.collect();
+  await new Promise((r) => setTimeout(r, 200));
+  assert.ok(
+    f.warnLogs.some((line) => line.includes('admin-wechat-reply:1') && line.includes('6000')),
+  );
+  assert.ok(
+    f.warnLogs.some((line) => line.includes('管理员微信自动回复未送达') && line.includes('6000')),
+  );
 });

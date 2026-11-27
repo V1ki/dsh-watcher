@@ -10,9 +10,7 @@ import type {
   WechatSendResult,
   WechatTransport,
 } from '@local/dsh-hub/contracts';
-
-const MAX_SEGMENTS = 5;
-const MAX_TOTAL_CHARS = 1500;
+import { MAX_PROACTIVE_SEGMENTS, normalizeProactiveParts } from './automation.js';
 
 export const WXARC_SEND_SINK_ID = 'wxarc.send';
 export const WXARC_PROACTIVE_SEND_TOOL = 'wxarc_proactive_send';
@@ -84,34 +82,17 @@ function normalizeSegments(
   payload: Record<string, unknown>,
 ): { ok: true; segments: string[] } | { ok: false; error: string } {
   const raw = payload.segments ?? payload.messages ?? payload.text;
-  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? [raw] : [];
-  if (list.length < 1 || list.length > MAX_SEGMENTS) {
+  if (typeof raw !== 'string' && !Array.isArray(raw)) {
     return {
       ok: false,
-      error: `WeChat message must contain between 1 and ${MAX_SEGMENTS} non-empty segments`,
+      error: `WeChat message must contain between 1 and ${MAX_PROACTIVE_SEGMENTS} non-empty segments`,
     };
   }
-
-  const segments: string[] = [];
-  let total = 0;
-  for (const item of list) {
-    if (typeof item !== 'string') {
-      return { ok: false, error: 'Each message segment must be a string' };
-    }
-    const trimmed = item.trim();
-    if (!trimmed) {
-      return { ok: false, error: 'Message segments must not be empty' };
-    }
-    total += trimmed.length;
-    if (total > MAX_TOTAL_CHARS) {
-      return {
-        ok: false,
-        error: `Total WeChat message length exceeds ${MAX_TOTAL_CHARS} characters`,
-      };
-    }
-    segments.push(trimmed);
+  const normalized = normalizeProactiveParts(raw as string | string[], false);
+  if (!normalized.ok) {
+    return normalized;
   }
-  return { ok: true, segments };
+  return { ok: true, segments: normalized.parts };
 }
 
 function isTargetAllowed(chatId: string, allowedTargets?: string[]): boolean {
@@ -438,7 +419,7 @@ export function registerWechatSendTool(
   const dispose = tools.register({
     name: WXARC_PROACTIVE_SEND_TOOL,
     description:
-      'Send a proactive WeChat message (1-5 segments) or stage a draft via wxarc.send with ownId safety verification and crash-safe uncertain reporting.',
+      'Send a proactive WeChat message (1-6 segments, auto-splitting long text up to 6000 chars) or stage a draft via wxarc.send with ownId safety verification and crash-safe uncertain reporting.',
     inputSchema: {
       type: 'object',
       required: ['text'],
@@ -450,9 +431,14 @@ export function registerWechatSendTool(
         text: {
           oneOf: [
             { type: 'string' },
-            { type: 'array', items: { type: 'string' }, minItems: 1, maxItems: 5 },
+            {
+              type: 'array',
+              items: { type: 'string' },
+              minItems: 1,
+              maxItems: MAX_PROACTIVE_SEGMENTS,
+            },
           ],
-          description: 'Single message string or array of 1 to 5 message segments',
+          description: `Single message string or array of 1 to ${MAX_PROACTIVE_SEGMENTS} message segments`,
         },
         reason: {
           type: 'string',

@@ -1,12 +1,11 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
+import { normalizeProactiveParts } from './automation.js';
 import { loadLocalImage } from './outgoing-image.js';
 
 const DEFAULT_FALLBACK_ORIGIN = 'http://localhost';
 const MAX_BODY_BYTES = 65_536;
-const MAX_SEGMENTS = 5;
-const MAX_TOTAL_CHARS = 1500;
 const DEFAULT_RECENT_LIMIT = 20;
 const MAX_RECENT_LIMIT = 200;
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1', '[::1]']);
@@ -151,41 +150,7 @@ function normalizeParts(
   text: string | string[] | undefined,
   allowEmpty = false,
 ): { ok: true; parts: string[] } | { ok: false; error: string } {
-  if (allowEmpty) {
-    if (text === undefined || text === null) {
-      return { ok: true, parts: [] };
-    }
-    if (typeof text === 'string' && !text.trim()) {
-      return { ok: true, parts: [] };
-    }
-    if (Array.isArray(text) && text.length === 0) {
-      return { ok: true, parts: [] };
-    }
-  }
-  const rawList = Array.isArray(text) ? text : [text];
-  if (rawList.length < 1 || rawList.length > MAX_SEGMENTS) {
-    return {
-      ok: false,
-      error: `Message must contain between 1 and ${MAX_SEGMENTS} segments`,
-    };
-  }
-  const parts: string[] = [];
-  let totalChars = 0;
-  for (const item of rawList) {
-    if (typeof item !== 'string') {
-      return { ok: false, error: 'Each message segment must be a string' };
-    }
-    const trimmed = item.trim();
-    if (!trimmed) {
-      return { ok: false, error: 'Message segments must not be empty' };
-    }
-    totalChars += trimmed.length;
-    if (totalChars > MAX_TOTAL_CHARS) {
-      return { ok: false, error: `Total message length exceeds ${MAX_TOTAL_CHARS} characters` };
-    }
-    parts.push(trimmed);
-  }
-  return { ok: true, parts };
+  return normalizeProactiveParts(text, allowEmpty);
 }
 
 function normalizeTimestampMs(rawTs: unknown): number {

@@ -213,11 +213,15 @@ const DEFAULT: AutomationPolicy = {
   debounceMaxMessages: 10,
 };
 
-const MAX_PROACTIVE_SEGMENTS = 5;
-const MAX_PROACTIVE_CHARS = 1500;
+export const MAX_PROACTIVE_SEGMENTS = 6;
+export const MAX_PROACTIVE_SEGMENT_CHARS = 1500;
+export const PROACTIVE_AUTO_SPLIT_TARGET_CHARS = 1200;
+export const MAX_PROACTIVE_TOTAL_CHARS = 6000;
 const DEFAULT_RECENT_LIMIT = 20;
 const MAX_RECENT_LIMIT = 200;
 const DEFAULT_PROACTIVE_RETRY_DELAYS_MS: readonly number[] = [2000, 5000];
+const BLANK_LINE_RE = /\r?\n[ \t]*\r?\n/g;
+const SENTENCE_END_RE = /[。！？.!?;；]/;
 
 function isRetryableProactivePrepareError(msg: string): boolean {
   return (
@@ -232,7 +236,126 @@ function policyDefaults(input: Record<string, any>): AutomationPolicy {
   return { ...DEFAULT, ...current };
 }
 
-function normalizeProactiveParts(
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff;
+}
+
+function safeHardCutIndex(text: string, maxChars: number, minIndex: number): number {
+  let cut = Math.min(maxChars, text.length);
+  if (
+    cut > minIndex &&
+    cut < text.length &&
+    isHighSurrogate(text.charCodeAt(cut - 1)) &&
+    isLowSurrogate(text.charCodeAt(cut))
+  ) {
+    cut -= 1;
+  }
+  return cut;
+}
+
+function findBoundaryCut(
+  text: string,
+  minCut: number,
+  maxChars: number,
+): { headEnd: number; nextStart: number } | null {
+  let blankMatch: { headEnd: number; nextStart: number } | null = null;
+  BLANK_LINE_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = BLANK_LINE_RE.exec(text)) !== null) {
+    const start = match.index;
+    const end = start + match[0].length;
+    if (start > maxChars) {
+      break;
+    }
+    if (start >= minCut && text.slice(0, start).trim().length > 0) {
+      blankMatch = { headEnd: start, nextStart: end };
+    }
+  }
+  if (blankMatch) {
+    return blankMatch;
+  }
+
+  for (let i = Math.min(maxChars, text.length - 1); i >= minCut; i--) {
+    if (text.charCodeAt(i) === 10) {
+      const headEnd = i > 0 && text.charCodeAt(i - 1) === 13 ? i - 1 : i;
+      if (headEnd > 0 && text.slice(0, headEnd).trim().length > 0) {
+        return { headEnd, nextStart: i + 1 };
+      }
+    }
+  }
+
+  for (let i = Math.min(maxChars, text.length) - 1; i >= minCut - 1 && i >= 0; i--) {
+    if (SENTENCE_END_RE.test(text[i])) {
+      const cut = i + 1;
+      if (cut >= minCut && cut <= maxChars) {
+        return { headEnd: cut, nextStart: cut };
+      }
+    }
+  }
+
+  return null;
+}
+
+function splitProactiveSegment(
+  text: string,
+  maxChars: number,
+  maxSegments?: number,
+): string[] {
+  const parts: string[] = [];
+  let remaining = text.trim();
+  const minPreferredBase = Math.max(1, Math.floor(maxChars * 0.3));
+
+  while (remaining.length > maxChars) {
+    const remainingBudget =
+      maxSegments !== undefined ? Math.max(1, maxSegments - parts.length) : undefined;
+    if (remainingBudget === 1) {
+      break;
+    }
+    const minRequired =
+      remainingBudget !== undefined
+        ? Math.max(1, remaining.length - (remainingBudget - 1) * maxChars)
+        : 1;
+    const minPreferred = Math.max(minRequired, Math.min(maxChars, minPreferredBase));
+
+    const boundary =
+      findBoundaryCut(remaining, minPreferred, maxChars) ??
+      (minRequired < minPreferred ? findBoundaryCut(remaining, minRequired, maxChars) : null);
+
+    let head: string;
+    let tail: string;
+    if (boundary) {
+      head = remaining.slice(0, boundary.headEnd).trim();
+      tail = remaining.slice(boundary.nextStart).trim();
+    } else {
+      const cut = safeHardCutIndex(remaining, maxChars, minRequired);
+      head = remaining.slice(0, cut).trim();
+      tail = remaining.slice(cut).trim();
+    }
+
+    if (!head || !tail) {
+      const cut = safeHardCutIndex(remaining, maxChars, 1);
+      head = remaining.slice(0, cut).trim();
+      tail = remaining.slice(cut).trim();
+      if (!head || !tail) {
+        break;
+      }
+    }
+
+    parts.push(head);
+    remaining = tail;
+  }
+
+  if (remaining) {
+    parts.push(remaining);
+  }
+  return parts;
+}
+
+export function normalizeProactiveParts(
   text: string | string[] | undefined,
   allowEmpty = false,
 ): { ok: true; parts: string[] } | { ok: false; error: string } {
@@ -254,7 +377,7 @@ function normalizeProactiveParts(
       error: `Message must contain between 1 and ${MAX_PROACTIVE_SEGMENTS} segments`,
     };
   }
-  const parts: string[] = [];
+  const trimmedList: string[] = [];
   let totalChars = 0;
   for (const item of rawList) {
     if (typeof item !== 'string') {
@@ -265,12 +388,67 @@ function normalizeProactiveParts(
       return { ok: false, error: 'Message segments must not be empty' };
     }
     totalChars += trimmed.length;
-    if (totalChars > MAX_PROACTIVE_CHARS) {
-      return { ok: false, error: `Total message length exceeds ${MAX_PROACTIVE_CHARS} characters` };
+    if (totalChars > MAX_PROACTIVE_TOTAL_CHARS) {
+      return {
+        ok: false,
+        error: `Total message length exceeds ${MAX_PROACTIVE_TOTAL_CHARS} characters`,
+      };
     }
-    parts.push(trimmed);
+    trimmedList.push(trimmed);
   }
-  return { ok: true, parts };
+
+  const targetParts: string[] = [];
+  for (const segment of trimmedList) {
+    if (segment.length <= PROACTIVE_AUTO_SPLIT_TARGET_CHARS) {
+      targetParts.push(segment);
+    } else {
+      targetParts.push(...splitProactiveSegment(segment, PROACTIVE_AUTO_SPLIT_TARGET_CHARS));
+    }
+  }
+  if (
+    targetParts.length <= MAX_PROACTIVE_SEGMENTS &&
+    targetParts.every((part) => part.length <= MAX_PROACTIVE_SEGMENT_CHARS)
+  ) {
+    return { ok: true, parts: targetParts };
+  }
+
+  const minSegmentsPerItem = trimmedList.map((segment) =>
+    Math.max(1, Math.ceil(segment.length / MAX_PROACTIVE_SEGMENT_CHARS)),
+  );
+  const totalMinSegments = minSegmentsPerItem.reduce((sum, count) => sum + count, 0);
+  if (totalMinSegments > MAX_PROACTIVE_SEGMENTS) {
+    return {
+      ok: false,
+      error: `Message exceeds maximum of ${MAX_PROACTIVE_SEGMENTS} segments after splitting (requires at least ${totalMinSegments} segments)`,
+    };
+  }
+
+  let extraBudget = MAX_PROACTIVE_SEGMENTS - totalMinSegments;
+  const packedParts: string[] = [];
+  for (let i = 0; i < trimmedList.length; i++) {
+    const segment = trimmedList[i];
+    if (segment.length <= MAX_PROACTIVE_SEGMENT_CHARS) {
+      packedParts.push(segment);
+      continue;
+    }
+    const minSegs = minSegmentsPerItem[i];
+    const budget = minSegs + extraBudget;
+    const chunks = splitProactiveSegment(segment, MAX_PROACTIVE_SEGMENT_CHARS, budget);
+    extraBudget = Math.max(0, extraBudget - (chunks.length - minSegs));
+    packedParts.push(...chunks);
+  }
+
+  if (
+    packedParts.length > MAX_PROACTIVE_SEGMENTS ||
+    packedParts.some((part) => part.length > MAX_PROACTIVE_SEGMENT_CHARS)
+  ) {
+    return {
+      ok: false,
+      error: `Message exceeds maximum of ${MAX_PROACTIVE_SEGMENTS} segments (max ${MAX_PROACTIVE_SEGMENT_CHARS} characters per segment)`,
+    };
+  }
+
+  return { ok: true, parts: packedParts };
 }
 
 function normalizeTimestampMs(rawTs: unknown): number {
@@ -863,7 +1041,7 @@ export class Automation {
           });
           if (result.status !== 'sent' && result.status !== 'staged') {
             this.logger?.warn?.(
-              `管理员微信自动回复未送达（status=${result.status}）：${result.detail || '未知原因'}`,
+              `管理员微信自动回复未送达（session=${replySession}, key=${replyKey}, status=${result.status}）：${result.detail || '未知原因'}`,
             );
             if (result.status === 'failed' && replyImagePath && replyText.trim()) {
               const fallbackResult = await this.sendProactive({
@@ -875,7 +1053,7 @@ export class Automation {
               });
               if (fallbackResult.status !== 'sent' && fallbackResult.status !== 'staged') {
                 this.logger?.warn?.(
-                  `管理员微信纯文字降级回复未送达（status=${fallbackResult.status}）：${fallbackResult.detail || '未知原因'}`,
+                  `管理员微信纯文字降级回复未送达（session=${replySession}, key=${replyKey}:text-fallback, status=${fallbackResult.status}）：${fallbackResult.detail || '未知原因'}`,
                 );
               }
             }
@@ -2721,17 +2899,27 @@ export class Automation {
     signal?: AbortSignal,
   ): Promise<ProactiveSendResult> {
     const session = String(input?.session || '').trim();
-    if (!session) {
-      return { status: 'failed', detail: 'Missing session' };
-    }
     const idempotencyKey = String(input?.idempotencyKey || '').trim();
-    if (!idempotencyKey) {
-      return { status: 'failed', detail: 'Missing idempotencyKey' };
+    const mode: 'send' | 'draft' = input?.mode === 'draft' ? 'draft' : 'send';
+    const reason = typeof input?.reason === 'string' ? input.reason.slice(0, 300) : '';
+    const warnOutcome = (
+      status: 'failed' | 'uncertain' | 'skipped',
+      detail: string,
+      deliveryId?: string,
+    ): ProactiveSendResult => {
+      this.logger?.warn?.(
+        `[wxarc] sendProactive ${status} (session=${session || '-'}, key=${idempotencyKey || '-'}, reason=${reason || '-'}): ${detail}`,
+      );
+      return deliveryId ? { status, deliveryId, detail } : { status, detail };
+    };
+    if (!session) {
+      return warnOutcome('failed', 'Missing session');
     }
-    const mode: 'send' | 'draft' = input.mode === 'draft' ? 'draft' : 'send';
-    const reason = typeof input.reason === 'string' ? input.reason.slice(0, 300) : '';
+    if (!idempotencyKey) {
+      return warnOutcome('failed', 'Missing idempotencyKey');
+    }
     if (input.imagePath !== undefined && typeof input.imagePath !== 'string') {
-      return { status: 'failed', detail: 'Invalid imagePath' };
+      return warnOutcome('failed', 'Invalid imagePath');
     }
     const imagePath = typeof input.imagePath === 'string' ? input.imagePath.trim() : '';
     let imageData: OutgoingImageData | null = null;
@@ -2739,30 +2927,27 @@ export class Automation {
       try {
         imageData = loadLocalImage(imagePath);
       } catch (err) {
-        return {
-          status: 'failed',
-          detail: err instanceof Error ? err.message : String(err),
-        };
+        return warnOutcome('failed', err instanceof Error ? err.message : String(err));
       }
     }
     const normalized = normalizeProactiveParts(input.text, Boolean(imageData));
     if (!normalized.ok) {
-      return { status: 'failed', detail: normalized.error };
+      return warnOutcome('failed', normalized.error);
     }
     const currentOwnId = (this.settings().policy.ownId || '').trim();
     const expectedOwnId =
       typeof input.expectedOwnId === 'string' ? input.expectedOwnId.trim() : '';
     if (expectedOwnId && currentOwnId && expectedOwnId !== currentOwnId) {
-      return {
-        status: 'failed',
-        detail: `Account ownId mismatch: expected "${expectedOwnId}", bridge bound to "${currentOwnId}"`,
-      };
+      return warnOutcome(
+        'failed',
+        `Account ownId mismatch: expected "${expectedOwnId}", bridge bound to "${currentOwnId}"`,
+      );
     }
     if (expectedOwnId && !currentOwnId) {
-      return {
-        status: 'failed',
-        detail: `Account ownId verification failed: bridge has no configured ownId (expected "${expectedOwnId}")`,
-      };
+      return warnOutcome(
+        'failed',
+        `Account ownId verification failed: bridge has no configured ownId (expected "${expectedOwnId}")`,
+      );
     }
     const inFlight = this.inFlightProactive.get(idempotencyKey);
     if (inFlight) {
@@ -2856,8 +3041,9 @@ export class Automation {
         }
         for (let i = 0; this.active && i < 200; i++) {
           if (this.stopped || signal?.aborted || this.controller.signal.aborted) {
-            this.updateProactiveStatus(deliveryId, 'failed', 'Aborted while waiting for GUI slot');
-            return { status: 'failed', deliveryId, detail: 'Aborted while waiting for GUI slot' };
+            const detail = 'Aborted while waiting for GUI slot';
+            this.updateProactiveStatus(deliveryId, 'failed', detail);
+            return warnOutcome('failed', detail, deliveryId);
           }
           await pause(50, undefined, {
             signal: signal
@@ -2866,23 +3052,24 @@ export class Automation {
           }).catch(() => {});
         }
         if (this.stopped || signal?.aborted || this.controller.signal.aborted) {
-          this.updateProactiveStatus(deliveryId, 'failed', 'Aborted before send started');
-          return { status: 'failed', deliveryId, detail: 'Aborted before send started' };
+          const detail = 'Aborted before send started';
+          this.updateProactiveStatus(deliveryId, 'failed', detail);
+          return warnOutcome('failed', detail, deliveryId);
         }
         if (this.active) {
           const detail = 'Automation GUI busy; skipped proactive send';
           this.updateProactiveStatus(deliveryId, 'skipped', detail);
-          return { status: 'skipped', deliveryId, detail };
+          return warnOutcome('skipped', detail, deliveryId);
         }
         if (this.stickers?.lease) {
           const detail = 'Sticker panel lease active; skipped GUI conflict';
           this.updateProactiveStatus(deliveryId, 'skipped', detail);
-          return { status: 'skipped', deliveryId, detail };
+          return warnOutcome('skipped', detail, deliveryId);
         }
         if (!this.listener.status().healthy) {
           const detail = 'wxarc listener unhealthy';
           this.updateProactiveStatus(deliveryId, 'failed', detail);
-          return { status: 'failed', deliveryId, detail };
+          return warnOutcome('failed', detail, deliveryId);
         }
         abort = this.active = new AbortController();
         const combinedSignal = AbortSignal.any([
@@ -2906,13 +3093,13 @@ export class Automation {
           } catch (err) {
             const detail = `Target verification failed: ${err instanceof Error ? err.message : String(err)}`;
             this.updateProactiveStatus(deliveryId, 'failed', detail);
-            return { status: 'failed', deliveryId, detail };
+            return warnOutcome('failed', detail, deliveryId);
           }
         }
         if (!rule) {
           const detail = `Target verification failed: unknown session "${session}"`;
           this.updateProactiveStatus(deliveryId, 'failed', detail);
-          return { status: 'failed', deliveryId, detail };
+          return warnOutcome('failed', detail, deliveryId);
         }
         const totalSteps = normalized.parts.length + (imageData ? 1 : 0);
         let sentSteps = 0;
@@ -2970,11 +3157,11 @@ export class Automation {
             if (sentSteps > 0) {
               const detail = `Pre-send prepare failed after ${sentSteps} segment(s) sent (${msg}); marked uncertain`;
               this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-              return { status: 'uncertain', deliveryId, detail };
+              return warnOutcome('uncertain', detail, deliveryId);
             }
             const detail = `Pre-send prepare failed: ${msg}`;
             this.updateProactiveStatus(deliveryId, 'failed', detail);
-            return { status: 'failed', deliveryId, detail };
+            return warnOutcome('failed', detail, deliveryId);
           }
           const clickedAt = this.now();
           this.store.db
@@ -2992,12 +3179,12 @@ export class Automation {
             if (!receipt?.confirmed) {
               const detail = receipt?.detail || 'Send confirmation missing; marked uncertain and never automatically replayed';
               this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-              return { status: 'uncertain', deliveryId, detail };
+              return warnOutcome('uncertain', detail, deliveryId);
             }
           } catch (err) {
             const detail = `Mid-send failure (${err instanceof Error ? err.message : String(err)}); marked uncertain and never automatically replayed`;
             this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-            return { status: 'uncertain', deliveryId, detail };
+            return warnOutcome('uncertain', detail, deliveryId);
           }
           sentSteps += 1;
           if (sentSteps < totalSteps) {
@@ -3006,7 +3193,7 @@ export class Automation {
             } catch (err) {
               const detail = `Interrupted between segments (${err instanceof Error ? err.message : String(err)}); marked uncertain`;
               this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-              return { status: 'uncertain', deliveryId, detail };
+              return warnOutcome('uncertain', detail, deliveryId);
             }
           }
         }
@@ -3034,11 +3221,11 @@ export class Automation {
             if (sentSteps > 0) {
               const detail = `Pre-send image prepare failed after ${sentSteps} segment(s) sent (${msg}); marked uncertain`;
               this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-              return { status: 'uncertain', deliveryId, detail };
+              return warnOutcome('uncertain', detail, deliveryId);
             }
             const detail = `Pre-send image prepare failed: ${msg}`;
             this.updateProactiveStatus(deliveryId, 'failed', detail);
-            return { status: 'failed', deliveryId, detail };
+            return warnOutcome('failed', detail, deliveryId);
           }
           const clickedAt = this.now();
           this.store.db
@@ -3057,12 +3244,12 @@ export class Automation {
               const detail =
                 receipt?.detail || 'Image send confirmation missing; marked uncertain and never automatically replayed';
               this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-              return { status: 'uncertain', deliveryId, detail };
+              return warnOutcome('uncertain', detail, deliveryId);
             }
           } catch (err) {
             const detail = `Mid-send image failure (${err instanceof Error ? err.message : String(err)}); marked uncertain and never automatically replayed`;
             this.updateProactiveStatus(deliveryId, 'uncertain', detail);
-            return { status: 'uncertain', deliveryId, detail };
+            return warnOutcome('uncertain', detail, deliveryId);
           }
           sentSteps += 1;
         }
