@@ -5,16 +5,25 @@ import { randomUUID } from 'node:crypto';
 import type { AdminWechatMessage, HubService } from '@local/dsh-hub/contracts';
 import type { RouterDecisionRecord } from './contracts.js';
 import type { RouterDb } from './db.js';
-import type {
-  SessionAgentLike,
-  SessionControllerLike,
-  WorkerDispatcherContext,
-  WorkspaceControllerLike,
-  WorkspaceRegistryLike,
+import type { TriageLoggerLike } from './triage.js';
+import {
+  unwrapResolvedAgent,
+  type SessionAgentLike,
+  type SessionControllerLike,
+  type WorkerDispatcherContext,
+  type WorkspaceControllerLike,
+  type WorkspaceRegistryLike,
 } from './worker-dispatcher.js';
 
 export const OWNER_SESSION_META_KEY = 'owner_session_id';
 export const DEFAULT_OWNER_DEBOUNCE_MS = 1500;
+const OWNER_PROMPT_TIMEOUT_MS = 30_000;
+
+export interface AgentDefaultModelLike {
+  currentSelection?: () =>
+    | { provider?: string; model?: string; reasoningEffort?: string }
+    | undefined;
+}
 
 export interface OwnerSessionAgentLike extends SessionAgentLike {
   inject?: (message: unknown) => void;
@@ -32,6 +41,8 @@ export interface OwnerSessionAgentLike extends SessionAgentLike {
 }
 
 export interface OwnerSessionContextLike extends WorkerDispatcherContext {
+  logger?: TriageLoggerLike;
+  agentDefaultModel?: AgentDefaultModelLike;
   agents?: {
     get?: (sessionId: string) => OwnerSessionAgentLike | undefined;
   };
@@ -133,6 +144,7 @@ export class OwnerSessionBridge {
   private readonly resolveOwnerTarget: () => Promise<string>;
   private readonly onTurnEnded?: (info: { sessionId: string; runId: string }) => void;
   private readonly disposers: Array<() => void> = [];
+  private readonly abortController = new AbortController();
   private ensurePromise: Promise<string | null> | null = null;
   private pendingMessages: AdminWechatMessage[] = [];
   private debounceTimer: ReturnType<typeof setTimeout> | null = null;
@@ -207,19 +219,53 @@ export class OwnerSessionBridge {
     });
   }
 
+  private warn(message: string, err?: unknown): void {
+    const detail = err instanceof Error ? err.message : err !== undefined ? String(err) : '';
+    const full = detail ? `${message}: ${detail}` : message;
+    const logger = readService<TriageLoggerLike>(this.ctx, 'logger');
+    if (typeof logger?.warn === 'function') {
+      logger.warn(full);
+      return;
+    }
+    console.warn(full);
+  }
+
+  private createPromptSignal(): AbortSignal {
+    const timeoutSignal = AbortSignal.timeout(OWNER_PROMPT_TIMEOUT_MS);
+    if (typeof AbortSignal.any === 'function') {
+      return AbortSignal.any([this.abortController.signal, timeoutSignal]);
+    }
+    return timeoutSignal;
+  }
+
+  private ensureDefaultModel(agent: OwnerSessionAgentLike | null): void {
+    if (!agent?.model || typeof agent.model.select !== 'function') return;
+    if (typeof agent.model.current === 'function' && agent.model.current()) return;
+    const defaultModel = readService<AgentDefaultModelLike>(this.ctx, 'agentDefaultModel');
+    const selection = defaultModel?.currentSelection?.();
+    if (!selection?.provider || !selection.model) return;
+    try {
+      agent.model.select({
+        provider: selection.provider,
+        model: selection.model,
+        ...(selection.reasoningEffort ? { reasoningEffort: selection.reasoningEffort } : {}),
+      });
+    } catch (err) {
+      this.warn('[dsh-router] owner-session default model select failed', err);
+    }
+  }
+
   private async resolveAgent(sessionId: string): Promise<OwnerSessionAgentLike | null> {
     const agents = readService<OwnerSessionContextLike['agents']>(this.ctx, 'agents');
-    const cached = agents?.get?.(sessionId);
+    const cached = unwrapResolvedAgent<OwnerSessionAgentLike>(agents?.get?.(sessionId));
     if (cached) return cached;
     const controller = readService<SessionControllerLike>(this.ctx, 'sessionController');
     if (!controller?.resolveAgent) return null;
     try {
       const resolved = await controller.resolveAgent(sessionId);
-      if (resolved && typeof resolved === 'object' && 'agent' in resolved) {
-        return (resolved.agent as OwnerSessionAgentLike | undefined) ?? null;
-      }
-      return (resolved as OwnerSessionAgentLike | undefined) ?? null;
-    } catch {
+      return unwrapResolvedAgent<OwnerSessionAgentLike>(resolved);
+    } catch (err) {
+      this.warn('[dsh-router] owner-session resolveAgent failed', err);
       return null;
     }
   }
@@ -246,6 +292,7 @@ export class OwnerSessionBridge {
       }
       const existingAgent = await this.resolveAgent(existingId);
       if (existingAgent) {
+        this.ensureDefaultModel(existingAgent);
         return existingId;
       }
     }
@@ -297,6 +344,10 @@ export class OwnerSessionBridge {
       this.db.setMeta(OWNER_SESSION_META_KEY, finalSessionId);
     }
     this.registerPrincipal(finalSessionId);
+    if (controller.resolveAgent) {
+      const createdAgent = await this.resolveAgent(finalSessionId);
+      this.ensureDefaultModel(createdAgent);
+    }
     return finalSessionId;
   }
 
@@ -315,7 +366,8 @@ export class OwnerSessionBridge {
         source: { kind: 'dsh-router:push-receipt', silent: true },
       });
       return true;
-    } catch {
+    } catch (err) {
+      this.warn('[dsh-router] owner-session receipt inject failed', err);
       return false;
     }
   }
@@ -369,26 +421,50 @@ export class OwnerSessionBridge {
       };
       this.activeTurn = turnState;
 
-      const controller = readService<
-        SessionControllerLike & {
-          prompt?: (input: Record<string, unknown>) => Promise<unknown>;
-        }
-      >(this.ctx, 'sessionController');
+      const controller = readService<SessionControllerLike>(this.ctx, 'sessionController');
 
       if (typeof controller?.prompt === 'function') {
-        const res = await controller.prompt({
-          sessionId,
-          requestId,
-          mode: 'queue',
-          clientTimeZone: 'Asia/Shanghai',
-          content,
-        });
-        const directReply = extractPromptReturnText(res);
-        if (directReply && !turnState.replied) {
-          await this.finalizeTurn(sessionId, turnState, directReply);
+        try {
+          const res = await controller.prompt(
+            {
+              sessionId,
+              requestId,
+              mode: 'queue',
+              clientTimeZone: 'Asia/Shanghai',
+              content,
+            },
+            this.createPromptSignal(),
+          );
+          const directReply = extractPromptReturnText(res);
+          if (directReply && !turnState.replied) {
+            await this.finalizeTurn(sessionId, turnState, directReply);
+          }
+        } catch (promptErr) {
+          const errMessage = promptErr instanceof Error ? promptErr.message : String(promptErr);
+          this.warn('[dsh-router] owner-session prompt failed', promptErr);
+          let fellBack = false;
+          if (!this.disposed && !this.abortController.signal.aborted && /model/i.test(errMessage)) {
+            const agent = await this.resolveAgent(sessionId);
+            this.ensureDefaultModel(agent);
+            if (agent && typeof agent.followup === 'function') {
+              agent.followup({
+                id: requestId,
+                role: 'user',
+                content,
+                source: { kind: 'dsh-router:owner-dm', requestId, chatId },
+              });
+              fellBack = true;
+            }
+          }
+          if (!fellBack) {
+            this.activeTurn = null;
+            this.hub.clearTurnPrivateRead?.(sessionId);
+            this.onTurnEnded?.({ sessionId, runId: turnState.turnId });
+          }
         }
       } else {
         const agent = await this.resolveAgent(sessionId);
+        this.ensureDefaultModel(agent);
         if (agent && typeof agent.followup === 'function') {
           agent.followup({
             id: requestId,
@@ -401,7 +477,8 @@ export class OwnerSessionBridge {
           this.hub.clearTurnPrivateRead?.(sessionId);
         }
       }
-    } catch {
+    } catch (err) {
+      this.warn('[dsh-router] owner-session prompt failed', err);
       const sessionId = this.getSessionId();
       const prevTurn = this.activeTurn;
       this.activeTurn = null;
@@ -489,7 +566,8 @@ export class OwnerSessionBridge {
             mode: 'send',
             reason: 'owner_session_reply',
           });
-        } catch {
+        } catch (err) {
+          this.warn('[dsh-router] owner-session reply send failed', err);
         }
       }
     }
@@ -502,6 +580,7 @@ export class OwnerSessionBridge {
   dispose(): void {
     if (this.disposed) return;
     this.disposed = true;
+    this.abortController.abort();
     if (this.debounceTimer) {
       clearTimeout(this.debounceTimer);
       this.debounceTimer = null;

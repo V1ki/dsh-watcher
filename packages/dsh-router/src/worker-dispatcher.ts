@@ -34,6 +34,11 @@ export interface WorkspaceRegistryLike {
   create?: (workspacePath: string) => Promise<{ id: string }>;
 }
 
+export interface SessionAgentModelLike {
+  current?: () => { provider?: string; model?: string; reasoningEffort?: string } | undefined;
+  select?: (selection: { provider: string; model: string; reasoningEffort?: string }) => void;
+}
+
 export interface SessionAgentLike {
   id?: string;
   session?: {
@@ -47,8 +52,27 @@ export interface SessionAgentLike {
       rootSessionId?: string;
     };
   };
+  model?: SessionAgentModelLike;
   followup?: (message: unknown) => void;
   inject?: (message: unknown) => void;
+}
+
+export function unwrapResolvedAgent<T extends SessionAgentLike = SessionAgentLike>(
+  resolved: unknown,
+): T | null {
+  if (!resolved || typeof resolved !== 'object') return null;
+  const record = resolved as Record<string, unknown>;
+  if ('error' in record && record.error) return null;
+  const candidate = ('agent' in record ? record.agent : resolved) as T | null | undefined;
+  if (!candidate || typeof candidate !== 'object') return null;
+  if (
+    typeof candidate.followup === 'function' ||
+    typeof candidate.inject === 'function' ||
+    Boolean(candidate.session)
+  ) {
+    return candidate;
+  }
+  return null;
 }
 
 export interface SessionControllerLike {
@@ -428,10 +452,7 @@ export async function sendWorkerFollowup(
   if (!controller?.resolveAgent) return false;
   try {
     const resolved = await controller.resolveAgent(sessionId);
-    const agent =
-      resolved && typeof resolved === 'object' && 'agent' in resolved
-        ? resolved.agent
-        : (resolved as SessionAgentLike | undefined);
+    const agent = unwrapResolvedAgent(resolved);
     if (!agent || typeof agent.followup !== 'function') return false;
     agent.followup(createRouterMessage(text, metadata));
     return true;
@@ -543,10 +564,7 @@ export async function dispatchWorker(input: DispatchWorkerInput): Promise<Dispat
   if (controller?.resolveAgent && (permissionPresets?.set || sandboxPolicy?.setMode)) {
     try {
       const resolved = await controller.resolveAgent(sessionId);
-      const agent =
-        resolved && typeof resolved === 'object' && 'agent' in resolved
-          ? resolved.agent
-          : (resolved as SessionAgentLike | undefined);
+      const agent = unwrapResolvedAgent(resolved);
       const targetSession = agent?.session ?? agent;
       if (targetSession) {
         if (permissionPresets?.set) {

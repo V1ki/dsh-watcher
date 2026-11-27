@@ -19,8 +19,11 @@ import {
   createRouterHttpHandler,
   mountRouterHttpRoutes,
   openRouterDb,
+  sendWorkerFollowup,
   triageEvent,
+  unwrapResolvedAgent,
   DEFAULT_ATTENTION_POLICY,
+  OWNER_SESSION_META_KEY,
   type CordisRouterContext,
   type RouterPluginConfig,
   type ToolDefinitionLike,
@@ -47,13 +50,15 @@ function makeEvent(overrides: Partial<NormalizedEvent> = {}): NormalizedEvent {
 
 function createMockSessionEnv(options: {
   preserveSessionId?: boolean;
-  onPrompt?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+  onPrompt?: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> | unknown;
 } = {}) {
   const createdWorkspaces: string[] = [];
   const createdSessions: Array<{ workspaceId: string; sessionId: string }> = [];
   const followups: Array<{ sessionId: string; message: unknown }> = [];
   const injected: Array<{ sessionId: string; message: unknown }> = [];
   const prompts: Array<Record<string, unknown>> = [];
+  const promptSignals: Array<AbortSignal | undefined> = [];
+  const warnings: string[] = [];
   const presetCalls: Array<{ session: unknown; preset: string }> = [];
   const sandboxCalls: Array<{ session: unknown; mode: string }> = [];
   const tools = new Map<string, ToolDefinitionLike>();
@@ -70,15 +75,18 @@ function createMockSessionEnv(options: {
 
   const sessionController: {
     create: (input: { sessionId?: string; workspaceId?: string; cwd?: string }) => Promise<{ sessionId: string }>;
-    resolveAgent: (sessionId: string) => Promise<{
-      agent: {
-        id: string;
-        session: { id: string };
-        followup: (message: unknown) => void;
-        inject: (message: unknown) => void;
-      };
-    }>;
-    prompt?: (input: Record<string, unknown>) => Promise<unknown>;
+    resolveAgent: (sessionId: string) => Promise<
+      | {
+          agent: {
+            id: string;
+            session: { id: string };
+            followup: (message: unknown) => void;
+            inject: (message: unknown) => void;
+          };
+        }
+      | { error: { code: string; message?: string } }
+    >;
+    prompt?: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>;
   } = {
     create: async (input: { sessionId?: string; workspaceId?: string; cwd?: string }) => {
       const sessionId =
@@ -103,11 +111,18 @@ function createMockSessionEnv(options: {
   };
 
   if (options.onPrompt) {
-    sessionController.prompt = async (input: Record<string, unknown>) => {
+    sessionController.prompt = async (input: Record<string, unknown>, signal?: AbortSignal) => {
       prompts.push(input);
-      return options.onPrompt!(input);
+      promptSignals.push(signal);
+      return options.onPrompt!(input, signal);
     };
   }
+
+  const logger = {
+    warn: (message: string) => {
+      warnings.push(message);
+    },
+  };
 
   const toolsRegistry = {
     register: (def: ToolDefinitionLike) => {
@@ -177,6 +192,8 @@ function createMockSessionEnv(options: {
     followups,
     injected,
     prompts,
+    promptSignals,
+    warnings,
     presetCalls,
     sandboxCalls,
     tools,
@@ -185,6 +202,7 @@ function createMockSessionEnv(options: {
     toolsRegistry,
     permissionPresets,
     sandboxPolicy,
+    logger,
     on,
     emitEvent,
     runMiddleware,
@@ -201,7 +219,7 @@ function createHarness(options: {
   approvalTtlMs?: number;
   legacyWxarcDbPath?: string;
   preserveSessionId?: boolean;
-  onPrompt?: (input: Record<string, unknown>) => Promise<unknown> | unknown;
+  onPrompt?: (input: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown> | unknown;
   wechatSend?: (input: WechatSendInput) => Promise<{ status: 'sent' | 'staged' | 'failed'; detail?: string }>;
 } = {}) {
   const disposers: Array<() => void> = [];
@@ -215,6 +233,7 @@ function createHarness(options: {
     ['tools', env.toolsRegistry],
     ['permissionPresets', env.permissionPresets],
     ['sandboxPolicy', env.sandboxPolicy],
+    ['logger', env.logger],
   ]);
 
   const hubCtx = {
@@ -2243,6 +2262,121 @@ describe('@local/dsh-router backend', () => {
     } finally {
       cleanup();
       fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes AbortSignal to sessionController.prompt, guards resolveAgent error objects, and logs prompt failures', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-router-owner-signal-'));
+    const sentWechat: WechatSendInput[] = [];
+    let promptMode: 'ok' | 'fail' | 'model-error' = 'ok';
+
+    const { hub, router, env, cleanup } = createHarness({
+      homeDir: tmpHome,
+      ownerDebounceMs: 10,
+      preserveSessionId: true,
+      controllerId: 'wxid_admin_demo',
+      onPrompt: async (_input, signal) => {
+        assert.ok(signal instanceof AbortSignal, 'sessionController.prompt must receive AbortSignal');
+        signal.throwIfAborted();
+        if (promptMode === 'fail') {
+          throw new Error('gateway/internal: transient prompt error');
+        }
+        if (promptMode === 'model-error') {
+          throw new Error('session/model-unavailable: Select an available model before sending a message.');
+        }
+        return { accepted: true };
+      },
+      wechatSend: async (input) => {
+        sentWechat.push(input);
+        return { status: 'sent' };
+      },
+    });
+
+    try {
+      const liveSessions = new Set<string>();
+      const origCreate = env.sessionController.create;
+      const origResolve = env.sessionController.resolveAgent;
+      env.sessionController.create = async (input) => {
+        const res = await origCreate(input);
+        liveSessions.add(res.sessionId);
+        return res;
+      };
+      env.sessionController.resolveAgent = async (sessionId) => {
+        if (!liveSessions.has(sessionId)) {
+          return { error: { code: 'session/not-found', message: `session "${sessionId}" not found` } };
+        }
+        return origResolve(sessionId);
+      };
+
+      assert.equal(unwrapResolvedAgent({ error: { code: 'session/not-found' } }), null);
+      assert.equal(unwrapResolvedAgent({ id: 'invalid-bare-object' }), null);
+      assert.equal(
+        await sendWorkerFollowup(
+          { sessionController: env.sessionController },
+          'missing-worker-session',
+          'hello',
+        ),
+        false,
+      );
+
+      router.db.setMeta(OWNER_SESSION_META_KEY, 'stale-missing-owner-session');
+      const recreatedId = await router.ownerSession.ensureSession();
+      assert.equal(recreatedId, 'stale-missing-owner-session');
+      assert.equal(env.createdSessions.length, 1);
+      assert.equal(liveSessions.has('stale-missing-owner-session'), true);
+
+      await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '还在吗',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      assert.equal(env.prompts.length, 1);
+      assert.ok(env.promptSignals[0] instanceof AbortSignal);
+      assert.equal(env.warnings.length, 0);
+
+      env.emitEvent('session/event', { id: recreatedId }, { type: 'turn/start', data: { turn: 1 } });
+      env.emitEvent('session/event', { id: recreatedId }, {
+        type: 'assistant/message',
+        data: { turn: 1, message: { content: [{ type: 'text', text: '在的，什么事？' }] } },
+      });
+      env.emitEvent('session/event', { id: recreatedId }, {
+        type: 'turn/end',
+        data: { turn: 1, reason: { kind: 'completed' } },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 20));
+
+      assert.equal(sentWechat.length, 1);
+      assert.equal(sentWechat[0].text, '在的，什么事？');
+
+      promptMode = 'fail';
+      await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '测试报错不静默吞错',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      assert.equal(env.warnings.some((w) => w.includes('[dsh-router] owner-session prompt failed')), true);
+      assert.equal(env.warnings.some((w) => w.includes('transient prompt error')), true);
+      assert.equal(router.ownerSession.getActiveRunId(), null);
+
+      promptMode = 'model-error';
+      const followupsBefore = env.followups.length;
+      await hub.dispatchAdminWechatMessage!({
+        session: 'wxid_admin_demo',
+        senderId: 'wxid_admin_demo',
+        text: '测试未选模型回退 followup',
+      });
+      await new Promise((resolve) => setTimeout(resolve, 40));
+
+      assert.equal(env.warnings.some((w) => w.includes('Select an available model')), true);
+      assert.equal(env.followups.length, followupsBefore + 1);
+      assert.ok(router.ownerSession.getActiveRunId());
+    } finally {
+      cleanup();
+      fs.rmSync(tmpHome, { recursive: true, force: true });
     }
   });
 });
