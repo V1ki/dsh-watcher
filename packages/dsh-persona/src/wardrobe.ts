@@ -3,14 +3,31 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import type {
+  AddPersonaMemoryInput,
+  AudienceTag,
+  ChatCircle,
+  ChatCircleRecord,
+  ContextStamp,
+  ContextStampInput,
   DynamicPersonaCard,
   DynamicPersonaCardInput,
   DynamicPersonaMemoryItem,
+  EventFactInput,
+  EventFactRecord,
+  EvidenceTargetType,
   FoundationBundle,
   FoundationImportResult,
   FoundationSource,
+  ImportFoundationOptions,
   LearnStyleOptions,
   LegacyMigrationResult,
+  MediaAssetInput,
+  MediaAssetRecord,
+  MemoryEvidenceRecord,
+  MemoryVisibility,
+  MultimodalRecallInput,
+  MultimodalRecallResult,
+  ObservationStatus,
   PersonaConfig,
   PersonaDb,
   PersonaKind,
@@ -20,10 +37,16 @@ import type {
   PersonaWardrobe,
   PreviewChatInput,
   PreviewChatResult,
+  PromoteObservationInput,
   RecordTurnPreferenceInput,
+  ReferenceCardInput,
+  ReferenceCardRecord,
+  ReferenceEntityType,
   StyleSampleFile,
   StyleSampleInfo,
   StyleSampleItem,
+  VisualObservationInput,
+  VisualObservationRecord,
   WxarcImportResult,
 } from './contracts.js';
 import {
@@ -32,6 +55,38 @@ import {
   DEFAULT_LEGACY_WXARC_DIR,
   expandHome,
 } from './db.js';
+import { normalizeChatId } from './multimodal.js';
+import { importFoundationHardened } from './wardrobe-import.js';
+import {
+  deleteReferenceCardOp,
+  listEventFactsOp,
+  listEvidenceOp,
+  listReferenceCardsOp,
+  listVisualObservationsOp,
+  promoteObservationToFactOp,
+  recordEventFactOp,
+  recordVisualObservationOp,
+  rejectObservationOp,
+  revokeEventFactOp,
+  upsertMediaAssetOp,
+  upsertReferenceCardOp,
+} from './wardrobe-multimodal.js';
+import {
+  type PersonaMemoryFullRow,
+  bumpMemoryVersion,
+  coerceAudienceTag,
+  coerceVisibility,
+  computeContextStamp,
+  deleteChatCircleRecord,
+  getChatCircleRecord,
+  getMemoryVersion,
+  listChatCircleRecords,
+  resolveCardAccess,
+  rowToFullMemoryRecord,
+  selectDrawerMemories,
+  setChatCircleRecord,
+} from './wardrobe-policy.js';
+import { recallMultimodalOp } from './wardrobe-recall.js';
 
 const DEFAULT_CARD_MEMORY_LIMIT = 16;
 const DEFAULT_MAX_MEMORIES_PER_SCOPE = 24;
@@ -123,6 +178,10 @@ export interface RecordTurnPreferenceCompatInput
     note: string;
     quote?: string;
     category?: string;
+    visibility?: MemoryVisibility;
+    audienceTag?: AudienceTag;
+    subjectWxid?: string;
+    speakerWxid?: string;
     sourceKey?: string;
     metadata?: PersonaMemoryMetadata;
   }>;
@@ -140,19 +199,6 @@ interface PersonaRow {
   style: string;
   style_meta: string;
   memory_count?: number;
-}
-
-interface PersonaMemoryRow {
-  id: number;
-  persona_id: string;
-  scope: string;
-  event_seq: number;
-  note: string;
-  quote: string;
-  at: number;
-  source_key: string | null;
-  category: string;
-  metadata: string;
 }
 
 function parseJsonObject(raw: string | null | undefined): Record<string, unknown> {
@@ -187,21 +233,6 @@ function rowToPersonaRecord(row: PersonaRow): PersonaRecord {
     style: row.style ?? '',
     styleMeta: parseJsonObject(row.style_meta),
     memoryCount: Number(row.memory_count ?? 0),
-  };
-}
-
-function rowToMemoryRecord(row: PersonaMemoryRow): PersonaMemoryRecord {
-  return {
-    id: Number(row.id),
-    personaId: row.persona_id,
-    scope: row.scope,
-    eventSeq: Number(row.event_seq),
-    note: row.note,
-    quote: row.quote,
-    at: Number(row.at),
-    sourceKey: row.source_key ?? null,
-    category: row.category || DEFAULT_CATEGORY,
-    metadata: parseJsonObject(row.metadata),
   };
 }
 
@@ -285,10 +316,14 @@ function toDynamicMemoryItem(mem: PersonaMemoryRecord): DynamicPersonaMemoryItem
     quote: mem.quote || undefined,
     category: mem.category,
     title: typeof meta.title === 'string' ? meta.title : undefined,
-    status: typeof meta.status === 'string' ? meta.status : undefined,
+    status: mem.editedAt ? 'user_corrected' : typeof meta.status === 'string' ? meta.status : undefined,
     period: observedFrom || observedTo ? [observedFrom, observedTo] : undefined,
     caveat: typeof meta.caveat === 'string' ? meta.caveat : undefined,
     sourceIds,
+    visibility: mem.visibility,
+    audienceTag: mem.audienceTag || undefined,
+    subjectWxid: mem.subjectWxid || undefined,
+    speakerWxid: mem.speakerWxid || undefined,
   };
 }
 
@@ -386,7 +421,7 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     return this.store.db
       .prepare(
         `SELECT p.id, p.revision, p.config, p.style, p.style_meta,
-                (SELECT COUNT(*) FROM persona_memory m WHERE m.persona_id = p.id) AS memory_count
+                (SELECT COUNT(*) FROM persona_memory m WHERE m.persona_id = p.id AND m.revoked_at IS NULL) AS memory_count
          FROM personas p
          WHERE p.id = ?`,
       )
@@ -397,7 +432,7 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     const rows = this.store.db
       .prepare(
         `SELECT p.id, p.revision, p.config, p.style, p.style_meta,
-                (SELECT COUNT(*) FROM persona_memory m WHERE m.persona_id = p.id) AS memory_count
+                (SELECT COUNT(*) FROM persona_memory m WHERE m.persona_id = p.id AND m.revoked_at IS NULL) AS memory_count
          FROM personas p
          ORDER BY p.id ASC`,
       )
@@ -428,6 +463,7 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     this.store.db
       .prepare('INSERT INTO personas (id, revision, config, style, style_meta) VALUES (?, 1, ?, ?, ?)')
       .run(id, serializeConfig(config), style, '{}');
+    bumpMemoryVersion(this.store);
     return this.get(id);
   }
 
@@ -445,6 +481,7 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     if (Number(result.changes) === 0) {
       throw new PersonaRevisionConflictError(value.id, revision);
     }
+    bumpMemoryVersion(this.store);
     return this.get(value.id);
   }
 
@@ -452,8 +489,34 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     return this.store.transaction(() => {
       this.store.db.prepare('DELETE FROM persona_memory WHERE persona_id = ?').run(id);
       const result = this.store.db.prepare('DELETE FROM personas WHERE id = ?').run(id);
-      return Number(result.changes) > 0;
+      const deleted = Number(result.changes) > 0;
+      if (deleted) bumpMemoryVersion(this.store);
+      return deleted;
     });
+  }
+
+  getVersion(): number {
+    return getMemoryVersion(this.store);
+  }
+
+  getContextStamp(input: ContextStampInput): ContextStamp {
+    return computeContextStamp(this.store, input);
+  }
+
+  getChatCircle(chatId: string): ChatCircleRecord {
+    return getChatCircleRecord(this.store, chatId);
+  }
+
+  setChatCircle(chatId: string, circle: ChatCircle, label?: string): ChatCircleRecord {
+    return setChatCircleRecord(this.store, chatId, circle, label, this.now());
+  }
+
+  deleteChatCircle(chatId: string): boolean {
+    return deleteChatCircleRecord(this.store, chatId);
+  }
+
+  listChatCircles(): ChatCircleRecord[] {
+    return listChatCircleRecords(this.store);
   }
 
   getDynamicCard(input: DynamicPersonaCardInput): DynamicPersonaCard | null;
@@ -470,45 +533,15 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     if (!row) return null;
     const persona = rowToPersonaRecord(row);
     const limit = Math.max(0, Math.min(input.limit ?? this.cardMemoryLimit, this.cardMemoryLimit));
-    const memRows =
-      limit > 0 && input.scope
-        ? (this.store.db
-            .prepare(
-              `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, metadata
-               FROM persona_memory
-               WHERE persona_id = ? AND scope = ?
-                 AND (source_key IS NULL OR source_key NOT LIKE 'foundation:%')
-               ORDER BY at DESC, id DESC
-               LIMIT ?`,
-            )
-            .all(persona.id, input.scope, limit) as unknown as PersonaMemoryRow[])
-        : [];
-    const recentMemories = memRows.map(rowToMemoryRecord).reverse();
-
-    let foundationMemories: PersonaMemoryRecord[] = [];
-    const ownerId = input.ownerId?.trim();
-    if (ownerId) {
-      const ownerScope = `${OWNER_SCOPE_PREFIX}${ownerId}`;
-      const fRows = this.store.db
-        .prepare(
-          `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, metadata
-           FROM persona_memory
-           WHERE persona_id = ? AND scope = ? AND source_key LIKE 'foundation:%'
-           ORDER BY id ASC`,
-        )
-        .all(persona.id, ownerScope) as unknown as PersonaMemoryRow[];
-      foundationMemories = rankFoundationMemories(fRows.map(rowToMemoryRecord), input.queryText);
-    } else if (input.ownerPreview === true) {
-      const fRows = this.store.db
-        .prepare(
-          `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, metadata
-           FROM persona_memory
-           WHERE persona_id = ? AND scope LIKE 'owner:%' AND source_key LIKE 'foundation:%'
-           ORDER BY id ASC`,
-        )
-        .all(persona.id) as unknown as PersonaMemoryRow[];
-      foundationMemories = rankFoundationMemories(fRows.map(rowToMemoryRecord), input.queryText);
-    }
+    const access = resolveCardAccess(this.store, input);
+    const { foundationMemories, recentMemories } = selectDrawerMemories(
+      this.store,
+      persona.id,
+      input,
+      access,
+      limit,
+      rankFoundationMemories,
+    );
 
     const combined = [...foundationMemories, ...recentMemories];
     const promptBlock = formatPromptBlock(persona, foundationMemories, recentMemories);
@@ -521,6 +554,9 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
       character: persona.character,
       style: persona.style,
       learning: persona.learning,
+      version: access.version,
+      circle: access.circle,
+      ownerMemoryIncluded: access.allowOwnerPrivate,
       cardMarkdown: promptBlock,
       memory: combined.map(toDynamicMemoryItem),
       promptBlock,
@@ -530,6 +566,9 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
   recordTurnPreference(input: RecordTurnPreferenceCompatInput): { recorded: number } {
     if (input.preview === true) return { recorded: 0 };
     if (!input.scope || input.scope.startsWith('sns:')) return { recorded: 0 };
+    const sourceText = typeof input.sourceText === 'string' ? input.sourceText : '';
+    if (!sourceText.trim()) return { recorded: 0 };
+
     const row = this.findPersonaRow(input.personaId);
     if (!row) return { recorded: 0 };
     const persona = rowToPersonaRecord(row);
@@ -539,34 +578,49 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
       Array.isArray(input.memories) && input.memories.length > 0
         ? input.memories
         : input.note && input.note.trim()
-          ? [{ note: input.note, quote: input.evidence ?? input.sourceText ?? '' }]
+          ? [{ note: input.note, quote: input.evidence ?? sourceText }]
           : [];
     const items = rawItems.filter((item) => typeof item.note === 'string' && item.note.trim().length > 0);
     if (items.length === 0) return { recorded: 0 };
 
-    const sourceText = typeof input.sourceText === 'string' ? input.sourceText : undefined;
     const ts = this.now();
     const eventSeq = input.eventSeq ?? ts;
     const speaker = input.speaker ?? input.sender ?? '';
+    const defaultSpeakerWxid = (input.speakerWxid ?? input.senderWxid ?? '').trim();
+    const defaultSubjectWxid = (input.subjectWxid ?? input.senderWxid ?? '').trim();
+    const chatId = normalizeChatId(input.chatId ?? input.scope);
+    const chatCircle = chatId ? getChatCircleRecord(this.store, chatId).circle : 'external';
+    const defaultVisibility = coerceVisibility(input.visibility, 'room');
+    const defaultAudience = coerceAudienceTag(input.audienceTag, '');
 
     const recorded = this.store.transaction(() => {
       let inserted = 0;
       const insertStmt = this.store.db.prepare(
         `INSERT OR IGNORE INTO persona_memory
-         (persona_id, scope, event_seq, note, quote, at, source_key, category, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (persona_id, scope, event_seq, note, quote, at, source_key, category, subject_wxid, speaker_wxid, visibility, audience_tag, edited_at, revoked_at, metadata)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
       );
       items.forEach((item, idx) => {
         const quote = (item.quote ?? input.evidence ?? '').trim();
-        if (!quote) return;
-        if (sourceText !== undefined && !sourceText.includes(quote)) return;
+        if (!quote || !sourceText.includes(quote)) return;
         const sourceKey =
           item.sourceKey ??
           (input.sourceKey ? (items.length === 1 ? input.sourceKey : `${input.sourceKey}#${idx}`) : null);
         const category = item.category?.trim() || DEFAULT_CATEGORY;
+        const visibility = coerceVisibility(item.visibility ?? defaultVisibility, 'room');
+        const audienceTag = coerceAudienceTag(
+          item.audienceTag ?? defaultAudience,
+          visibility === 'circle' ? chatCircle : '',
+        );
+        const subjectWxid = (item.subjectWxid ?? defaultSubjectWxid).trim();
+        const speakerWxid = (item.speakerWxid ?? defaultSpeakerWxid).trim();
         const metaObj: PersonaMemoryMetadata = {
           ...(item.metadata ?? {}),
           ...(speaker ? { speaker } : {}),
+          ...(speakerWxid ? { speakerWxid } : {}),
+          ...(subjectWxid ? { subjectWxid } : {}),
+          visibility,
+          ...(audienceTag ? { audienceTag } : {}),
         };
         const res = insertStmt.run(
           persona.id,
@@ -577,6 +631,10 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
           ts + idx,
           sourceKey,
           category,
+          subjectWxid,
+          speakerWxid,
+          visibility,
+          audienceTag,
           JSON.stringify(metaObj),
         );
         inserted += Number(res.changes);
@@ -585,28 +643,91 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
       this.store.db
         .prepare(
           `DELETE FROM persona_memory
-           WHERE persona_id = ? AND scope = ? AND source_key IS NULL
+           WHERE persona_id = ? AND scope = ? AND source_key IS NULL AND revoked_at IS NULL
              AND id NOT IN (
                SELECT id FROM persona_memory
-               WHERE persona_id = ? AND scope = ? AND source_key IS NULL
+               WHERE persona_id = ? AND scope = ? AND source_key IS NULL AND revoked_at IS NULL
                ORDER BY at DESC, id DESC
                LIMIT ?
              )`,
         )
         .run(persona.id, input.scope, persona.id, input.scope, this.maxMemoriesPerScope);
 
+      if (inserted > 0) bumpMemoryVersion(this.store);
       return inserted;
     });
 
     return { recorded };
   }
 
-  listMemories(id: string, filter: { scope?: string; limit?: number } = {}): PersonaMemoryRecord[] {
+  addMemory(input: AddPersonaMemoryInput): PersonaMemoryRecord {
+    this.get(input.personaId);
+    const note = input.note.trim();
+    if (!note) throw new Error('Memory note must be non-empty');
+    const ts = this.now();
+    const chatId = normalizeChatId(input.scope);
+    const visibility = coerceVisibility(
+      input.visibility,
+      input.scope.startsWith(OWNER_SCOPE_PREFIX) ? 'owner_private' : 'room',
+    );
+    const inferredAudience: AudienceTag =
+      visibility === 'circle' && chatId ? getChatCircleRecord(this.store, chatId).circle : '';
+    const audienceTag = coerceAudienceTag(input.audienceTag, inferredAudience);
+    const subjectWxid = (input.subjectWxid ?? '').trim();
+    const speakerWxid = (input.speakerWxid ?? '').trim();
+    const metadata: PersonaMemoryMetadata = {
+      ...(input.metadata ?? {}),
+      visibility,
+      ...(audienceTag ? { audienceTag } : {}),
+      ...(subjectWxid ? { subjectWxid } : {}),
+      ...(speakerWxid ? { speakerWxid } : {}),
+    };
+    const id = this.store.transaction(() => {
+      const res = this.store.db
+        .prepare(
+          `INSERT INTO persona_memory
+           (persona_id, scope, event_seq, note, quote, at, source_key, category, subject_wxid, speaker_wxid, visibility, audience_tag, edited_at, revoked_at, metadata)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)`,
+        )
+        .run(
+          input.personaId,
+          input.scope,
+          input.eventSeq ?? ts,
+          note,
+          (input.quote ?? '').trim(),
+          ts,
+          input.sourceKey ?? null,
+          input.category?.trim() || DEFAULT_CATEGORY,
+          subjectWxid,
+          speakerWxid,
+          visibility,
+          audienceTag,
+          JSON.stringify(metadata),
+        );
+      bumpMemoryVersion(this.store);
+      return Number(res.lastInsertRowid);
+    });
+    const row = this.store.db
+      .prepare(
+        `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, subject_wxid, speaker_wxid, visibility, audience_tag, edited_at, revoked_at, metadata
+         FROM persona_memory WHERE id = ?`,
+      )
+      .get(id) as unknown as PersonaMemoryFullRow;
+    return rowToFullMemoryRecord(row);
+  }
+
+  listMemories(
+    id: string,
+    filter: { scope?: string; limit?: number; includeRevoked?: boolean } = {},
+  ): PersonaMemoryRecord[] {
     const clauses = ['persona_id = ?'];
     const params: Array<string | number> = [id];
     if (filter.scope !== undefined) {
       clauses.push('scope = ?');
       params.push(filter.scope);
+    }
+    if (!filter.includeRevoked) {
+      clauses.push('revoked_at IS NULL');
     }
     const limitClause = filter.limit !== undefined ? ' LIMIT ?' : '';
     if (filter.limit !== undefined) {
@@ -614,13 +735,13 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     }
     const rows = this.store.db
       .prepare(
-        `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, metadata
+        `SELECT id, persona_id, scope, event_seq, note, quote, at, source_key, category, subject_wxid, speaker_wxid, visibility, audience_tag, edited_at, revoked_at, metadata
          FROM persona_memory
          WHERE ${clauses.join(' AND ')}
          ORDER BY at DESC, id DESC${limitClause}`,
       )
-      .all(...params) as unknown as PersonaMemoryRow[];
-    return rows.map(rowToMemoryRecord);
+      .all(...params) as unknown as PersonaMemoryFullRow[];
+    return rows.map(rowToFullMemoryRecord);
   }
 
   editMemory(id: string, memoryId: number, note: string): void {
@@ -632,20 +753,63 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     if (!existing) {
       throw new Error(`Memory ${memoryId} not found for persona ${id}`);
     }
-    const nextMeta = { ...parseJsonObject(existing.metadata), editedAt: this.now() };
-    this.store.db
-      .prepare('UPDATE persona_memory SET note = ?, metadata = ? WHERE persona_id = ? AND id = ?')
-      .run(trimmed, JSON.stringify(nextMeta), id, memoryId);
+    const now = this.now();
+    const nextMeta = { ...parseJsonObject(existing.metadata), editedAt: now };
+    this.store.transaction(() => {
+      this.store.db
+        .prepare(
+          'UPDATE persona_memory SET note = ?, edited_at = ?, metadata = ? WHERE persona_id = ? AND id = ?',
+        )
+        .run(trimmed, now, JSON.stringify(nextMeta), id, memoryId);
+      bumpMemoryVersion(this.store);
+    });
+  }
+
+  revokeMemory(id: string, memoryIdOrSourceKey: number | string, reason?: string): boolean {
+    const now = this.now();
+    return this.store.transaction(() => {
+      let existing: { id: number; metadata: string } | undefined;
+      if (typeof memoryIdOrSourceKey === 'number') {
+        existing = this.store.db
+          .prepare(
+            'SELECT id, metadata FROM persona_memory WHERE persona_id = ? AND id = ? AND revoked_at IS NULL',
+          )
+          .get(id, memoryIdOrSourceKey) as { id: number; metadata: string } | undefined;
+      } else {
+        const key = memoryIdOrSourceKey.trim();
+        const prefixed = key.startsWith(FOUNDATION_PREFIX) ? key : `${FOUNDATION_PREFIX}${key}`;
+        existing = this.store.db
+          .prepare(
+            'SELECT id, metadata FROM persona_memory WHERE persona_id = ? AND (source_key = ? OR source_key = ?) AND revoked_at IS NULL',
+          )
+          .get(id, key, prefixed) as { id: number; metadata: string } | undefined;
+      }
+      if (!existing) return false;
+      const nextMeta: PersonaMemoryMetadata = {
+        ...parseJsonObject(existing.metadata),
+        revokedAt: now,
+        ...(reason ? { revokeReason: reason } : {}),
+      };
+      this.store.db
+        .prepare('UPDATE persona_memory SET revoked_at = ?, metadata = ? WHERE id = ?')
+        .run(now, JSON.stringify(nextMeta), existing.id);
+      bumpMemoryVersion(this.store);
+      return true;
+    });
   }
 
   clearMemories(id: string, scope?: string): { deleted: number } {
-    const res =
-      scope !== undefined
-        ? this.store.db
-            .prepare('DELETE FROM persona_memory WHERE persona_id = ? AND scope = ?')
-            .run(id, scope)
-        : this.store.db.prepare('DELETE FROM persona_memory WHERE persona_id = ?').run(id);
-    return { deleted: Number(res.changes) };
+    return this.store.transaction(() => {
+      const res =
+        scope !== undefined
+          ? this.store.db
+              .prepare('DELETE FROM persona_memory WHERE persona_id = ? AND scope = ?')
+              .run(id, scope)
+          : this.store.db.prepare('DELETE FROM persona_memory WHERE persona_id = ?').run(id);
+      const deleted = Number(res.changes);
+      if (deleted > 0) bumpMemoryVersion(this.store);
+      return { deleted };
+    });
   }
 
   private resolveSampleFilePath(): string | null {
@@ -786,6 +950,7 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     if (Number(res.changes) === 0) {
       throw new PersonaRevisionConflictError(id, revision);
     }
+    bumpMemoryVersion(this.store);
     return this.get(id);
   }
 
@@ -836,87 +1001,12 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     };
   }
 
-  importFoundation(bundle: FoundationBundle, sources: FoundationSource[] = []): FoundationImportResult {
-    const sourceMap = new Map<string, FoundationSource>();
-    for (const src of sources) {
-      if (src && typeof src.source_id === 'string' && src.source_id.trim()) {
-        sourceMap.set(src.source_id.trim(), src);
-      }
-    }
-    const records = Array.isArray(bundle.records) ? bundle.records : [];
-    const now = this.now();
-    const touchedPersonas = new Set<string>();
-    if (bundle.default_persona_id) touchedPersonas.add(bundle.default_persona_id);
-
-    let added = 0;
-    this.store.transaction(() => {
-      const checkStmt = this.store.db.prepare(
-        'SELECT id FROM persona_memory WHERE persona_id = ? AND source_key = ?',
-      );
-      const insertStmt = this.store.db.prepare(
-        `INSERT INTO persona_memory
-         (persona_id, scope, event_seq, note, quote, at, source_key, category, metadata)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      );
-      const updateStmt = this.store.db.prepare(
-        `UPDATE persona_memory
-         SET scope = ?, note = ?, quote = ?, category = ?, metadata = ?
-         WHERE id = ?`,
-      );
-
-      for (let i = 0; i < records.length; i += 1) {
-        const rec = records[i];
-        if (!rec || typeof rec.id !== 'string' || !rec.id.trim()) continue;
-        const statement = typeof rec.statement === 'string' ? rec.statement.trim() : '';
-        if (!statement) continue;
-        const personaId = (rec.owner_persona_id || bundle.default_persona_id || '').trim();
-        const subjectId = (rec.subject_id || bundle.subject_id || '').trim();
-        if (!personaId || !subjectId) continue;
-        touchedPersonas.add(personaId);
-
-        const sourceKey = `${FOUNDATION_PREFIX}${rec.id.trim()}`;
-        const scope = `${OWNER_SCOPE_PREFIX}${subjectId}`;
-        const category = rec.category?.trim() || FOUNDATION_FALLBACK_CATEGORY;
-        const sourceIds = Array.isArray(rec.source_ids) ? rec.source_ids.map((s) => String(s)) : [];
-        const evidence: FoundationSource[] = [];
-        for (const sid of sourceIds) {
-          const found = sourceMap.get(sid);
-          if (found) evidence.push(found);
-        }
-        const quote = (evidence[0]?.text ?? evidence[0]?.note ?? '').trim();
-        const metadata: PersonaMemoryMetadata = {
-          id: rec.id.trim(),
-          title: rec.title,
-          tags: Array.isArray(rec.tags) ? rec.tags.map((t) => String(t)) : undefined,
-          status: rec.status,
-          observed_from: rec.observed_from,
-          observed_to: rec.observed_to,
-          caveat: rec.caveat,
-          source_ids: sourceIds,
-          evidence,
-          visibility: rec.visibility,
-          source_snapshot: bundle.source_snapshot,
-        };
-
-        const existing = checkStmt.get(personaId, sourceKey) as { id: number } | undefined;
-        if (existing) {
-          updateStmt.run(scope, statement, quote, category, JSON.stringify(metadata), existing.id);
-        } else {
-          insertStmt.run(personaId, scope, 0, statement, quote, now + i, sourceKey, category, JSON.stringify(metadata));
-          added += 1;
-        }
-      }
-    });
-
-    let total = 0;
-    const countStmt = this.store.db.prepare(
-      "SELECT COUNT(*) AS cnt FROM persona_memory WHERE persona_id = ? AND source_key LIKE 'foundation:%'",
-    );
-    for (const pid of touchedPersonas) {
-      const row = countStmt.get(pid) as { cnt: number } | undefined;
-      total += Number(row?.cnt ?? 0);
-    }
-    return { added, total };
+  importFoundation(
+    bundle: FoundationBundle,
+    sources: FoundationSource[] = [],
+    options: ImportFoundationOptions = {},
+  ): FoundationImportResult {
+    return importFoundationHardened(this.store, bundle, sources, options, this.now());
   }
 
   autoMigrateIfEmpty(): LegacyMigrationResult {
@@ -1018,8 +1108,8 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
           const rows = src.prepare('SELECT * FROM persona_memory').all() as Array<Record<string, unknown>>;
           const stmt = this.store.db.prepare(
             `INSERT OR IGNORE INTO persona_memory
-             (persona_id, scope, event_seq, note, quote, at, source_key, category, metadata)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             (persona_id, scope, event_seq, note, quote, at, source_key, category, subject_wxid, speaker_wxid, visibility, audience_tag, edited_at, revoked_at, metadata)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           );
           for (const row of rows) {
             const personaId = typeof row.persona_id === 'string' ? row.persona_id : '';
@@ -1034,9 +1124,50 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
               ? row.category
               : DEFAULT_CATEGORY;
             const metadata = cols.has('metadata') && typeof row.metadata === 'string' ? row.metadata : '{}';
-            const res = stmt.run(personaId, scope, eventSeq, note, quote, at, sourceKey, category, metadata);
+            const defaultVis: MemoryVisibility =
+              scope.startsWith(OWNER_SCOPE_PREFIX) || sourceKey?.startsWith(FOUNDATION_PREFIX)
+                ? 'owner_private'
+                : 'room';
+            const subjectWxid =
+              cols.has('subject_wxid') && typeof row.subject_wxid === 'string'
+                ? row.subject_wxid
+                : scope.startsWith(OWNER_SCOPE_PREFIX)
+                  ? scope.slice(OWNER_SCOPE_PREFIX.length)
+                  : '';
+            const speakerWxid =
+              cols.has('speaker_wxid') && typeof row.speaker_wxid === 'string' ? row.speaker_wxid : '';
+            const visibility = coerceVisibility(cols.has('visibility') ? row.visibility : undefined, defaultVis);
+            const audienceTag = coerceAudienceTag(cols.has('audience_tag') ? row.audience_tag : undefined, '');
+            const editedAt =
+              cols.has('edited_at') && row.edited_at !== null && Number.isFinite(Number(row.edited_at))
+                ? Number(row.edited_at)
+                : null;
+            const revokedAt =
+              cols.has('revoked_at') && row.revoked_at !== null && Number.isFinite(Number(row.revoked_at))
+                ? Number(row.revoked_at)
+                : null;
+            const res = stmt.run(
+              personaId,
+              scope,
+              eventSeq,
+              note,
+              quote,
+              at,
+              sourceKey,
+              category,
+              subjectWxid,
+              speakerWxid,
+              visibility,
+              audienceTag,
+              editedAt,
+              revokedAt,
+              metadata,
+            );
             memoriesImported += Number(res.changes);
           }
+        }
+        if (personasImported > 0 || memoriesImported > 0) {
+          bumpMemoryVersion(this.store);
         }
       });
 
@@ -1044,6 +1175,74 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     } finally {
       src.close();
     }
+  }
+
+  upsertMediaAsset(input: MediaAssetInput): MediaAssetRecord {
+    return upsertMediaAssetOp(this.store, input, this.now());
+  }
+
+  recordVisualObservation(input: VisualObservationInput): VisualObservationRecord {
+    return recordVisualObservationOp(this.store, input, this.now());
+  }
+
+  listVisualObservations(filter?: {
+    chatId?: string;
+    status?: ObservationStatus;
+    circle?: ChatCircle;
+    limit?: number;
+  }): VisualObservationRecord[] {
+    return listVisualObservationsOp(this.store, filter);
+  }
+
+  promoteObservationToFact(input: PromoteObservationInput): {
+    observation: VisualObservationRecord;
+    fact: EventFactRecord;
+  } {
+    return promoteObservationToFactOp(this.store, input, this.now());
+  }
+
+  rejectObservation(observationId: string, _reason?: string): boolean {
+    return rejectObservationOp(this.store, observationId, this.now());
+  }
+
+  recordEventFact(input: EventFactInput): EventFactRecord {
+    return recordEventFactOp(this.store, input, this.now());
+  }
+
+  listEventFacts(filter?: {
+    circle?: ChatCircle;
+    includeRevoked?: boolean;
+    limit?: number;
+  }): EventFactRecord[] {
+    return listEventFactsOp(this.store, filter);
+  }
+
+  revokeEventFact(factId: string, _reason?: string): boolean {
+    return revokeEventFactOp(this.store, factId, this.now());
+  }
+
+  upsertReferenceCard(input: ReferenceCardInput): ReferenceCardRecord {
+    return upsertReferenceCardOp(this.store, input, this.now());
+  }
+
+  listReferenceCards(filter?: {
+    circle?: ChatCircle;
+    entityType?: ReferenceEntityType;
+    includeRevoked?: boolean;
+  }): ReferenceCardRecord[] {
+    return listReferenceCardsOp(this.store, filter);
+  }
+
+  deleteReferenceCard(cardId: string): boolean {
+    return deleteReferenceCardOp(this.store, cardId, this.now());
+  }
+
+  listEvidence(targetType: EvidenceTargetType, targetId: string): MemoryEvidenceRecord[] {
+    return listEvidenceOp(this.store, targetType, targetId);
+  }
+
+  recallMultimodal(input: MultimodalRecallInput): MultimodalRecallResult {
+    return recallMultimodalOp(this.store, input);
   }
 }
 

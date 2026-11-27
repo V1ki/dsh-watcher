@@ -2,11 +2,15 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import type {
   FoundationBundle,
   FoundationSource,
+  ImportFoundationOptions,
   PersonaConfig,
   PersonaKind,
   PersonaWardrobe,
 } from './contracts.js';
 import { expandHome } from './db.js';
+import { FoundationImportError } from './foundation.js';
+import { buildExtendedRoutes } from './http-routes-ext.js';
+import { MultimodalEvidenceError } from './multimodal.js';
 import type { CreatePersonaInput, PersonaWardrobeImpl } from './wardrobe.js';
 
 const LOCAL_BASE_URL = 'http://127.0.0.1';
@@ -233,7 +237,11 @@ function buildRoutes(
           throw new HttpRouteError(400, 'foundation_bundle_required');
         }
         const sources = Array.isArray(body.sources) ? (body.sources as FoundationSource[]) : [];
-        const result = wardrobe.importFoundation(bundle, sources);
+        const importOptions =
+          body.options && typeof body.options === 'object' && !Array.isArray(body.options)
+            ? (body.options as ImportFoundationOptions)
+            : undefined;
+        const result = wardrobe.importFoundation(bundle, sources, importOptions);
         return { body: { ok: true, ...result } };
       },
     },
@@ -380,6 +388,11 @@ function buildRoutes(
         return { body: result };
       },
     },
+    ...buildExtendedRoutes(wardrobe, {
+      readJsonBody: (req) => readJsonBody(req, maxBodyBytes),
+      optionalString,
+      createError: (status, message) => new HttpRouteError(status, message),
+    }),
   ];
 }
 
@@ -398,9 +411,30 @@ function compileRoutePattern(routePath: string): { regex: RegExp; paramNames: st
   return { regex: new RegExp(`^${escaped}$`), paramNames };
 }
 
-function normalizeErrorStatus(err: unknown): { status: number; message: string } {
+function normalizeErrorStatus(err: unknown): { status: number; message: string; code?: string } {
   if (err instanceof HttpRouteError) {
     return { status: err.status, message: err.message };
+  }
+  if (err instanceof FoundationImportError) {
+    if (err.code === 'FOUNDATION_INVALID_PERSONA') {
+      return { status: 404, message: err.message, code: err.code };
+    }
+    if (err.code === 'FOUNDATION_REPLAY') {
+      return { status: 409, message: err.message, code: err.code };
+    }
+    if (
+      err.code === 'FOUNDATION_ACCOUNT_BLOCKED' ||
+      err.code === 'FOUNDATION_ACCOUNT_MISMATCH' ||
+      err.code === 'FOUNDATION_INVALID_SIGNATURE' ||
+      err.code === 'FOUNDATION_SIGNATURE_REQUIRED'
+    ) {
+      return { status: 403, message: err.message, code: err.code };
+    }
+    return { status: 400, message: err.message, code: err.code };
+  }
+  if (err instanceof MultimodalEvidenceError) {
+    const status = err.code.endsWith('_NOT_FOUND') ? 404 : 400;
+    return { status, message: err.message, code: err.code };
   }
   const message = err instanceof Error ? err.message : String(err);
   if (/not found/i.test(message)) return { status: 404, message };

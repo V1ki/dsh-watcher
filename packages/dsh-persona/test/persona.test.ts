@@ -267,13 +267,25 @@ test('importFoundation and owner-private CJK 2-gram ranking in getDynamicCard', 
     });
     assert.equal(wrongOwnerCard?.memory.length, 0);
 
-    const matchedCard = wardrobe.getDynamicCard({
+    const unflaggedOwnerCard = wardrobe.getDynamicCard({
       personaId: persona.id,
       scope: 'text:owner',
       ownerId: 'owner',
       queryText: '推荐一杯手冲咖啡',
     });
+    assert.ok(unflaggedOwnerCard);
+    assert.equal(unflaggedOwnerCard.ownerMemoryIncluded, false);
+    assert.equal(unflaggedOwnerCard.memory.length, 0);
+
+    const matchedCard = wardrobe.getDynamicCard({
+      personaId: persona.id,
+      scope: 'text:owner',
+      ownerId: 'owner',
+      includeOwnerMemory: true,
+      queryText: '推荐一杯手冲咖啡',
+    });
     assert.ok(matchedCard);
+    assert.equal(matchedCard.ownerMemoryIncluded, true);
     assert.equal(matchedCard.memory.length, 6);
     assert.ok(matchedCard.memory.every((m) => m.category === '饮食习惯'));
     assert.match(matchedCard.promptBlock, /Owner Foundation Facts/);
