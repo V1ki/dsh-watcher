@@ -246,6 +246,7 @@ function resolveWechatChatId(memo: MemoRecord): string | null {
 export class MemoEngine {
   readonly config: MemoEngineConfig;
   readonly store: MemoStore;
+  readonly hub: HubService;
   private readonly watcher: HubService;
   private readonly scout: WebScout | null;
   private readonly logger: MemoLogger;
@@ -263,6 +264,7 @@ export class MemoEngine {
       throw new TypeError('MemoEngine requires a hub or watcher service');
     }
     this.config = normalizeMemoConfig(options.config);
+    this.hub = hub;
     this.watcher = hub;
     this.store =
       options.store ??

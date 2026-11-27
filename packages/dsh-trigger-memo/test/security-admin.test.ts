@@ -327,8 +327,31 @@ describe('Redline #1: P0 cross-room cancel denied atomically with zero ownership
   it('blocks cross-session cancel in non-WeChat DSH sessions and fails closed when store scope is missing', async () => {
     const harness = createHarness();
     try {
+      const workerThreads: Record<string, string> = {
+        'sess-alpha': 'room-alpha',
+        'sess-beta': 'room-beta',
+      };
       const engine = new MemoEngine({
-        hub: harness.hub,
+        hub: {
+          ...harness.hub,
+          resolveSessionPrincipal: (exec) => {
+            const sid = exec?.agent?.id ?? null;
+            const thread = sid ? workerThreads[sid] : undefined;
+            return {
+              sessionId: sid,
+              rootSessionId: sid,
+              role: thread ? 'worker' : 'unknown',
+              tier: thread ? 2 : 0,
+              trustLevel: thread ? 'triage' : 'untrusted',
+              delegationDepth: 0,
+              isSubagent: false,
+              tainted: false,
+              turnPrivateRead: false,
+              allowedCircles: thread ? ['external', 'work'] : [],
+              boundThreadKey: thread ?? null,
+            };
+          },
+        },
         now: () => new Date('2026-11-26T08:00:00.000Z'),
       });
       const registered = new Map<string, MemoToolDefinition>();

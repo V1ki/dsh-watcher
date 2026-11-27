@@ -740,7 +740,22 @@ describe('Room tools & Cordis apply() integration', () => {
     try {
       const registered = new Map<string, MemoToolDefinition>();
       const engine = new MemoEngine({
-        watcher: harness.watcher,
+        watcher: {
+          ...harness.watcher,
+          resolveSessionPrincipal: (exec) => ({
+            sessionId: exec?.agent?.id ?? null,
+            rootSessionId: exec?.agent?.id ?? null,
+            role: 'worker',
+            tier: 2,
+            trustLevel: 'owner',
+            delegationDepth: 0,
+            isSubagent: false,
+            tainted: false,
+            turnPrivateRead: false,
+            allowedCircles: ['external', 'work'],
+            boundThreadKey: 'room-a',
+          }),
+        },
         config: { maxActivePerRoom: 2 },
         now: () => new Date('2026-11-20T10:00:00.000Z'),
       });

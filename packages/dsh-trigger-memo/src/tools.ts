@@ -1,18 +1,18 @@
-import type { MemoKind, MemoRecord, MemoStatus } from '@local/dsh-hub/contracts';
+import type {
+  HubService,
+  MemoKind,
+  MemoRecord,
+  MemoStatus,
+  SessionPrincipalRole,
+  SessionVaultTier,
+  TargetDirectoryEntry,
+  TargetDirectoryQuery,
+  ToolExecutionContext,
+  TrustLevel,
+} from '@local/dsh-hub/contracts';
 import type { MemoEngine } from './scheduler.js';
 
-export interface ToolExecutionContext {
-  agent?: {
-    id?: string;
-    session?: {
-      header?: {
-        cwd?: string;
-        delegationDepth?: number;
-        origin?: string;
-      };
-    };
-  };
-}
+export type { ToolExecutionContext };
 
 export interface MemoCallerPrincipal {
   sessionId: string;
@@ -103,6 +103,9 @@ export interface MemoToolsContext {
   get?: (name: string) => unknown;
   inject?: (deps: readonly string[], callback: (subCtx: MemoToolsContext) => void) => unknown;
   effect?: (callback: () => (() => void) | void) => unknown;
+  hub?: HubService;
+  watcher?: HubService;
+  controllerId?: string;
   tools?: ToolsRegistryLike;
   wxarcSessionChat?: (sessionId: string) => string | null;
   wxarcMemoPrincipal?: MemoPrincipalResolver;
@@ -111,9 +114,13 @@ export interface MemoToolsContext {
 
 interface ResolvedCallerAccess {
   sessionId: string;
+  role: SessionPrincipalRole;
+  tier: SessionVaultTier;
+  trustLevel: TrustLevel;
   delegationDepth: number;
   boundChatId: string | null;
   currentRoomKey: string | null;
+  boundThreadKey: string | null;
   canCrossRoom: boolean;
   adminId: string | null;
 }
@@ -125,6 +132,12 @@ interface ResolvedAddTarget {
   targetSessionId: string | null;
 }
 
+interface DirectoryLookupResult {
+  status: 'matched' | 'not_found';
+  target?: ResolvedAddTarget;
+  hasDirectory: boolean;
+}
+
 const VALID_KINDS = new Set<MemoKind>(['time_nudge', 'news_followup', 'long_watch']);
 const VALID_STATUSES = new Set<MemoStatus>(['active', 'fired', 'torn', 'completed', 'expired']);
 const CANCEL_DENIED_DETAIL = 'Memo not found or not cancellable in current room';
@@ -134,7 +147,7 @@ function assertRootSessionCaller(exec?: ToolExecutionContext): {
   delegationDepth: number;
   origin: string | undefined;
 } {
-  const sessionId = exec?.agent?.id;
+  const sessionId = typeof exec?.agent?.id === 'string' ? exec.agent.id.trim() : '';
   const header = exec?.agent?.session?.header;
   if (!sessionId) {
     throw new Error('watcher_memo_* tools require an active DSH root session context (exec.agent.id).');
@@ -142,7 +155,7 @@ function assertRootSessionCaller(exec?: ToolExecutionContext): {
   const delegationDepth = Number(header?.delegationDepth ?? 0);
   const origin = header?.origin;
   if (delegationDepth > 0 || origin === 'subagent') {
-    throw new Error('Subagents are not permitted to invoke watcher_memo_* tools.');
+    throw new MemoAuthorizationError('Subagents are not permitted to invoke watcher_memo_* tools.');
   }
   return { sessionId, delegationDepth, origin };
 }
@@ -173,7 +186,50 @@ function extractChatIdFromRoomKey(roomKey: string | null): string | null {
     const rest = roomKey.slice('wechat:'.length).trim();
     return rest || null;
   }
+  if (roomKey.startsWith('wxarc:')) {
+    const rest = roomKey.slice('wxarc:'.length).trim();
+    return rest || null;
+  }
   return null;
+}
+
+function isChatRoomKey(roomKey: string | null): boolean {
+  if (!roomKey) return false;
+  return (
+    roomKey.startsWith('wechat:') ||
+    roomKey.startsWith('wxarc:') ||
+    roomKey.startsWith('dingtalk:')
+  );
+}
+
+function resolveHubService(ctx: MemoToolsContext, engine: MemoEngine): HubService {
+  const fromGet =
+    typeof ctx.get === 'function'
+      ? ((ctx.get('hub') ?? ctx.get('watcher')) as HubService | undefined)
+      : undefined;
+  return fromGet ?? ctx.hub ?? ctx.watcher ?? engine.hub;
+}
+
+async function resolveOwnerControllerId(
+  ctx: MemoToolsContext,
+  hub: HubService,
+  engine: MemoEngine,
+): Promise<string | null> {
+  try {
+    const transport = hub.getWechatTransport?.();
+    if (transport && typeof transport.status === 'function') {
+      const status = await transport.status();
+      const fromTransport = asOptionalString(status?.controllerId);
+      if (fromTransport) return fromTransport;
+    }
+  } catch {
+  }
+  const fromConfig = asOptionalString(engine.config.defaultNotifyWechatChatId);
+  if (fromConfig) return fromConfig;
+  const fromCtx =
+    asOptionalString(typeof ctx.get === 'function' ? ctx.get('controllerId') : undefined) ??
+    asOptionalString(ctx.controllerId);
+  return fromCtx;
 }
 
 function resolveBoundWechatChat(ctx: MemoToolsContext, sessionId: string): string | null {
@@ -219,11 +275,52 @@ function resolveTargetDirectory(ctx: MemoToolsContext): MemoTargetResolver | nul
   return null;
 }
 
-function resolveCallerAccess(
+function mapLegacyPrincipal(
   ctx: MemoToolsContext,
-  exec?: ToolExecutionContext,
+  sessionId: string,
+  principal: MemoCallerPrincipal,
 ): ResolvedCallerAccess {
-  const { sessionId, delegationDepth, origin } = assertRootSessionCaller(exec);
+  if (principal.delegationDepth > 0) {
+    throw new MemoAuthorizationError('Subagents are not permitted to invoke watcher_memo_* tools.');
+  }
+  const boundChatId =
+    asOptionalString(principal.boundChatId) ?? resolveBoundWechatChat(ctx, sessionId);
+  const currentRoomKey =
+    asOptionalString(principal.roomKey) ?? (boundChatId ? `wechat:${boundChatId}` : null);
+  const isVerifiedAdmin = principal.isAdminDm === true && principal.allowCrossRoom === true;
+  if (isVerifiedAdmin) {
+    return {
+      sessionId,
+      role: 'owner_session',
+      tier: 3,
+      trustLevel: 'owner',
+      delegationDepth: 0,
+      boundChatId,
+      currentRoomKey,
+      boundThreadKey: null,
+      canCrossRoom: true,
+      adminId: asOptionalString(principal.adminId) ?? boundChatId,
+    };
+  }
+  return {
+    sessionId,
+    role: 'external_chat',
+    tier: 1,
+    trustLevel: 'untrusted',
+    delegationDepth: 0,
+    boundChatId,
+    currentRoomKey,
+    boundThreadKey: null,
+    canCrossRoom: false,
+    adminId: null,
+  };
+}
+
+function resolveLegacyAccess(
+  ctx: MemoToolsContext,
+  sessionId: string,
+  exec?: ToolExecutionContext,
+): ResolvedCallerAccess | null {
   const principalResolver = resolvePrincipalResolver(ctx);
   let principal: MemoCallerPrincipal | null = null;
   if (principalResolver) {
@@ -233,32 +330,83 @@ function resolveCallerAccess(
       principal = null;
     }
   }
-  const principalMatches = Boolean(principal && principal.sessionId === sessionId);
-  const boundChatId =
-    (principalMatches ? asOptionalString(principal?.boundChatId) : null) ??
-    resolveBoundWechatChat(ctx, sessionId);
-  const currentRoomKey =
-    (principalMatches ? asOptionalString(principal?.roomKey) : null) ??
-    (boundChatId ? `wechat:${boundChatId}` : null);
-  const canCrossRoom = Boolean(
-    principalMatches &&
-      principal &&
-      principal.isAdminDm === true &&
-      principal.allowCrossRoom === true &&
-      principal.delegationDepth === 0 &&
-      delegationDepth === 0 &&
-      origin !== 'subagent',
-  );
-  const adminId =
-    canCrossRoom && principal ? asOptionalString(principal.adminId) : null;
+  if (principal && principal.sessionId === sessionId) {
+    return mapLegacyPrincipal(ctx, sessionId, principal);
+  }
+  const boundChatId = resolveBoundWechatChat(ctx, sessionId);
+  if (boundChatId) {
+    return {
+      sessionId,
+      role: 'external_chat',
+      tier: 1,
+      trustLevel: 'untrusted',
+      delegationDepth: 0,
+      boundChatId,
+      currentRoomKey: `wechat:${boundChatId}`,
+      boundThreadKey: null,
+      canCrossRoom: false,
+      adminId: null,
+    };
+  }
+  return null;
+}
+
+function resolveCallerAccess(
+  ctx: MemoToolsContext,
+  hub: HubService,
+  exec?: ToolExecutionContext,
+): ResolvedCallerAccess {
+  const { sessionId } = assertRootSessionCaller(exec);
+
+  if (typeof hub.resolveSessionPrincipal === 'function') {
+    const hubPrincipal = hub.resolveSessionPrincipal(exec);
+    if (hubPrincipal.isSubagent || hubPrincipal.delegationDepth > 0) {
+      throw new MemoAuthorizationError('Subagents are not permitted to invoke watcher_memo_* tools.');
+    }
+    const explicitRegistered =
+      typeof hub.getSessionPrincipal === 'function' ? hub.getSessionPrincipal(sessionId) : null;
+    if (!explicitRegistered && hubPrincipal.role === 'interactive') {
+      const legacy = resolveLegacyAccess(ctx, sessionId, exec);
+      if (legacy) return legacy;
+    }
+    const boundRoomKey = asOptionalString(hubPrincipal.boundRoomKey);
+    const boundThreadKey = asOptionalString(hubPrincipal.boundThreadKey);
+    const currentRoomKey = boundRoomKey ?? boundThreadKey;
+    const boundChatId = extractChatIdFromRoomKey(currentRoomKey);
+    const canCrossRoom = Boolean(
+      hubPrincipal.tier === 3 &&
+        (hubPrincipal.role === 'owner_session' || hubPrincipal.role === 'interactive') &&
+        hubPrincipal.delegationDepth === 0 &&
+        !hubPrincipal.isSubagent,
+    );
+    return {
+      sessionId,
+      role: hubPrincipal.role,
+      tier: hubPrincipal.tier,
+      trustLevel: hubPrincipal.trustLevel,
+      delegationDepth: hubPrincipal.delegationDepth,
+      boundChatId,
+      currentRoomKey,
+      boundThreadKey,
+      canCrossRoom,
+      adminId: hubPrincipal.role === 'owner_session' ? boundChatId : null,
+    };
+  }
+
+  const legacy = resolveLegacyAccess(ctx, sessionId, exec);
+  if (legacy) return legacy;
 
   return {
     sessionId,
-    delegationDepth,
-    boundChatId,
-    currentRoomKey,
-    canCrossRoom,
-    adminId,
+    role: 'unknown',
+    tier: 0,
+    trustLevel: 'untrusted',
+    delegationDepth: 0,
+    boundChatId: null,
+    currentRoomKey: null,
+    boundThreadKey: null,
+    canCrossRoom: false,
+    adminId: null,
   };
 }
 
@@ -286,6 +434,92 @@ function assertConsistentWechatTargets(
       'targetChatId and notifyWechatChatId refer to different chats.',
     );
   }
+}
+
+function mapHubCandidates(
+  candidates?: TargetDirectoryEntry[],
+): Array<{ chatId: string; roomKey: string; title?: string | null }> | undefined {
+  if (!Array.isArray(candidates) || candidates.length === 0) return undefined;
+  return candidates.map((entry) => ({
+    chatId: asOptionalString(entry.chatId) ?? asOptionalString(entry.targetId) ?? entry.roomKey,
+    roomKey: entry.roomKey,
+    title: entry.title ?? null,
+  }));
+}
+
+function validateHubTargetEntry(
+  entry: TargetDirectoryEntry,
+  query: {
+    roomKey: string | null;
+    targetChatId: string | null;
+    notifyWechatChatId: string | null;
+    targetSessionId: string | null;
+    targetName: string | null;
+  },
+): ResolvedAddTarget {
+  const roomKey = asOptionalString(entry.roomKey);
+  if (!roomKey) {
+    throw new MemoTargetError(
+      'MEMO_TARGET_INVALID',
+      'Resolved target is missing required roomKey.',
+    );
+  }
+  const roomChatId = extractChatIdFromRoomKey(roomKey);
+  const isWechat = Boolean(roomChatId) || entry.source === 'wechat' || entry.source === 'wxarc';
+  const chatId =
+    asOptionalString(entry.chatId) ??
+    roomChatId ??
+    (isWechat ? asOptionalString(entry.targetId) : null);
+  const notifyWechatChatId =
+    asOptionalString(entry.notifyWechatChatId) ?? (isWechat ? chatId : null);
+  const targetSessionId = asOptionalString(entry.targetSessionId);
+
+  if (isWechat) {
+    if (!chatId || !notifyWechatChatId) {
+      throw new MemoTargetError(
+        'MEMO_TARGET_INVALID',
+        'Resolved WeChat target is missing required chatId or notifyWechatChatId.',
+      );
+    }
+    if ((roomChatId && roomChatId !== chatId) || notifyWechatChatId !== chatId) {
+      throw new MemoTargetError(
+        'MEMO_TARGET_MISMATCH',
+        'Resolved target binding is internally inconsistent.',
+      );
+    }
+  }
+
+  if (query.roomKey && query.roomKey !== roomKey) {
+    throw new MemoTargetError(
+      'MEMO_TARGET_MISMATCH',
+      'Requested roomKey does not match resolved target.',
+    );
+  }
+  if (query.targetChatId && query.targetChatId !== chatId) {
+    throw new MemoTargetError(
+      'MEMO_TARGET_MISMATCH',
+      'Requested targetChatId does not match resolved target.',
+    );
+  }
+  if (query.notifyWechatChatId && query.notifyWechatChatId !== notifyWechatChatId) {
+    throw new MemoTargetError(
+      'MEMO_TARGET_MISMATCH',
+      'Requested notifyWechatChatId does not match resolved target.',
+    );
+  }
+  if (query.targetSessionId && targetSessionId && query.targetSessionId !== targetSessionId) {
+    throw new MemoTargetError(
+      'MEMO_TARGET_MISMATCH',
+      'Requested targetSessionId does not match resolved target.',
+    );
+  }
+
+  return {
+    roomKey,
+    targetChatId: chatId,
+    notifyWechatChatId,
+    targetSessionId,
+  };
 }
 
 function resolveVerifiedDirectoryTarget(
@@ -370,12 +604,81 @@ function resolveVerifiedDirectoryTarget(
   };
 }
 
-function resolveAddTarget(
+async function resolveDirectoryTarget(
   ctx: MemoToolsContext,
+  hub: HubService,
+  query: {
+    roomKey: string | null;
+    targetChatId: string | null;
+    notifyWechatChatId: string | null;
+    targetSessionId: string | null;
+    targetName: string | null;
+  },
+): Promise<DirectoryLookupResult> {
+  let hubHasDirectory = false;
+
+  if (typeof hub.resolveTarget === 'function') {
+    const hubQuery: TargetDirectoryQuery = {
+      query: query.targetName ?? query.roomKey ?? query.targetChatId ?? undefined,
+      roomKey: query.roomKey,
+      targetChatId: query.targetChatId,
+      notifyWechatChatId: query.notifyWechatChatId,
+      targetSessionId: query.targetSessionId,
+      targetName: query.targetName,
+    };
+    const hubRes = await hub.resolveTarget(hubQuery);
+    if (hubRes?.status === 'matched' && hubRes.target) {
+      return {
+        status: 'matched',
+        target: validateHubTargetEntry(hubRes.target, query),
+        hasDirectory: true,
+      };
+    }
+    if (hubRes?.status === 'ambiguous') {
+      throw new MemoTargetError(
+        'MEMO_TARGET_AMBIGUOUS',
+        hubRes.detail || 'Target room is ambiguous; specify an exact room.',
+        mapHubCandidates(hubRes.candidates),
+      );
+    }
+    if (typeof hub.listTargets === 'function') {
+      try {
+        const probe = await hub.listTargets({ limit: 1 });
+        hubHasDirectory = Array.isArray(probe) && probe.length > 0;
+      } catch {
+        hubHasDirectory = true;
+      }
+    } else {
+      hubHasDirectory = true;
+    }
+  }
+
+  const legacyResolver = resolveTargetDirectory(ctx);
+  if (legacyResolver) {
+    const resolved = resolveVerifiedDirectoryTarget(legacyResolver, query);
+    return {
+      status: 'matched',
+      target: {
+        roomKey: resolved.roomKey,
+        targetChatId: resolved.chatId,
+        notifyWechatChatId: resolved.notifyWechatChatId,
+        targetSessionId: resolved.targetSessionId,
+      },
+      hasDirectory: true,
+    };
+  }
+
+  return { status: 'not_found', hasDirectory: hubHasDirectory };
+}
+
+async function resolveAddTarget(
+  ctx: MemoToolsContext,
+  hub: HubService,
+  engine: MemoEngine,
   access: ResolvedCallerAccess,
   rawKind: MemoKind,
   args: Record<string, unknown>,
-): ResolvedAddTarget {
+): Promise<ResolvedAddTarget> {
   const reqRoomKey = asOptionalString(args.roomKey);
   const reqTargetChatId = asOptionalString(args.targetChatId);
   const reqNotifyChatId = asOptionalString(args.notifyWechatChatId);
@@ -384,46 +687,82 @@ function resolveAddTarget(
 
   assertConsistentWechatTargets(reqRoomKey, reqTargetChatId, reqNotifyChatId);
 
-  if (!access.canCrossRoom) {
+  if (access.role === 'unknown') {
+    throw new MemoAuthorizationError('Unknown or unauthorized session cannot create memos.');
+  }
+
+  if (access.role === 'worker') {
+    if (access.trustLevel === 'untrusted') {
+      throw new MemoAuthorizationError('Untrusted worker sessions are not permitted to create memos.');
+    }
+    const boundRoom = access.boundThreadKey ?? access.currentRoomKey;
+    if (!boundRoom) {
+      throw new MemoAuthorizationError('Worker session has no bound room and cannot create memos.');
+    }
+    if (reqTargetName !== null) {
+      throw new MemoAuthorizationError('Worker sessions cannot perform cross-room target lookup.');
+    }
+    if (reqRoomKey !== null && reqRoomKey !== boundRoom) {
+      throw new MemoAuthorizationError('Worker sessions can only create memos for their bound room.');
+    }
+    const boundChatId = extractChatIdFromRoomKey(boundRoom);
+    if (reqTargetChatId !== null && reqTargetChatId !== boundChatId) {
+      throw new MemoAuthorizationError('Worker sessions cannot override targetChatId for another room.');
+    }
+    if (reqTargetSessionId !== null && reqTargetSessionId !== access.sessionId) {
+      throw new MemoAuthorizationError('Worker sessions cannot override targetSessionId.');
+    }
+    if (reqNotifyChatId !== null) {
+      if (reqNotifyChatId.endsWith('@chatroom')) {
+        throw new MemoAuthorizationError('Worker sessions cannot notify arbitrary group chats.');
+      }
+      const controllerId = await resolveOwnerControllerId(ctx, hub, engine);
+      if (!controllerId || reqNotifyChatId !== controllerId) {
+        throw new MemoAuthorizationError(
+          'Worker notifyWechatChatId must be empty or match the verified owner controllerId.',
+        );
+      }
+    }
+    return {
+      roomKey: boundRoom,
+      targetChatId: boundChatId,
+      notifyWechatChatId: reqNotifyChatId,
+      targetSessionId: access.sessionId,
+    };
+  }
+
+  if (access.role === 'external_chat' || !access.canCrossRoom) {
     if (reqTargetName !== null) {
       throw new MemoAuthorizationError(
-        'Cross-room target lookup requires a verified admin DM context.',
+        'Cross-room target lookup requires a verified tier-3 owner session.',
       );
     }
-    if (access.currentRoomKey !== null) {
-      if (reqRoomKey !== null && reqRoomKey !== access.currentRoomKey) {
-        throw new MemoAuthorizationError('Cannot create memos for another room.');
-      }
-      if (reqTargetChatId !== null && reqTargetChatId !== access.boundChatId) {
-        throw new MemoAuthorizationError('Cannot override targetChatId for another room.');
-      }
-      if (reqNotifyChatId !== null && reqNotifyChatId !== access.boundChatId) {
-        throw new MemoAuthorizationError('Cannot override notifyWechatChatId for another room.');
-      }
-      if (reqTargetSessionId !== null && reqTargetSessionId !== access.sessionId) {
-        throw new MemoAuthorizationError('Cannot override targetSessionId for another session.');
-      }
-      return {
-        roomKey: access.currentRoomKey,
-        targetChatId: access.boundChatId,
-        notifyWechatChatId:
-          reqNotifyChatId ?? (rawKind === 'time_nudge' ? access.boundChatId : null),
-        targetSessionId: access.sessionId,
-      };
+    if (!access.currentRoomKey) {
+      throw new MemoAuthorizationError(
+        'Unauthorized session without a bound room cannot create memos.',
+      );
     }
-
+    if (reqRoomKey !== null && reqRoomKey !== access.currentRoomKey) {
+      throw new MemoAuthorizationError('Cannot create memos for another room.');
+    }
+    if (reqTargetChatId !== null && reqTargetChatId !== access.boundChatId) {
+      throw new MemoAuthorizationError('Cannot override targetChatId for another room.');
+    }
+    if (reqNotifyChatId !== null && reqNotifyChatId !== access.boundChatId) {
+      throw new MemoAuthorizationError('Cannot override notifyWechatChatId for another room.');
+    }
     if (reqTargetSessionId !== null && reqTargetSessionId !== access.sessionId) {
       throw new MemoAuthorizationError('Cannot override targetSessionId for another session.');
     }
-    const targetChatId = reqTargetChatId;
-    const notifyWechatChatId =
-      reqNotifyChatId ?? (rawKind === 'time_nudge' ? targetChatId : null);
-    const roomKey =
-      reqRoomKey ?? (targetChatId ? `wechat:${targetChatId}` : `session:${access.sessionId}`);
     return {
-      roomKey,
-      targetChatId,
-      notifyWechatChatId,
+      roomKey: access.currentRoomKey,
+      targetChatId: access.boundChatId,
+      notifyWechatChatId:
+        reqNotifyChatId !== null
+          ? access.boundChatId
+          : rawKind === 'time_nudge'
+            ? access.boundChatId
+            : null,
       targetSessionId: access.sessionId,
     };
   }
@@ -452,15 +791,16 @@ function resolveAddTarget(
     };
   }
 
-  const targetResolver = resolveTargetDirectory(ctx);
-  if (targetResolver) {
-    const resolved = resolveVerifiedDirectoryTarget(targetResolver, {
-      roomKey: reqRoomKey,
-      targetChatId: reqTargetChatId,
-      notifyWechatChatId: reqNotifyChatId,
-      targetSessionId: reqTargetSessionId,
-      targetName: reqTargetName,
-    });
+  const lookup = await resolveDirectoryTarget(ctx, hub, {
+    roomKey: reqRoomKey,
+    targetChatId: reqTargetChatId,
+    notifyWechatChatId: reqNotifyChatId,
+    targetSessionId: reqTargetSessionId,
+    targetName: reqTargetName,
+  });
+
+  if (lookup.status === 'matched' && lookup.target) {
+    const resolved = lookup.target;
     const boundSessionId = resolved.targetSessionId ?? reqTargetSessionId ?? null;
     if (
       resolved.roomKey !== access.currentRoomKey &&
@@ -474,9 +814,53 @@ function resolveAddTarget(
     }
     return {
       roomKey: resolved.roomKey,
-      targetChatId: resolved.chatId,
+      targetChatId: resolved.targetChatId,
       notifyWechatChatId: resolved.notifyWechatChatId,
       targetSessionId: boundSessionId,
+    };
+  }
+
+  if (lookup.hasDirectory) {
+    if (
+      reqTargetName !== null ||
+      reqTargetChatId !== null ||
+      isChatRoomKey(reqRoomKey) ||
+      !reqRoomKey
+    ) {
+      throw new MemoTargetError(
+        'MEMO_TARGET_NOT_FOUND',
+        'Target room not found in target directory.',
+      );
+    }
+    if (reqTargetSessionId !== null && reqTargetSessionId === access.sessionId) {
+      throw new MemoTargetError(
+        'MEMO_TARGET_MISMATCH',
+        'Cross-room memo targetSessionId cannot reuse admin DM session.',
+      );
+    }
+    if (reqNotifyChatId !== null) {
+      const controllerId = await resolveOwnerControllerId(ctx, hub, engine);
+      if (!controllerId || reqNotifyChatId !== controllerId) {
+        const notifyCheck = await resolveDirectoryTarget(ctx, hub, {
+          roomKey: null,
+          targetChatId: null,
+          notifyWechatChatId: reqNotifyChatId,
+          targetSessionId: null,
+          targetName: null,
+        });
+        if (notifyCheck.status !== 'matched') {
+          throw new MemoTargetError(
+            'MEMO_TARGET_NOT_FOUND',
+            'Requested notifyWechatChatId not found in target directory.',
+          );
+        }
+      }
+    }
+    return {
+      roomKey: reqRoomKey,
+      targetChatId: null,
+      notifyWechatChatId: reqNotifyChatId,
+      targetSessionId: reqTargetSessionId ?? null,
     };
   }
 
@@ -532,6 +916,7 @@ export function registerMemoTools(
       ? (ctx.get('tools') as ToolsRegistryLike | undefined)
       : undefined) ?? ctx.tools;
   if (!tools?.register) return [];
+  const hub = resolveHubService(ctx, engine);
 
   const addSchema = {
     type: 'object',
@@ -632,7 +1017,7 @@ export function registerMemoTools(
       args,
       exec,
     ): Promise<{ ok: true; memo: MemoRecord; activeInRoom: number; deduplicated: boolean }> => {
-      const access = resolveCallerAccess(ctx, exec);
+      const access = resolveCallerAccess(ctx, hub, exec);
       const rawKind = String(args.kind || '') as MemoKind;
       if (!VALID_KINDS.has(rawKind)) {
         throw new TypeError(`Unsupported memo kind: ${String(args.kind)}`);
@@ -642,7 +1027,7 @@ export function registerMemoTools(
         throw new TypeError('watcher_memo_add requires a non-empty basis');
       }
 
-      const resolvedTarget = resolveAddTarget(ctx, access, rawKind, args);
+      const resolvedTarget = await resolveAddTarget(ctx, hub, engine, access, rawKind, args);
       const idempotencyKey = asOptionalString(args.idempotencyKey);
 
       const { memo, deduplicated } = engine.createMemoWithIdempotency({
@@ -718,7 +1103,7 @@ export function registerMemoTools(
       scope: 'room' | 'all_rooms';
       roomKey: string | null;
     }> => {
-      const access = resolveCallerAccess(ctx, exec);
+      const access = resolveCallerAccess(ctx, hub, exec);
       const allRooms = args.allRooms === true;
       const reqRoomKey = asOptionalString(args.roomKey);
       const reqTargetChatId = asOptionalString(args.targetChatId);
@@ -732,7 +1117,7 @@ export function registerMemoTools(
       if (allRooms) {
         if (!access.canCrossRoom) {
           throw new MemoAuthorizationError(
-            'Listing memos across all rooms requires a verified admin DM context.',
+            'Listing memos across all rooms requires a verified tier-3 owner session.',
           );
         }
         if (reqRoomKey || reqTargetChatId || reqTargetName) {
@@ -748,37 +1133,34 @@ export function registerMemoTools(
       assertConsistentWechatTargets(reqRoomKey, reqTargetChatId, null);
 
       if (!access.canCrossRoom) {
-        if (reqTargetName !== null) {
+        if (access.role === 'unknown') {
           throw new MemoAuthorizationError(
-            'Cross-room target lookup requires a verified admin DM context.',
+            'Unknown or unauthorized session cannot list memos.',
           );
         }
-        if (access.currentRoomKey !== null) {
-          if (reqRoomKey !== null && reqRoomKey !== access.currentRoomKey) {
-            throw new MemoAuthorizationError('Cannot list memos for another room.');
-          }
-          if (reqTargetChatId !== null && reqTargetChatId !== access.boundChatId) {
-            throw new MemoAuthorizationError('Cannot list memos for another chat.');
-          }
-          const memos = engine.store.listMemos({
-            roomKey: access.currentRoomKey,
-            status,
-            kind,
-            limit,
-          });
-          return {
-            ok: true,
-            memos,
-            count: memos.length,
-            scope: 'room',
-            roomKey: access.currentRoomKey,
-          };
+        if (reqTargetName !== null) {
+          throw new MemoAuthorizationError(
+            'Cross-room target lookup requires a verified tier-3 owner session.',
+          );
         }
-
-        const scopedRoomKey = reqRoomKey ?? (reqTargetChatId ? `wechat:${reqTargetChatId}` : undefined);
+        const boundRoom =
+          access.role === 'worker'
+            ? (access.boundThreadKey ?? access.currentRoomKey)
+            : access.currentRoomKey;
+        if (!boundRoom) {
+          throw new MemoAuthorizationError(
+            'Unauthorized session without a bound room cannot list memos.',
+          );
+        }
+        const boundChatId = extractChatIdFromRoomKey(boundRoom) ?? access.boundChatId;
+        if (reqRoomKey !== null && reqRoomKey !== boundRoom) {
+          throw new MemoAuthorizationError('Cannot list memos for another room.');
+        }
+        if (reqTargetChatId !== null && reqTargetChatId !== boundChatId) {
+          throw new MemoAuthorizationError('Cannot list memos for another chat.');
+        }
         const memos = engine.store.listMemos({
-          roomKey: scopedRoomKey,
-          targetSessionId: access.sessionId,
+          roomKey: boundRoom,
           status,
           kind,
           limit,
@@ -788,7 +1170,7 @@ export function registerMemoTools(
           memos,
           count: memos.length,
           scope: 'room',
-          roomKey: scopedRoomKey ?? `session:${access.sessionId}`,
+          roomKey: boundRoom,
         };
       }
 
@@ -806,16 +1188,28 @@ export function registerMemoTools(
       ) {
         targetRoomKey = access.currentRoomKey;
       } else {
-        const targetResolver = resolveTargetDirectory(ctx);
-        if (targetResolver) {
-          const resolved = resolveVerifiedDirectoryTarget(targetResolver, {
-            roomKey: reqRoomKey,
-            targetChatId: reqTargetChatId,
-            notifyWechatChatId: null,
-            targetSessionId: null,
-            targetName: reqTargetName,
-          });
-          targetRoomKey = resolved.roomKey;
+        const lookup = await resolveDirectoryTarget(ctx, hub, {
+          roomKey: reqRoomKey,
+          targetChatId: reqTargetChatId,
+          notifyWechatChatId: null,
+          targetSessionId: null,
+          targetName: reqTargetName,
+        });
+        if (lookup.status === 'matched' && lookup.target) {
+          targetRoomKey = lookup.target.roomKey;
+        } else if (lookup.hasDirectory) {
+          if (
+            reqTargetName !== null ||
+            reqTargetChatId !== null ||
+            isChatRoomKey(reqRoomKey) ||
+            !reqRoomKey
+          ) {
+            throw new MemoTargetError(
+              'MEMO_TARGET_NOT_FOUND',
+              'Target room not found in target directory.',
+            );
+          }
+          targetRoomKey = reqRoomKey;
         } else {
           if (reqTargetName !== null) {
             throw new MemoTargetError(
@@ -870,7 +1264,7 @@ export function registerMemoTools(
       args,
       exec,
     ): Promise<{ ok: boolean; memo: MemoRecord | null; detail: string }> => {
-      const access = resolveCallerAccess(ctx, exec);
+      const access = resolveCallerAccess(ctx, hub, exec);
       const memoId = asOptionalString(args.memoId);
       if (!memoId) {
         throw new TypeError('watcher_memo_cancel requires memoId');
@@ -879,23 +1273,24 @@ export function registerMemoTools(
       const reqRoomKey = asOptionalString(args.roomKey);
 
       if (!access.canCrossRoom) {
-        if (access.currentRoomKey !== null) {
-          if (reqRoomKey !== null && reqRoomKey !== access.currentRoomKey) {
-            return { ok: false, memo: null, detail: CANCEL_DENIED_DETAIL };
-          }
-          const updated = engine.store.cancelMemo(memoId, reason, {
-            roomKey: access.currentRoomKey,
-            allowCrossRoom: false,
-          });
-          if (!updated) {
-            return { ok: false, memo: null, detail: CANCEL_DENIED_DETAIL };
-          }
-          return { ok: true, memo: updated, detail: `Cancelled memo ${memoId}` };
+        if (
+          access.role === 'unknown' ||
+          (access.role === 'worker' && access.trustLevel === 'untrusted')
+        ) {
+          return { ok: false, memo: null, detail: CANCEL_DENIED_DETAIL };
         }
-
+        const boundRoom =
+          access.role === 'worker'
+            ? (access.boundThreadKey ?? access.currentRoomKey)
+            : access.currentRoomKey;
+        if (!boundRoom) {
+          return { ok: false, memo: null, detail: CANCEL_DENIED_DETAIL };
+        }
+        if (reqRoomKey !== null && reqRoomKey !== boundRoom) {
+          return { ok: false, memo: null, detail: CANCEL_DENIED_DETAIL };
+        }
         const updated = engine.store.cancelMemo(memoId, reason, {
-          roomKey: reqRoomKey,
-          targetSessionId: access.sessionId,
+          roomKey: boundRoom,
           allowCrossRoom: false,
         });
         if (!updated) {

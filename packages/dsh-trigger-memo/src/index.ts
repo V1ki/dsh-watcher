@@ -1,4 +1,4 @@
-import type { HubService } from '@local/dsh-hub/contracts';
+import type { HubService, PersonaWardrobe } from '@local/dsh-hub/contracts';
 import {
   MemoStore,
   MemoRoomCapError,
@@ -58,6 +58,11 @@ import {
   type ToolExecutionContext,
   type ToolsRegistryLike,
 } from './tools.js';
+import {
+  createMemoVaultProvider,
+  resolveMemoVaultVisibility,
+  type MemoVaultProviderOptions,
+} from './vault-provider.js';
 
 export const name = 'trigger-memo';
 
@@ -66,6 +71,7 @@ export const inject = ['hub'] as const;
 export interface MemoPluginContext extends MemoToolsContext {
   hub?: HubService;
   watcher?: HubService;
+  personaWardrobe?: PersonaWardrobe;
   web?: WebSearchClient;
   logger?: ((scope: string) => MemoLogger) | MemoLogger;
   on?: (event: string, listener: () => void) => void;
@@ -135,8 +141,22 @@ export function apply(ctx: MemoPluginContext, rawConfig: RawMemoEngineConfig = {
     }
   }
   const watchSource = engine.asWatchSource();
+  const vaultProvider = createMemoVaultProvider({
+    store,
+    hub,
+    getWardrobe: () => {
+      const fromHub = hub.getWardrobe?.() ?? hub.wardrobe ?? null;
+      if (fromHub) return fromHub;
+      if (typeof ctx.get === 'function') {
+        const fromCtx = ctx.get('personaWardrobe') as PersonaWardrobe | undefined;
+        if (fromCtx) return fromCtx;
+      }
+      return ctx.personaWardrobe ?? null;
+    },
+  });
   const disposers = [
     hub.registerSource(watchSource),
+    hub.registerVaultProvider?.(vaultProvider),
     hub.registerConnector?.({
       id: 'memo',
       label: '待惦记便签',
@@ -173,7 +193,7 @@ export function apply(ctx: MemoPluginContext, rawConfig: RawMemoEngineConfig = {
     }
   });
 
-  return { config, store, engine };
+  return { config, store, engine, vaultProvider };
 }
 
 export {
@@ -195,6 +215,8 @@ export {
   normalizeMemoConfig,
   pickRandomFireAt,
   registerMemoTools,
+  createMemoVaultProvider,
+  resolveMemoVaultVisibility,
 };
 
 export type {
@@ -231,4 +253,5 @@ export type {
   MemoToolsContext,
   ToolExecutionContext,
   ToolsRegistryLike,
+  MemoVaultProviderOptions,
 };
