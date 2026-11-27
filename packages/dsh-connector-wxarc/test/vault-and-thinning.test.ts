@@ -113,6 +113,69 @@ test('VaultProvider(wechat): enforces 4-tier visibility, unlabeled defaults to o
   assert.equal(deniedCtx.result, null);
 });
 
+test('VaultProvider(wechat): supports roomKey exact matching and empty-query reverse-chronological browsing', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxarc-vault-roomkey-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const store = new Store(dir);
+  t.after(() => store.close());
+
+  store.commit(
+    'text',
+    0,
+    [
+      { id: 1, kind: 'text', session: 'ext@chatroom', session_name: '公开群', sender: '路人', text: '公开第一条', ts: 1700001001, local_type: 1 },
+      { id: 2, kind: 'text', session: 'wxid_owner_dm', session_name: '主人私聊', sender: '主人', text: '私聊第一条', ts: 1700001002, local_type: 1 },
+      { id: 3, kind: 'text', session: 'wxid_owner_dm', session_name: '主人私聊', sender: '主人', text: '   ', ts: 1700001003, local_type: 1 },
+      { id: 4, kind: 'text', session: 'wxid_owner_dm_other', session_name: '其他私聊', sender: '朋友', text: '前缀相似但不是同一会话', ts: 1700001004, local_type: 1 },
+      { id: 5, kind: 'text', session: 'wxid_owner_dm', session_name: '主人私聊', sender: '助理', text: '私聊最新一条', ts: 1700001005, local_type: 1 },
+    ],
+    1000,
+  );
+
+  const wardrobe = {
+    resolveVaultVisibility: (roomKey: string): VaultVisibility =>
+      roomKey === 'ext@chatroom' ? 'external' : 'owner_private',
+  };
+
+  const hub = createTestHub(t);
+  hub.registerVaultProvider(createWechatVaultProvider({ db: store.db, getWardrobe: () => wardrobe }));
+  hub.registerSessionPrincipal({ sessionId: 'tier1-worker', role: 'worker', tier: 1, trustLevel: 'untrusted' });
+  hub.registerSessionPrincipal({ sessionId: 'owner-main', role: 'owner_session', tier: 3, trustLevel: 'owner' });
+
+  const recentAll = await hub.vault.search(
+    { query: '', sources: ['wechat'], limit: 10 },
+    { agent: { id: 'owner-main' } },
+  );
+  assert.deepEqual(
+    recentAll.hits.map((h) => h.snippet),
+    ['私聊最新一条', '前缀相似但不是同一会话', '私聊第一条', '公开第一条'],
+  );
+
+  const ownerDmPrefixed = await hub.vault.search(
+    { query: '', sources: ['wechat'], roomKey: 'wechat:wxid_owner_dm', limit: 10 },
+    { agent: { id: 'owner-main' } },
+  );
+  assert.deepEqual(
+    ownerDmPrefixed.hits.map((h) => h.snippet),
+    ['私聊最新一条', '私聊第一条'],
+  );
+
+  const ownerDmBare = await hub.vault.search(
+    { sources: ['wechat'], roomKey: '  WXID_OWNER_DM  ', limit: 10 },
+    { agent: { id: 'owner-main' } },
+  );
+  assert.deepEqual(
+    ownerDmBare.hits.map((h) => h.snippet),
+    ['私聊最新一条', '私聊第一条'],
+  );
+
+  const tier1Blocked = await hub.vault.search(
+    { query: '', sources: ['wechat'], roomKey: 'wechat:wxid_owner_dm', limit: 10 },
+    { agent: { id: 'tier1-worker' } },
+  );
+  assert.equal(tier1Blocked.hits.length, 0);
+});
+
 test('VaultProvider(nas) & nas-search: no hardcoded LAN IP, 4-tier filtering, unlabeled->owner_private, and context', async (t) => {
   assert.equal(DEFAULT_NAS_ARCHIVE_URL, '');
   await assert.rejects(

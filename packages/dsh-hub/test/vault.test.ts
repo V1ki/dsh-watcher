@@ -270,6 +270,116 @@ test('Vault enforces four-tier visibility, double-lock filtering, snippet trunca
   }
 });
 
+test('Vault supports empty-query chronological browsing with filters, roomKey passthrough/filtering, and still rejects bare empty queries', async () => {
+  const db = openHubDb({ inMemory: true });
+  try {
+    const guard = createDoorGuard();
+    const service = createHubService(undefined, { db, guard });
+    const receivedQueries: Array<{ query?: string; roomKey?: string; sources?: string[] }> = [];
+
+    service.vault.registerProvider({
+      id: 'wechat',
+      label: 'WeChat Mock',
+      search: (q) => {
+        receivedQueries.push({ query: q.query, roomKey: q.roomKey, sources: q.sources });
+        return [
+          {
+            source: 'wechat',
+            itemId: 'seq:1',
+            circle: 'external',
+            roomKey: 'wechat:room-a',
+            occurredAt: '2026-11-20T08:00:00.000Z',
+            snippet: 'older external message',
+            author: 'alice',
+          },
+          {
+            source: 'wechat',
+            itemId: 'seq:2',
+            circle: 'owner_private',
+            roomKey: 'wechat:owner-dm',
+            occurredAt: '2026-11-20T09:00:00.000Z',
+            snippet: 'newer private dm message',
+            author: 'owner',
+          },
+          {
+            source: 'wechat',
+            itemId: 'seq:3',
+            circle: 'owner_private',
+            roomKey: 'wechat:other-dm',
+            occurredAt: '2026-11-20T10:00:00.000Z',
+            snippet: 'other private dm message',
+            author: 'friend',
+          },
+        ];
+      },
+    });
+
+    service.registerSessionPrincipal({
+      sessionId: 'sess-owner',
+      role: 'owner_session',
+      tier: 3,
+      trustLevel: 'owner',
+    });
+    service.registerSessionPrincipal({
+      sessionId: 'sess-tier1',
+      role: 'worker',
+      tier: 1,
+      trustLevel: 'triage',
+    });
+
+    await assert.rejects(
+      () => service.vault.search({ query: '' }, makeExec('sess-owner')),
+      (err: unknown) => err instanceof VaultError && err.code === 'VAULT_INVALID_QUERY',
+    );
+    await assert.rejects(
+      () => service.vault.search({}, makeExec('sess-owner')),
+      (err: unknown) => err instanceof VaultError && err.code === 'VAULT_INVALID_QUERY',
+    );
+
+    const recentBySource = await service.vault.search(
+      { query: '', sources: ['wechat'], limit: 10 },
+      makeExec('sess-owner'),
+    );
+    assert.deepEqual(
+      recentBySource.hits.map((h) => h.itemId),
+      ['seq:3', 'seq:2', 'seq:1'],
+    );
+    assert.equal(service.isSessionTainted('sess-owner'), true);
+    assert.equal(service.isTurnPrivateRead('sess-owner'), true);
+
+    const byRoomKey = await service.vault.search(
+      { sources: ['wechat'], roomKey: 'wechat:owner-dm', limit: 10 },
+      makeExec('sess-owner'),
+    );
+    assert.equal(receivedQueries.at(-1)?.roomKey, 'wechat:owner-dm');
+    assert.deepEqual(
+      byRoomKey.hits.map((h) => h.itemId),
+      ['seq:2'],
+    );
+
+    const byBareRoomKey = await service.vault.search(
+      { roomKey: 'owner-dm' },
+      makeExec('sess-owner'),
+    );
+    assert.deepEqual(
+      byBareRoomKey.hits.map((h) => h.itemId),
+      ['seq:2'],
+    );
+
+    const tier1Browse = await service.vault.search(
+      { query: '', sources: ['wechat'] },
+      makeExec('sess-tier1'),
+    );
+    assert.deepEqual(
+      tier1Browse.hits.map((h) => h.itemId),
+      ['seq:1'],
+    );
+    assert.equal(service.isSessionTainted('sess-tier1'), false);
+  } finally {
+    db.close();
+  }
+});
+
 test('Subagent strictly inherits parent tier (never escalates), fail-closes without parent, and propagates taint to rootSessionId', async () => {
   const db = openHubDb({ inMemory: true });
   try {
@@ -530,6 +640,8 @@ test('apply() provides vault service, registers vault_search & vault_context too
     const contextTool = tools.get('vault_context')!;
     assert.equal(searchTool.isConcurrencySafe(), true);
     assert.equal(contextTool.isConcurrencySafe(), true);
+    assert.equal(Array.isArray(searchTool.inputSchema.required), false);
+    assert.ok((searchTool.inputSchema.properties as Record<string, unknown>).roomKey);
 
     const searchRes = (await searchTool.execute(
       { query: 'deadline', sources: ['persona'] },

@@ -38,7 +38,12 @@ import {
   normalizeAttentionPolicy,
   resolveAttentionDestination,
 } from './policy.js';
-import { isReadOnlyBash, taskReusable, withinWorkspace } from './task-permissions.js';
+import {
+  isReadOnlyBash,
+  needsOperationConfirmation,
+  taskReusable,
+  withinWorkspace,
+} from './task-permissions.js';
 import { triageEvent, type TriageLlmLike, type TriageLoggerLike } from './triage.js';
 import {
   dispatchWorker,
@@ -57,22 +62,37 @@ const LIST_COMMANDS = new Set(['列表', '还有啥', '在忙啥', '任务', 'li
 
 const OWNER_SAFE_READ_TOOLS = new Set([
   'read',
+  'read_file',
   'read_image',
   'grep',
   'glob',
   'find',
   'ls',
+  'list_dir',
   'vault_search',
   'vault_context',
   'router_tasks',
   'router_send_to_task',
-  'web_search',
-  'ask_user_question',
+  'watch_list',
+  'watch_update',
+  'watch_cancel',
+  'watch_stage_draft',
+  'github_stage_reply',
+  'github_stage_review',
+  'wxarc_status',
+  'wxarc_messages',
+  'wxarc_targets',
+  'wxarc_nas_search',
   'wxarc_sticker_search',
   'watcher_memo_add',
   'watcher_memo_list',
   'watcher_memo_cancel',
+  'web_search',
+  'ask_user_question',
   'job_output',
+  'todoread',
+  'todowrite',
+  'skill',
 ]);
 
 function extractShortId(decision: Pick<RouterDecisionRecord, 'id' | 'threadKey'>): string {
@@ -551,21 +571,37 @@ export class RouterRuntime {
 
     if (exec.name === 'bash') {
       const command = exec.arguments?.command;
-      if (isReadOnlyBash(command, exec.arguments)) {
-        return next();
+      if (
+        needsOperationConfirmation(exec) ||
+        exec.arguments?.sandbox_permissions === 'require_escalated'
+      ) {
+        this.approvals.eligible(exec, false);
+        return {
+          kind: 'ask',
+          reason: '涉及删除、安装、提权或系统变更的终端命令需要主人微信确认码。',
+        };
       }
-      this.approvals.eligible(exec, false);
-      return {
-        kind: 'ask',
-        reason: '非只读终端命令需要主人微信确认码。',
-      };
+      if (isReadOnlyBash(command, exec.arguments)) {
+        return { kind: 'allow' };
+      }
+      const base = await next();
+      if (base.kind === 'allow') {
+        return base;
+      }
+      if (base.kind === 'ask') {
+        this.approvals.eligible(exec, true);
+        if (this.approvals.allows(exec, run)) {
+          return { kind: 'allow' };
+        }
+      }
+      return base;
     }
 
     if (exec.name === 'write' || exec.name === 'edit') {
       const targetPath =
         exec.arguments?.file_path ?? exec.arguments?.path ?? exec.arguments?.target_file;
       if (withinWorkspace(this.ownerSession.workspacePath, targetPath)) {
-        return next();
+        return { kind: 'allow' };
       }
       this.approvals.eligible(exec, false);
       return {
@@ -575,22 +611,20 @@ export class RouterRuntime {
     }
 
     if (OWNER_SAFE_READ_TOOLS.has(exec.name)) {
-      return next();
+      return { kind: 'allow' };
     }
 
     const baseDecision = await next();
-    if (baseDecision.kind !== 'allow') {
+    if (baseDecision.kind === 'allow') {
       return baseDecision;
     }
-
-    this.approvals.eligible(exec, taskReusable(exec));
-    if (this.approvals.allows(exec, run)) {
-      return baseDecision;
+    if (baseDecision.kind === 'ask') {
+      this.approvals.eligible(exec, taskReusable(exec));
+      if (this.approvals.allows(exec, run)) {
+        return { kind: 'allow' };
+      }
     }
-    return {
-      kind: 'ask',
-      reason: `调用 ${exec.name} 需要主人微信确认码。`,
-    };
+    return baseDecision;
   }
 
   private listActiveDecisions(limit = 20): RouterDecisionRecord[] {

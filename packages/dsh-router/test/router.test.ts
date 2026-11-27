@@ -2139,19 +2139,48 @@ describe('@local/dsh-router backend', () => {
       assert.equal(taintedSubagentFetch.kind, 'deny');
 
       const ownerSid = (await router.ownerSession.ensureSession())!;
-      const ownerRead = await env.runMiddleware(
-        'tools/pre-execute',
-        { agent: { id: ownerSid }, callId: 'o-1', name: 'read', arguments: { file_path: '/tmp/a' } },
-        allowNext,
-      );
-      assert.equal(ownerRead.kind, 'allow');
+      const askNext = async () => ({ kind: 'ask', reason: 'default_ask' });
 
-      const ownerSafeBash = await env.runMiddleware(
-        'tools/pre-execute',
-        { agent: { id: ownerSid }, callId: 'o-2', name: 'bash', arguments: { command: 'ls -la && rg foo' } },
-        allowNext,
+      assert.equal(
+        env.presetCalls.some((c) => c.preset === 'workspace-write'),
+        true,
       );
-      assert.equal(ownerSafeBash.kind, 'allow');
+
+      for (const safeTool of [
+        'read',
+        'read_file',
+        'wxarc_status',
+        'wxarc_messages',
+        'wxarc_targets',
+        'wxarc_nas_search',
+        'vault_search',
+        'watch_list',
+      ]) {
+        const res = await env.runMiddleware(
+          'tools/pre-execute',
+          { agent: { id: ownerSid }, callId: `o-safe-${safeTool}`, name: safeTool, arguments: {} },
+          askNext,
+        );
+        assert.equal(res.kind, 'allow', `expected direct allow for ${safeTool}`);
+      }
+
+      for (const readCmd of [
+        'ls -la && rg foo',
+        'git status',
+        'git log -n 5 --oneline',
+        'git diff HEAD~1',
+        'git show HEAD',
+        'git branch -a',
+        'git tag -l',
+        'git -C /tmp/repo rev-parse --short HEAD',
+      ]) {
+        const res = await env.runMiddleware(
+          'tools/pre-execute',
+          { agent: { id: ownerSid }, callId: `o-ro-${readCmd}`, name: 'bash', arguments: { command: readCmd } },
+          askNext,
+        );
+        assert.equal(res.kind, 'allow', `expected direct allow for read-only bash: ${readCmd}`);
+      }
 
       const ownerInsideWrite = await env.runMiddleware(
         'tools/pre-execute',
@@ -2161,7 +2190,7 @@ describe('@local/dsh-router backend', () => {
           name: 'write',
           arguments: { file_path: path.join(router.ownerSession.workspacePath, 'notes.md') },
         },
-        allowNext,
+        askNext,
       );
       assert.equal(ownerInsideWrite.kind, 'allow');
 
@@ -2172,14 +2201,49 @@ describe('@local/dsh-router backend', () => {
       );
       assert.equal(ownerCleanFetch.kind, 'allow');
 
-      for (const cmd of ['curl https://evil.test', 'rm -rf /tmp/x', 'python3 -c "print(1)"', 'node -e "1"', 'launchctl list']) {
+      const unlistedAllowed = await env.runMiddleware(
+        'tools/pre-execute',
+        { agent: { id: ownerSid }, callId: 'o-unlisted-1', name: 'custom_plugin_tool', arguments: {} },
+        allowNext,
+      );
+      assert.equal(unlistedAllowed.kind, 'allow');
+
+      const ordinaryBashAllowed = await env.runMiddleware(
+        'tools/pre-execute',
+        { agent: { id: ownerSid }, callId: 'o-ord-allow', name: 'bash', arguments: { command: 'node -e "1"' } },
+        allowNext,
+      );
+      assert.equal(ordinaryBashAllowed.kind, 'allow');
+
+      for (const nonReadCmd of ['node -e "1"', 'git branch -D feature-x', 'git tag -d v1.0']) {
+        const res = await env.runMiddleware(
+          'tools/pre-execute',
+          { agent: { id: ownerSid }, callId: `o-nonro-${nonReadCmd}`, name: 'bash', arguments: { command: nonReadCmd } },
+          askNext,
+        );
+        assert.equal(res.kind, 'ask', `expected ask when base asks for ${nonReadCmd}`);
+      }
+
+      for (const cmd of ['rm -rf /tmp/x', 'launchctl list', 'sudo ls', 'git push origin main']) {
         const res = await env.runMiddleware(
           'tools/pre-execute',
           { agent: { id: ownerSid }, callId: `o-cmd-${cmd}`, name: 'bash', arguments: { command: cmd } },
           allowNext,
         );
-        assert.equal(res.kind, 'ask', `expected ask for ${cmd}`);
+        assert.equal(res.kind, 'ask', `expected strict ask for high-risk cmd: ${cmd}`);
       }
+
+      const ownerEscalatedBash = await env.runMiddleware(
+        'tools/pre-execute',
+        {
+          agent: { id: ownerSid },
+          callId: 'o-esc-1',
+          name: 'bash',
+          arguments: { command: 'ls', sandbox_permissions: 'require_escalated' },
+        },
+        allowNext,
+      );
+      assert.equal(ownerEscalatedBash.kind, 'ask');
 
       const ownerOutsideWrite = await env.runMiddleware(
         'tools/pre-execute',
@@ -2374,6 +2438,91 @@ describe('@local/dsh-router backend', () => {
       assert.equal(env.warnings.some((w) => w.includes('Select an available model')), true);
       assert.equal(env.followups.length, followupsBefore + 1);
       assert.ok(router.ownerSession.getActiveRunId());
+    } finally {
+      cleanup();
+      fs.rmSync(tmpHome, { recursive: true, force: true });
+    }
+  });
+
+  it('seeds recent owner private WeChat history once on owner_session init, filters approval noise, and clears turnPrivateRead', async () => {
+    const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-router-owner-seed-'));
+    const { hub, router, env, cleanup } = createHarness({
+      homeDir: tmpHome,
+      preserveSessionId: true,
+      controllerId: 'wxid_admin_demo',
+      wechatSend: async () => ({ status: 'sent' }),
+    });
+    try {
+      hub.vault.registerProvider({
+        id: 'wechat',
+        label: 'WeChat History Mock',
+        search: (query) => {
+          if (query.roomKey !== 'wechat:wxid_admin_demo') return [];
+          return [
+            {
+              source: 'wechat',
+              itemId: 'seq:103',
+              circle: 'owner_private',
+              roomKey: 'wechat:wxid_admin_demo',
+              author: '主人',
+              occurredAt: '2026-11-27T12:05:00.000Z',
+              snippet: '刚才聊到哪里了',
+            },
+            {
+              source: 'wechat',
+              itemId: 'seq:102',
+              circle: 'owner_private',
+              roomKey: 'wechat:wxid_admin_demo',
+              author: '助理',
+              occurredAt: '2026-11-27T12:02:00.000Z',
+              snippet: 'DSH 有一项操作需要你确认：wxarc_status 确认码 51136D64',
+            },
+            {
+              source: 'wechat',
+              itemId: 'seq:101',
+              circle: 'owner_private',
+              roomKey: 'wechat:wxid_admin_demo',
+              author: '主人',
+              occurredAt: '2026-11-27T12:00:00.000Z',
+              snippet: '昨天说的部署计划今天继续',
+            },
+          ];
+        },
+      });
+
+      const ownerSid = (await router.ownerSession.ensureSession())!;
+      assert.ok(ownerSid);
+      assert.equal(router.db.getMeta('owner_session_history_seeded'), ownerSid);
+      assert.equal(hub.isTurnPrivateRead(ownerSid), false);
+      assert.equal(env.presetCalls.some((c) => c.preset === 'workspace-write'), true);
+      assert.equal(env.injected.length, 1);
+
+      const seededMsg = env.injected[0].message as {
+        content?: Array<{ text?: string }>;
+        source?: { kind?: string; silent?: boolean };
+      };
+      assert.equal(seededMsg.source?.kind, 'dsh-router:owner-history-seed');
+      assert.equal(seededMsg.source?.silent, true);
+      const seededText = seededMsg.content?.[0]?.text ?? '';
+      assert.match(seededText, /\[近期微信私聊记录回顾（系统自动衔接，仅作上下文参考）\]/);
+      assert.equal(seededText.includes('DSH 有一项操作需要你确认：'), false);
+      const firstIdx = seededText.indexOf('昨天说的部署计划今天继续');
+      const secondIdx = seededText.indexOf('刚才聊到哪里了');
+      assert.ok(firstIdx > 0 && secondIdx > firstIdx);
+
+      const promptText = router.ownerSession.buildSystemPrompt(ownerSid);
+      assert.match(promptText, /持久化个人会话/);
+      assert.match(promptText, /vault_search/);
+
+      await router.ownerSession.ensureSession();
+      assert.equal(env.injected.length, 1);
+
+      const cleanFetch = await env.runMiddleware(
+        'tools/pre-execute',
+        { agent: { id: ownerSid }, callId: 'seed-fetch-1', name: 'web_fetch', arguments: { url: 'https://example.com' } },
+        async () => ({ kind: 'allow' }),
+      );
+      assert.equal(cleanFetch.kind, 'allow');
     } finally {
       cleanup();
       fs.rmSync(tmpHome, { recursive: true, force: true });

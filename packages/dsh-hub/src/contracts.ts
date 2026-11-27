@@ -101,8 +101,9 @@ export interface VaultScope {
 }
 
 export interface VaultSearchQuery {
-  query: string;
+  query?: string;
   sources?: string[];
+  roomKey?: string;
   circle?: VaultVisibility;
   person?: string;
   since?: string;

@@ -40,6 +40,181 @@ export const SAFE_COMMANDS = new Set([
   'plutil',
 ]);
 
+const READ_ONLY_GIT_SUBCOMMANDS = new Set([
+  'status',
+  'log',
+  'diff',
+  'show',
+  'branch',
+  'rev-parse',
+  'ls-files',
+  'describe',
+  'tag',
+]);
+
+const GIT_GLOBAL_VALUE_FLAGS = new Set(['-C', '--git-dir', '--work-tree']);
+const GIT_GLOBAL_BOOL_FLAGS = new Set(['--no-pager', '--paginate', '--bare', '--no-optional-locks']);
+const GIT_BRANCH_VALUE_FLAGS = new Set([
+  '--list',
+  '-l',
+  '--contains',
+  '--no-contains',
+  '--merged',
+  '--no-merged',
+  '--points-at',
+  '--sort',
+  '--format',
+  '--color',
+  '--abbrev',
+]);
+const GIT_TAG_VALUE_FLAGS = new Set([
+  '--list',
+  '-l',
+  '-n',
+  '--contains',
+  '--no-contains',
+  '--merged',
+  '--no-merged',
+  '--points-at',
+  '--sort',
+  '--format',
+  '--color',
+]);
+
+function isReadOnlyGitCommand(args: string[]): boolean {
+  let idx = 0;
+  while (idx < args.length) {
+    const token = args[idx] ?? '';
+    if (!token.startsWith('-')) break;
+    if (GIT_GLOBAL_BOOL_FLAGS.has(token)) {
+      idx += 1;
+      continue;
+    }
+    if (GIT_GLOBAL_VALUE_FLAGS.has(token)) {
+      if (idx + 1 >= args.length) return false;
+      idx += 2;
+      continue;
+    }
+    if (/^--(?:git-dir|work-tree)=/.test(token)) {
+      idx += 1;
+      continue;
+    }
+    return false;
+  }
+
+  const subcommand = args[idx] ?? '';
+  if (!READ_ONLY_GIT_SUBCOMMANDS.has(subcommand)) {
+    return false;
+  }
+  const subArgs = args.slice(idx + 1);
+
+  if (subcommand === 'diff' || subcommand === 'log' || subcommand === 'show') {
+    if (subArgs.some((x) => x === '--ext-diff' || x === '--output' || x.startsWith('--output='))) {
+      return false;
+    }
+    return true;
+  }
+
+  if (subcommand === 'branch') {
+    let allowPositional = false;
+    for (let i = 0; i < subArgs.length; i += 1) {
+      const arg = subArgs[i] ?? '';
+      if (arg === '--') {
+        if (!allowPositional && i < subArgs.length - 1) return false;
+        continue;
+      }
+      if (arg.startsWith('--')) {
+        const flagName = arg.split('=')[0] ?? arg;
+        if (
+          [
+            '--delete',
+            '--move',
+            '--copy',
+            '--force',
+            '--set-upstream-to',
+            '--unset-upstream',
+            '--edit-description',
+            '--create-reflog',
+            '--track',
+            '--no-track',
+          ].includes(flagName)
+        ) {
+          return false;
+        }
+        if (flagName === '--list') {
+          allowPositional = true;
+        } else if (GIT_BRANCH_VALUE_FLAGS.has(flagName) && !arg.includes('=')) {
+          i += 1;
+        }
+        continue;
+      }
+      if (arg.startsWith('-') && arg.length > 1) {
+        if (/[dDmMcCfFu]/.test(arg.slice(1))) {
+          return false;
+        }
+        if (arg.includes('l')) {
+          allowPositional = true;
+        }
+        continue;
+      }
+      if (!allowPositional) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (subcommand === 'tag') {
+    let allowPositional = false;
+    for (let i = 0; i < subArgs.length; i += 1) {
+      const arg = subArgs[i] ?? '';
+      if (arg === '--') {
+        if (!allowPositional && i < subArgs.length - 1) return false;
+        continue;
+      }
+      if (arg.startsWith('--')) {
+        const flagName = arg.split('=')[0] ?? arg;
+        if (
+          [
+            '--delete',
+            '--annotate',
+            '--sign',
+            '--local-user',
+            '--force',
+            '--message',
+            '--file',
+            '--cleanup',
+            '--create-reflog',
+          ].includes(flagName)
+        ) {
+          return false;
+        }
+        if (flagName === '--list') {
+          allowPositional = true;
+        } else if (GIT_TAG_VALUE_FLAGS.has(flagName) && !arg.includes('=')) {
+          i += 1;
+        }
+        continue;
+      }
+      if (arg.startsWith('-') && arg.length > 1) {
+        if (/[dDmMsufFa]/.test(arg.slice(1))) {
+          return false;
+        }
+        if (arg.includes('l')) {
+          allowPositional = true;
+        }
+        continue;
+      }
+      if (!allowPositional) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  return true;
+}
+
 export function needsOperationConfirmation(exec: ToolExecutionLike): boolean {
   const command = typeof exec.arguments?.command === 'string' ? exec.arguments.command : '';
   return (
@@ -162,6 +337,9 @@ export function isReadOnlyBash(
     }
     if (rawCmd.includes('/') && !/^\/(?:usr\/)?bin\/[^/]+$/.test(rawCmd)) {
       return false;
+    }
+    if (cmdName === 'git') {
+      return isReadOnlyGitCommand(cmdArgs);
     }
     if (!SAFE_COMMANDS.has(cmdName)) {
       return false;

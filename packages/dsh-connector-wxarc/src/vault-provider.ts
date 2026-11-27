@@ -191,9 +191,10 @@ export function createWechatVaultProvider(options: WechatVaultProviderOptions): 
         return [];
       }
       const needle = typeof query.query === 'string' ? query.query.trim().toLowerCase() : '';
-      if (!needle) {
-        return [];
-      }
+      const rawRoomKey = typeof query.roomKey === 'string' ? query.roomKey.trim() : '';
+      const roomKeyNeedle = rawRoomKey
+        ? rawRoomKey.replace(/^wechat:/i, '').trim().toLowerCase()
+        : '';
       const personNeedle =
         typeof query.person === 'string' && query.person.trim()
           ? query.person.trim().toLowerCase()
@@ -225,6 +226,12 @@ export function createWechatVaultProvider(options: WechatVaultProviderOptions): 
             continue;
           }
           const session = typeof event.session === 'string' ? event.session.trim() : '';
+          if (roomKeyNeedle) {
+            const normalizedSession = session.replace(/^wechat:/i, '').trim().toLowerCase();
+            if (!normalizedSession || normalizedSession !== roomKeyNeedle) {
+              continue;
+            }
+          }
           const circle = resolveWechatVaultCircle(session, wardrobe);
           if (!allowed.has(circle)) {
             continue;
@@ -247,9 +254,15 @@ export function createWechatVaultProvider(options: WechatVaultProviderOptions): 
             }
           }
           const content = extractSearchableEventText(event);
-          const hay = `${content} ${sender} ${sessionName}`.toLowerCase();
-          if (!hay.includes(needle)) {
+          const textBody = content || (typeof event.text === 'string' ? event.text.trim() : '');
+          if (!textBody) {
             continue;
+          }
+          if (needle) {
+            const hay = `${content} ${sender} ${sessionName}`.toLowerCase();
+            if (!hay.includes(needle)) {
+              continue;
+            }
           }
           hits.push({
             source: 'wechat',
@@ -259,7 +272,7 @@ export function createWechatVaultProvider(options: WechatVaultProviderOptions): 
             ...(sessionName || session ? { roomName: sessionName || session } : {}),
             ...(sender || senderId ? { author: sender || senderId } : {}),
             occurredAt: toOccurredAtIso(tsMs, row.received_at),
-            snippet: compactVaultSnippet(content || event.text || ''),
+            snippet: compactVaultSnippet(textBody),
             metadata: {
               seq: row.seq,
               eventId: event.id,
@@ -443,6 +456,14 @@ export function createNasVaultProvider(options: NasVaultProviderOptions): VaultP
         return [];
       }
 
+      const queryText = typeof query.query === 'string' ? query.query.trim() : '';
+      if (!queryText) {
+        return [];
+      }
+      const rawRoomKey = typeof query.roomKey === 'string' ? query.roomKey.trim() : '';
+      const roomSession = rawRoomKey ? rawRoomKey.replace(/^wechat:/i, '').trim() : '';
+      const roomSessionLower = roomSession.toLowerCase();
+
       const limit = clampLimit(query.limit);
       const sinceMs = parseBoundaryMs(query.since);
       const untilMs = parseBoundaryMs(query.until);
@@ -450,7 +471,8 @@ export function createNasVaultProvider(options: NasVaultProviderOptions): VaultP
 
       const result = await searchNasArchive(
         {
-          query: query.query,
+          query: queryText,
+          ...(roomSession ? { session: roomSession } : {}),
           sender: query.person,
           limit: MAX_NAS_SEARCH_LIMIT,
         },
@@ -466,6 +488,9 @@ export function createNasVaultProvider(options: NasVaultProviderOptions): VaultP
       for (let i = 0; i < result.items.length; i += 1) {
         const item = result.items[i]!;
         const session = typeof item.session === 'string' ? item.session.trim() : '';
+        if (roomSessionLower && session.replace(/^wechat:/i, '').trim().toLowerCase() !== roomSessionLower) {
+          continue;
+        }
         const circle = resolveWechatVaultCircle(session, wardrobe);
         if (!allowed.has(circle)) {
           continue;
