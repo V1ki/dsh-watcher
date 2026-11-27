@@ -43,7 +43,10 @@ export interface SessionBridgeContext {
   logger?:
     | ((name: string) => { info?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void })
     | { info?: (...args: unknown[]) => void; warn?: (...args: unknown[]) => void };
-  agents?: { withoutInitiator?: <T>(fn: () => Promise<T> | T) => Promise<T> | T };
+  agents?: {
+    get?: (sessionId: string) => unknown;
+    withoutInitiator?: <T>(fn: () => Promise<T> | T) => Promise<T> | T;
+  };
   workspaceRegistry?: {
     archivedSessionIds?: Set<string> | string[];
     resolveByPath?: (workspacePath: string) => Promise<{ id: string } | null | undefined>;

@@ -16,12 +16,25 @@ import type {
   NormalizedEvent,
   PersonaWardrobe,
   RegisterSubscriptionInput,
+  ResolvedSessionPrincipal,
   RoutingRule,
+  SessionPrincipal,
+  SessionVaultTier,
   SinkInvokeInput,
   SinkInvokeResult,
   StagedDraft,
+  TargetDirectoryEntry,
+  TargetDirectoryListOptions,
+  TargetDirectoryProvider,
+  TargetDirectoryQuery,
+  TargetDirectoryResolution,
+  ThreadLifecycleEvent,
+  ThreadLifecycleHandler,
+  ThreadLifecycleState,
   ThreadSubscription,
+  ToolExecutionContext,
   UnclaimedEventHandler,
+  VaultProvider,
   WatchSource,
   WatchStatus,
   WatcherDb,
@@ -32,11 +45,30 @@ import type {
 import type { MemoEngineLike } from './http-routes.js';
 import { buildFastPathPrompt, buildWakeupPrompt, matchRoutingRule, resolveEffectiveTier } from './posterior.js';
 import type { SessionBridge } from './session-bridge.js';
+import { createVaultService, resolveAllowedVaultCircles, type VaultRuntime } from './vault.js';
+
+interface AgentLookupLike {
+  id?: string;
+  session?: {
+    id?: string;
+    header?: {
+      parentSession?: string;
+      parentSessionId?: string;
+      rootSessionId?: string;
+      delegationDepth?: number;
+      origin?: string;
+    };
+  };
+}
 
 export interface HubContextLike {
   effect?: (callback: () => (() => void) | void) => void;
   get?: (name: string) => unknown;
   personaWardrobe?: PersonaWardrobe;
+  agents?: {
+    get?: (sessionId: string) => unknown;
+    withoutInitiator?: <T>(fn: () => Promise<T> | T) => Promise<T> | T;
+  };
 }
 
 export type WatcherContextLike = HubContextLike;
@@ -111,9 +143,38 @@ function extractLinkedIssueNumbers(payload: Record<string, unknown> | undefined)
   return nums;
 }
 
+function detectThreadLifecycle(
+  event: NormalizedEvent,
+): { state: ThreadLifecycleState; lifecycleOnly: boolean } | null {
+  const typeLower = typeof event.type === 'string' ? event.type.trim().toLowerCase() : '';
+  const payload = event.payload ?? {};
+  const payloadState = typeof payload.state === 'string' ? payload.state.trim().toLowerCase() : '';
+  const isMerged = typeLower.endsWith('.merged') || payload.merged === true;
+  const isClosed = typeLower.endsWith('.closed') || payloadState === 'closed';
+  const lifecycleOnly = payload.lifecycleOnly === true;
+  if (!isMerged && !isClosed && !lifecycleOnly) {
+    return null;
+  }
+  const state: ThreadLifecycleState = isMerged ? 'merged' : isClosed ? 'closed' : 'ended';
+  return { state, lifecycleOnly };
+}
+
+function readAgentParentId(agent: AgentLookupLike | undefined): string | null {
+  const header = agent?.session?.header;
+  if (!header) return null;
+  if (typeof header.parentSessionId === 'string' && header.parentSessionId.trim()) {
+    return header.parentSessionId.trim();
+  }
+  if (typeof header.parentSession === 'string' && header.parentSession.trim()) {
+    return header.parentSession.trim();
+  }
+  return null;
+}
+
 export class HubRuntime implements HubService {
   readonly db: WatcherDb;
   readonly guard: DoorGuard;
+  readonly vault: VaultRuntime;
   private readonly ctx?: HubContextLike;
   private readonly wardrobeOverride: PersonaWardrobe | null;
   private readonly getWardrobeFn?: () => PersonaWardrobe | null;
@@ -122,11 +183,19 @@ export class HubRuntime implements HubService {
   private readonly maxAutoSessionsPerHour: number;
   private readonly connectors = new Map<string, ConnectorDescriptor>();
   private readonly unclaimedHandlers = new Set<UnclaimedEventHandler>();
+  private readonly threadLifecycleHandlers = new Set<ThreadLifecycleHandler>();
   private readonly adminWechatHandlers = new Set<AdminWechatHandler>();
   private readonly sources = new Map<string, WatchSource>();
   private readonly resolvers = new Map<string, EntityResolver>();
   private readonly sinks = new Map<string, ActionSink>();
   private readonly rules = new Map<string, RoutingRule>();
+  private readonly sessionPrincipals = new Map<string, SessionPrincipal>();
+  private readonly taintedSessions = new Set<string>();
+  private readonly taintReasons = new Map<string, string>();
+  private readonly sessionTurnOverrides = new Map<string, { tier: SessionVaultTier; expiresAt?: number }>();
+  private readonly turnPrivateRead = new Set<string>();
+  private readonly targetDirectories = new Map<string, TargetDirectoryProvider>();
+  private targetDirectorySeq = 0;
   private wechatTransport: WechatTransport | null = null;
   private memoEngineRef: MemoEngineLike | null = null;
   private githubAdminRef: GitHubAdminAdapter | null = null;
@@ -141,6 +210,17 @@ export class HubRuntime implements HubService {
     this.sessionBridge = deps.sessionBridge ?? null;
     this.defaultTtlHours = deps.defaultTtlHours ?? 72;
     this.maxAutoSessionsPerHour = deps.maxAutoSessionsPerHour ?? 12;
+    this.vault = createVaultService({
+      resolveSessionPrincipal: (exec) => this.resolveSessionPrincipal(exec),
+      markSessionTainted: (sessionId, reason) => this.markSessionTainted(sessionId, reason),
+      isSessionTainted: (sessionId) => this.isSessionTainted(sessionId),
+      markTurnPrivateRead: (sessionId) => this.markTurnPrivateRead(sessionId),
+      bindCleanup: (cleanup) => this.bindCleanup(cleanup),
+    });
+    this.guard.setSessionTaintChecker?.((sessionId) => this.isSessionTainted(sessionId));
+    this.guard.setSessionTargetCircleResolver?.(
+      (sessionId) => this.getSessionPrincipal(sessionId)?.targetCircle ?? null,
+    );
     this.recoverOrphanedSinks();
   }
 
@@ -276,6 +356,372 @@ export class HubRuntime implements HubService {
     return this.bindCleanup(() => {
       this.unclaimedHandlers.delete(handler);
     });
+  }
+
+  onThreadLifecycle(handler: ThreadLifecycleHandler): () => void {
+    this.threadLifecycleHandlers.add(handler);
+    return this.bindCleanup(() => {
+      this.threadLifecycleHandlers.delete(handler);
+    });
+  }
+
+  registerVaultProvider(provider: VaultProvider): () => void {
+    return this.vault.registerProvider(provider);
+  }
+
+  registerSessionPrincipal(principal: SessionPrincipal): () => void {
+    const sessionId = typeof principal?.sessionId === 'string' ? principal.sessionId.trim() : '';
+    if (!sessionId) {
+      throw new TypeError('SessionPrincipal must specify a non-empty sessionId');
+    }
+    const normalized: SessionPrincipal = {
+      ...principal,
+      sessionId,
+    };
+    this.sessionPrincipals.set(sessionId, normalized);
+    return this.bindCleanup(() => {
+      if (this.sessionPrincipals.get(sessionId) === normalized) {
+        this.sessionPrincipals.delete(sessionId);
+      }
+    });
+  }
+
+  getSessionPrincipal(sessionId: string): SessionPrincipal | null {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return null;
+    return this.sessionPrincipals.get(key) ?? null;
+  }
+
+  setSessionTurnOverride(sessionId: string, tier: SessionVaultTier, ttlMs?: number): void {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return;
+    if (ttlMs !== undefined) {
+      if (!Number.isFinite(ttlMs) || ttlMs <= 0) {
+        this.sessionTurnOverrides.delete(key);
+        return;
+      }
+      this.sessionTurnOverrides.set(key, { tier, expiresAt: Date.now() + ttlMs });
+      return;
+    }
+    this.sessionTurnOverrides.set(key, { tier });
+  }
+
+  clearSessionTurnOverride(sessionId: string): void {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return;
+    this.sessionTurnOverrides.delete(key);
+  }
+
+  private getActiveTurnOverride(sessionId: string): SessionVaultTier | null {
+    const entry = this.sessionTurnOverrides.get(sessionId);
+    if (!entry) return null;
+    if (entry.expiresAt !== undefined && Date.now() >= entry.expiresAt) {
+      this.sessionTurnOverrides.delete(sessionId);
+      return null;
+    }
+    return entry.tier;
+  }
+
+  markSessionTainted(sessionId: string, reason?: string): void {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return;
+    this.taintedSessions.add(key);
+    if (typeof reason === 'string' && reason.trim()) {
+      this.taintReasons.set(key, reason.trim());
+    }
+  }
+
+  isSessionTainted(sessionId: string): boolean {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return false;
+    return this.taintedSessions.has(key);
+  }
+
+  markTurnPrivateRead(sessionId: string): void {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return;
+    this.turnPrivateRead.add(key);
+  }
+
+  clearTurnPrivateRead(sessionId: string): void {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return;
+    this.turnPrivateRead.delete(key);
+  }
+
+  isTurnPrivateRead(sessionId: string): boolean {
+    const key = typeof sessionId === 'string' ? sessionId.trim() : '';
+    if (!key) return false;
+    return this.turnPrivateRead.has(key);
+  }
+
+  private getAgentsService(): HubContextLike['agents'] | undefined {
+    if (typeof this.ctx?.get === 'function') {
+      const fromCtx = this.ctx.get('agents') as HubContextLike['agents'] | undefined;
+      if (fromCtx) return fromCtx;
+    }
+    return this.ctx?.agents;
+  }
+
+  resolveSessionPrincipal(exec?: ToolExecutionContext): ResolvedSessionPrincipal {
+    const rawSessionId = typeof exec?.agent?.id === 'string' ? exec.agent.id.trim() : '';
+    if (!rawSessionId) {
+      return {
+        sessionId: null,
+        rootSessionId: null,
+        role: 'unknown',
+        tier: 0,
+        trustLevel: 'untrusted',
+        delegationDepth: 0,
+        isSubagent: false,
+        tainted: false,
+        turnPrivateRead: false,
+        allowedCircles: [],
+      };
+    }
+
+    const header = exec?.agent?.session?.header;
+    const rawDepth =
+      typeof header?.delegationDepth === 'number' && Number.isFinite(header.delegationDepth)
+        ? header.delegationDepth
+        : 0;
+    const isSubagent = rawDepth > 0 || header?.origin === 'subagent';
+    const delegationDepth = isSubagent ? Math.max(1, Math.floor(rawDepth)) : 0;
+
+    if (isSubagent) {
+      const ancestorChain: string[] = [];
+      const visited = new Set<string>([rawSessionId]);
+      const pushCandidate = (candidate: string | null | undefined): void => {
+        const trimmed = typeof candidate === 'string' ? candidate.trim() : '';
+        if (trimmed && !visited.has(trimmed)) {
+          visited.add(trimmed);
+          ancestorChain.push(trimmed);
+        }
+      };
+
+      const directParent =
+        (typeof header?.parentSessionId === 'string' && header.parentSessionId.trim()) ||
+        (typeof header?.parentSession === 'string' && header.parentSession.trim()) ||
+        null;
+      const explicitRoot =
+        typeof header?.rootSessionId === 'string' && header.rootSessionId.trim()
+          ? header.rootSessionId.trim()
+          : null;
+
+      pushCandidate(directParent);
+      const agentsSvc = this.getAgentsService();
+      let cursor = directParent;
+      for (let hop = 0; cursor && hop < 12; hop += 1) {
+        const parentAgent = agentsSvc?.get?.(cursor) as AgentLookupLike | undefined;
+        const nextParent = readAgentParentId(parentAgent);
+        if (!nextParent || visited.has(nextParent)) break;
+        pushCandidate(nextParent);
+        cursor = nextParent;
+      }
+      pushCandidate(explicitRoot);
+
+      const matchedAncestors: SessionPrincipal[] = [];
+      for (const candidateId of ancestorChain) {
+        const principal = this.sessionPrincipals.get(candidateId);
+        if (principal) {
+          matchedAncestors.push(principal);
+        }
+      }
+
+      if (matchedAncestors.length === 0) {
+        const fallbackRoot = explicitRoot ?? ancestorChain[ancestorChain.length - 1] ?? null;
+        return {
+          sessionId: rawSessionId,
+          rootSessionId: fallbackRoot,
+          role: 'unknown',
+          tier: 0,
+          trustLevel: 'untrusted',
+          delegationDepth,
+          isSubagent: true,
+          tainted:
+            this.isSessionTainted(rawSessionId) ||
+            (fallbackRoot ? this.isSessionTainted(fallbackRoot) : false),
+          turnPrivateRead:
+            this.isTurnPrivateRead(rawSessionId) ||
+            (fallbackRoot ? this.isTurnPrivateRead(fallbackRoot) : false),
+          allowedCircles: [],
+        };
+      }
+
+      const rootPrincipal = matchedAncestors[matchedAncestors.length - 1]!;
+      const rootSessionId = rootPrincipal.sessionId;
+      const rootOverride = this.getActiveTurnOverride(rootSessionId);
+      let effectiveTier: SessionVaultTier = rootOverride ?? rootPrincipal.tier;
+
+      for (const ancestor of matchedAncestors) {
+        if (ancestor.sessionId === rootSessionId) continue;
+        const ancOverride = this.getActiveTurnOverride(ancestor.sessionId);
+        const ancTier = ancOverride ?? ancestor.tier;
+        if (ancTier < effectiveTier) {
+          effectiveTier = ancTier;
+        }
+      }
+
+      const selfPrincipal = this.sessionPrincipals.get(rawSessionId);
+      if (selfPrincipal && selfPrincipal.tier < effectiveTier) {
+        effectiveTier = selfPrincipal.tier;
+      }
+
+      return {
+        sessionId: rawSessionId,
+        rootSessionId,
+        role: rootPrincipal.role,
+        tier: effectiveTier,
+        trustLevel: rootPrincipal.trustLevel,
+        delegationDepth,
+        isSubagent: true,
+        tainted: this.isSessionTainted(rootSessionId) || this.isSessionTainted(rawSessionId),
+        turnPrivateRead:
+          this.isTurnPrivateRead(rootSessionId) || this.isTurnPrivateRead(rawSessionId),
+        allowedCircles: resolveAllowedVaultCircles(effectiveTier),
+        boundSource: rootPrincipal.boundSource,
+        boundThreadKey: rootPrincipal.boundThreadKey,
+        boundDecisionId: rootPrincipal.boundDecisionId,
+        boundRepo: rootPrincipal.boundRepo,
+        boundRoomKey: rootPrincipal.boundRoomKey,
+        targetCircle: rootPrincipal.targetCircle,
+      };
+    }
+
+    const registered = this.sessionPrincipals.get(rawSessionId);
+    const overrideTier = this.getActiveTurnOverride(rawSessionId);
+    if (registered) {
+      const effectiveTier = overrideTier ?? registered.tier;
+      return {
+        sessionId: rawSessionId,
+        rootSessionId: rawSessionId,
+        role: registered.role,
+        tier: effectiveTier,
+        trustLevel: registered.trustLevel,
+        delegationDepth: 0,
+        isSubagent: false,
+        tainted: this.isSessionTainted(rawSessionId),
+        turnPrivateRead: this.isTurnPrivateRead(rawSessionId),
+        allowedCircles: resolveAllowedVaultCircles(effectiveTier),
+        boundSource: registered.boundSource,
+        boundThreadKey: registered.boundThreadKey,
+        boundDecisionId: registered.boundDecisionId,
+        boundRepo: registered.boundRepo,
+        boundRoomKey: registered.boundRoomKey,
+        targetCircle: registered.targetCircle,
+      };
+    }
+
+    const interactiveTier: SessionVaultTier = overrideTier ?? 3;
+    return {
+      sessionId: rawSessionId,
+      rootSessionId: rawSessionId,
+      role: 'interactive',
+      tier: interactiveTier,
+      trustLevel: 'owner',
+      delegationDepth: 0,
+      isSubagent: false,
+      tainted: this.isSessionTainted(rawSessionId),
+      turnPrivateRead: this.isTurnPrivateRead(rawSessionId),
+      allowedCircles: resolveAllowedVaultCircles(interactiveTier),
+    };
+  }
+
+  registerTargetDirectory(provider: TargetDirectoryProvider): () => void {
+    if (!provider || typeof provider !== 'object') {
+      throw new TypeError('TargetDirectoryProvider must be an object with resolveTarget and listTargets');
+    }
+    if (typeof provider.resolveTarget !== 'function' || typeof provider.listTargets !== 'function') {
+      throw new TypeError('TargetDirectoryProvider must provide resolveTarget(query) and listTargets(opts?)');
+    }
+    const key =
+      (typeof provider.id === 'string' && provider.id.trim()) ||
+      (typeof provider.source === 'string' && provider.source.trim()) ||
+      `target-dir-${++this.targetDirectorySeq}`;
+    this.targetDirectories.set(key, provider);
+    return this.bindCleanup(() => {
+      if (this.targetDirectories.get(key) === provider) {
+        this.targetDirectories.delete(key);
+      }
+    });
+  }
+
+  private selectTargetDirectories(source?: string): TargetDirectoryProvider[] {
+    const requested = typeof source === 'string' ? source.trim() : '';
+    const all = [...this.targetDirectories.entries()];
+    if (!requested) return all.map(([, provider]) => provider);
+    return all
+      .filter(
+        ([key, provider]) =>
+          provider.source === requested ||
+          provider.id === requested ||
+          key === requested ||
+          (!provider.source && !provider.id),
+      )
+      .map(([, provider]) => provider);
+  }
+
+  async resolveTarget(query: TargetDirectoryQuery): Promise<TargetDirectoryResolution> {
+    const providers = this.selectTargetDirectories(query?.source);
+    const ambiguousCandidates: TargetDirectoryEntry[] = [];
+    for (const provider of providers) {
+      try {
+        const res = await provider.resolveTarget(query);
+        if (!res) continue;
+        if (res.status === 'matched' && res.target) {
+          return res;
+        }
+        if (res.status === 'ambiguous' && Array.isArray(res.candidates)) {
+          ambiguousCandidates.push(...res.candidates);
+        }
+      } catch {
+        void 0;
+      }
+    }
+    if (ambiguousCandidates.length > 0) {
+      return {
+        status: 'ambiguous',
+        candidates: ambiguousCandidates,
+        detail: 'multiple_targets_matched',
+      };
+    }
+    return { status: 'not_found' };
+  }
+
+  async listTargets(opts?: TargetDirectoryListOptions): Promise<TargetDirectoryEntry[]> {
+    const providers = this.selectTargetDirectories(opts?.source);
+    const seen = new Set<string>();
+    const results: TargetDirectoryEntry[] = [];
+    for (const provider of providers) {
+      try {
+        const items = await provider.listTargets(opts);
+        if (!Array.isArray(items)) continue;
+        for (const item of items) {
+          if (!item || typeof item !== 'object') continue;
+          const dedupeKey = `${item.source}:${item.roomKey || item.targetId}`;
+          if (seen.has(dedupeKey)) continue;
+          seen.add(dedupeKey);
+          results.push(item);
+        }
+      } catch {
+        void 0;
+      }
+    }
+    const limit =
+      typeof opts?.limit === 'number' && Number.isFinite(opts.limit) && opts.limit > 0
+        ? Math.floor(opts.limit)
+        : undefined;
+    return limit !== undefined ? results.slice(0, limit) : results;
+  }
+
+  private async dispatchThreadLifecycle(lifecycle: ThreadLifecycleEvent): Promise<void> {
+    for (const handler of [...this.threadLifecycleHandlers]) {
+      try {
+        await handler(lifecycle);
+      } catch {
+        void 0;
+      }
+    }
   }
 
   registerSource(source: WatchSource): () => void {
@@ -415,6 +861,22 @@ export class HubRuntime implements HubService {
     const now = nowIso();
     const inboxId = randomUUID();
     const actorLabel = event.actor.login ?? event.actor.displayName ?? event.actor.id;
+    const lifecycle = detectThreadLifecycle(event);
+
+    const emitLifecycle = async (subscription: ThreadSubscription | null): Promise<void> => {
+      if (!lifecycle) return;
+      await this.dispatchThreadLifecycle({
+        source: event.source,
+        threadKey: event.threadKey,
+        entityKey: event.entityKey ?? null,
+        state: lifecycle.state,
+        lifecycleOnly: lifecycle.lifecycleOnly,
+        inboxId,
+        event,
+        subscription,
+        occurredAt: event.occurredAt,
+      });
+    };
 
     if (event.payload?.handledByWechatSession === true) {
       const handledSessionId =
@@ -450,7 +912,42 @@ export class HubRuntime implements HubService {
           now,
           now,
         );
+      await emitLifecycle(null);
       return { accepted: true, inboxId, routedVia: 'inbox' };
+    }
+
+    if (lifecycle?.lifecycleOnly === true) {
+      const existingSub = this.resolveSubscription(event.source, event.threadKey);
+      this.db.db
+        .prepare(
+          `INSERT INTO inbox_items (
+             id, event_id, dedupe_key, thread_key, source, type, entity_key,
+             workstream_id, session_id, actor, actor_is_bot, trust_level, summary,
+             payload_json, tier, pre_gate_tags, status, raw_url, occurred_at, created_at, updated_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'inbox-only', '[]', 'resolved', ?, ?, ?, ?)`,
+        )
+        .run(
+          inboxId,
+          event.id,
+          event.dedupeKey,
+          event.threadKey,
+          event.source,
+          event.type,
+          event.entityKey ?? null,
+          existingSub?.workstreamId ?? null,
+          existingSub?.sessionId ?? null,
+          actorLabel,
+          event.actor.isBot ? 1 : 0,
+          event.trustLevel,
+          event.summary,
+          JSON.stringify(event.payload ?? {}),
+          event.rawRef?.url ?? null,
+          event.occurredAt,
+          now,
+          now,
+        );
+      await emitLifecycle(existingSub);
+      return { accepted: true, inboxId, routedVia: 'lifecycle' };
     }
 
     let subscription = this.resolveSubscription(event.source, event.threadKey);
@@ -521,6 +1018,7 @@ export class HubRuntime implements HubService {
         }
       }
 
+      await emitLifecycle(subscription);
       return { accepted: true, inboxId, routedVia: 'subscription' };
     }
 
@@ -565,6 +1063,7 @@ export class HubRuntime implements HubService {
               )
               .run(claimed.workstreamId, claimed.sessionId, nowIso(), inboxId);
           }
+          await emitLifecycle(claimed);
           return { accepted: true, inboxId, routedVia: 'router' };
         }
       }
@@ -614,6 +1113,7 @@ export class HubRuntime implements HubService {
     }
 
     if (tier === 'inbox-only' || rule.handler.sessionPolicy === 'none' || !resolved?.workspacePath) {
+      await emitLifecycle(null);
       return { accepted: true, inboxId, routedVia: 'inbox' };
     }
 
@@ -652,6 +1152,7 @@ export class HubRuntime implements HubService {
       }
     }
 
+    await emitLifecycle(null);
     return { accepted: true, inboxId, routedVia: 'rule' };
   }
 
@@ -766,11 +1267,14 @@ export class HubRuntime implements HubService {
     const sink = this.sinks.get(sinkId);
     if (!sink) return { status: 'failed', detail: `sink_not_found:${sinkId}` };
 
+    const principal = input.sessionId ? this.getSessionPrincipal(input.sessionId) : null;
+    const effectiveTargetCircle = input.targetCircle ?? principal?.targetCircle ?? undefined;
     const gate = await this.guard.beforeSendOut({
       hook: 'beforeSendOut',
       sinkId,
       action: input.action,
       sessionId: input.sessionId ?? null,
+      targetCircle: effectiveTargetCircle,
       target: input.target,
       payload: input.payload,
     });
@@ -784,15 +1288,33 @@ export class HubRuntime implements HubService {
       .prepare('SELECT id, status FROM staged_drafts WHERE idempotency_key = ?')
       .get(input.idempotencyKey) as { id?: string; status?: StagedDraft['status'] } | undefined;
     if (existing?.id) {
-      if (existing.status === 'pending_approval') return { status: 'staged', draftId: existing.id };
+      if (existing.status === 'pending_approval') {
+        return {
+          status: 'staged',
+          draftId: existing.id,
+          ...(gate.publicTaintWarning
+            ? { publicTaintWarning: true, warningText: gate.warningText }
+            : {}),
+        };
+      }
       if (existing.status === 'executed') return { status: 'skipped', draftId: existing.id, detail: 'duplicate_idempotency_key' };
       return { status: 'uncertain', draftId: existing.id, detail: `existing_status:${existing.status}` };
     }
 
     const now = nowIso();
     const draftId = randomUUID();
-    const shouldStage = sink.kind === 'staged-draft' || Boolean(sink.requiresApproval) || Boolean(input.stageOnly);
+    const forceStageByTaint = gate.stageOnly === true && input.approved !== true;
+    const shouldStage =
+      sink.kind === 'staged-draft' ||
+      Boolean(sink.requiresApproval) ||
+      Boolean(input.stageOnly) ||
+      forceStageByTaint;
     const initialStatus: StagedDraft['status'] = shouldStage ? 'pending_approval' : 'executing';
+    const rawPreview = previewOf(input.action, input.payload);
+    const previewText =
+      shouldStage && gate.publicTaintWarning && gate.warningText
+        ? `${gate.warningText}\n\n${rawPreview}`
+        : rawPreview;
     this.db.db
       .prepare(
         `INSERT INTO staged_drafts (
@@ -808,14 +1330,27 @@ export class HubRuntime implements HubService {
         input.sessionId ?? null,
         JSON.stringify(input.target ?? {}),
         JSON.stringify(input.payload ?? {}),
-        previewOf(input.action, input.payload),
+        previewText,
         input.idempotencyKey,
         initialStatus,
         now,
         now,
       );
 
-    if (shouldStage) return { status: 'staged', draftId };
+    if (shouldStage) {
+      return {
+        status: 'staged',
+        draftId,
+        ...(forceStageByTaint ? { stageOnlyForced: true } : {}),
+        ...(gate.publicTaintWarning
+          ? {
+              publicTaintWarning: true,
+              warningText: gate.warningText,
+              detail: gate.warningText,
+            }
+          : {}),
+      };
+    }
     return this.executeDraftRecord(draftId, sink, input, signal);
   }
 
@@ -994,6 +1529,7 @@ export class HubRuntime implements HubService {
       pendingDrafts: Number(draftRow?.cnt ?? 0),
       autoSessionsThisHour: this.countAutoSessionsThisHour(),
       configRevision: this.configRevision,
+      vaultProviders: this.vault.listProviders().length,
     };
   }
 

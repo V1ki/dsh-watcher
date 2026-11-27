@@ -3,13 +3,36 @@ import type {
   GuardContext,
   GuardDecision,
   GuardHook,
+  VaultVisibility,
 } from './contracts.js';
+
+export const PUBLIC_TAINT_WARNING_TEXT =
+  '⚠️ 本会话查过内部/私人记录，发送公网前请核对不含敏感信息';
+
+export interface DoorGuardOptions {
+  isSessionTainted?: (sessionId: string) => boolean;
+  resolveTargetCircle?: (sessionId: string) => VaultVisibility | null | undefined;
+}
 
 export class DoorGuard implements DoorGuardContract {
   private readonly guards: GuardHook[];
+  private sessionTaintChecker: ((sessionId: string) => boolean) | null;
+  private sessionTargetCircleResolver: ((sessionId: string) => VaultVisibility | null | undefined) | null;
 
-  constructor() {
+  constructor(options: DoorGuardOptions = {}) {
     this.guards = [];
+    this.sessionTaintChecker = options.isSessionTainted ?? null;
+    this.sessionTargetCircleResolver = options.resolveTargetCircle ?? null;
+  }
+
+  setSessionTaintChecker(checker: ((sessionId: string) => boolean) | null): void {
+    this.sessionTaintChecker = checker;
+  }
+
+  setSessionTargetCircleResolver(
+    resolver: ((sessionId: string) => VaultVisibility | null | undefined) | null,
+  ): void {
+    this.sessionTargetCircleResolver = resolver;
   }
 
   registerGuard(guard: GuardHook): () => void {
@@ -71,11 +94,48 @@ export class DoorGuard implements DoorGuardContract {
     return this.runHook('beforeEnterRoom', input);
   }
 
-  beforeSendOut(input: GuardContext = {}): Promise<GuardDecision> {
-    return this.runHook('beforeSendOut', input);
+  async beforeSendOut(input: GuardContext = {}): Promise<GuardDecision> {
+    const decision = await this.runHook('beforeSendOut', input);
+    if (!decision.allow) {
+      return decision;
+    }
+
+    const sessionId = typeof input.sessionId === 'string' ? input.sessionId.trim() : '';
+    if (!sessionId || this.sessionTaintChecker?.(sessionId) !== true) {
+      return decision;
+    }
+
+    const targetCircle = input.targetCircle ?? this.sessionTargetCircleResolver?.(sessionId) ?? null;
+    const isPublic = targetCircle === 'external';
+    const metadata: Record<string, unknown> = {
+      ...(decision.metadata ?? {}),
+      tainted: true,
+      stageOnly: true,
+      ...(targetCircle ? { targetCircle } : {}),
+      ...(isPublic
+        ? {
+            publicTaintWarning: true,
+            warningText: PUBLIC_TAINT_WARNING_TEXT,
+          }
+        : {}),
+    };
+
+    return {
+      allow: true,
+      reason: 'tainted_force_stage',
+      stageOnly: true,
+      tainted: true,
+      ...(isPublic
+        ? {
+            publicTaintWarning: true,
+            warningText: PUBLIC_TAINT_WARNING_TEXT,
+          }
+        : {}),
+      metadata,
+    };
   }
 }
 
-export function createDoorGuard(): DoorGuard {
-  return new DoorGuard();
+export function createDoorGuard(options?: DoorGuardOptions): DoorGuard {
+  return new DoorGuard(options);
 }

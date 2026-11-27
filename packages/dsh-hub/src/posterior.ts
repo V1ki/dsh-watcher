@@ -9,23 +9,13 @@ import type {
   SinkInvokeInput,
   SinkInvokeResult,
   ThreadSubscription,
+  ToolExecutionContext,
   WorkstreamRecord,
 } from './contracts.js';
 
-export const BUNDLED_SKILL_RANK = 600;
+export type { ToolExecutionContext } from './contracts.js';
 
-export interface ToolExecutionContext {
-  agent?: {
-    id?: string;
-    session?: {
-      header?: {
-        cwd?: string;
-        delegationDepth?: number;
-        origin?: string;
-      };
-    };
-  };
-}
+export const BUNDLED_SKILL_RANK = 600;
 
 export interface PosteriorToolDefinition {
   name: string;

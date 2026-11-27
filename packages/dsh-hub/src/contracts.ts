@@ -33,6 +33,244 @@ export type TriageVerdict =
   | 'OBSOLETE_OR_DUPLICATE'
   | 'INFO_ONLY';
 
+export type SessionVaultTier = 0 | 1 | 2 | 3;
+
+export type VaultVisibility = 'external' | 'work' | 'family' | 'owner_private';
+
+export type SessionPrincipalRole = 'owner_session' | 'worker' | 'external_chat' | 'interactive' | 'unknown';
+
+export interface ToolExecutionContext {
+  agent?: {
+    id?: string;
+    session?: {
+      id?: string;
+      header?: {
+        cwd?: string;
+        delegationDepth?: number;
+        origin?: string;
+        parentSession?: string;
+        parentSessionId?: string;
+        rootSessionId?: string;
+      };
+    };
+  };
+}
+
+export interface SessionPrincipal {
+  sessionId: string;
+  role: SessionPrincipalRole;
+  tier: SessionVaultTier;
+  trustLevel: TrustLevel;
+  boundSource?: string | null;
+  boundThreadKey?: string | null;
+  boundDecisionId?: string | null;
+  boundRepo?: string | null;
+  boundRoomKey?: string | null;
+  targetCircle?: VaultVisibility | null;
+}
+
+export interface ResolvedSessionPrincipal {
+  sessionId: string | null;
+  rootSessionId: string | null;
+  role: SessionPrincipalRole;
+  tier: SessionVaultTier;
+  trustLevel: TrustLevel;
+  delegationDepth: number;
+  isSubagent: boolean;
+  tainted: boolean;
+  turnPrivateRead: boolean;
+  allowedCircles: VaultVisibility[];
+  boundSource?: string | null;
+  boundThreadKey?: string | null;
+  boundDecisionId?: string | null;
+  boundRepo?: string | null;
+  boundRoomKey?: string | null;
+  targetCircle?: VaultVisibility | null;
+}
+
+export interface VaultScope {
+  allowedCircles: VaultVisibility[];
+  tier: SessionVaultTier;
+  sessionId: string;
+  rootSessionId: string;
+  role: SessionPrincipalRole;
+  boundSource?: string | null;
+  boundThreadKey?: string | null;
+  boundRepo?: string | null;
+  boundRoomKey?: string | null;
+}
+
+export interface VaultSearchQuery {
+  query: string;
+  sources?: string[];
+  circle?: VaultVisibility;
+  person?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+export interface VaultSearchHit {
+  source: string;
+  itemId: string;
+  circle: VaultVisibility;
+  roomKey?: string;
+  roomName?: string;
+  author?: string;
+  occurredAt: string;
+  snippet: string;
+  score?: number;
+  metadata?: Record<string, unknown>;
+}
+
+export interface VaultContextOptions {
+  before?: number;
+  after?: number;
+}
+
+export interface VaultContextEntry {
+  itemId: string;
+  circle: VaultVisibility;
+  roomKey?: string;
+  roomName?: string;
+  author?: string;
+  occurredAt: string;
+  text: string;
+  isTarget?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface VaultContextResult {
+  source: string;
+  itemId: string;
+  circle: VaultVisibility;
+  roomKey?: string;
+  roomName?: string;
+  items: VaultContextEntry[];
+  truncated?: boolean;
+  metadata?: Record<string, unknown>;
+}
+
+export interface VaultProvider {
+  readonly id: string;
+  readonly label: string;
+  search(
+    query: VaultSearchQuery,
+    scope: VaultScope,
+  ): Promise<VaultSearchHit[]> | VaultSearchHit[];
+  context?(
+    itemId: string,
+    opts: VaultContextOptions,
+    scope: VaultScope,
+  ): Promise<VaultContextResult | null> | VaultContextResult | null;
+}
+
+export interface VaultProviderSummary {
+  id: string;
+  label: string;
+  supportsContext: boolean;
+}
+
+export interface VaultSearchResponse {
+  ok: true;
+  query: string;
+  tier: SessionVaultTier;
+  allowedCircles: VaultVisibility[];
+  tainted: boolean;
+  total: number;
+  hits: VaultSearchHit[];
+  sourcesSearched: string[];
+  providerErrors?: Array<{ source: string; error: string }>;
+}
+
+export interface VaultContextResponse {
+  ok: true;
+  source: string;
+  itemId: string;
+  tier: SessionVaultTier;
+  allowedCircles: VaultVisibility[];
+  tainted: boolean;
+  result: VaultContextResult | null;
+}
+
+export interface VaultService {
+  registerProvider(provider: VaultProvider): () => void;
+  listProviders(): VaultProviderSummary[];
+  search(query: VaultSearchQuery, exec?: ToolExecutionContext): Promise<VaultSearchResponse>;
+  context(
+    source: string,
+    itemId: string,
+    opts?: VaultContextOptions,
+    exec?: ToolExecutionContext,
+  ): Promise<VaultContextResponse>;
+}
+
+export interface TargetDirectoryQuery {
+  source?: string;
+  query?: string;
+  roomKey?: string | null;
+  targetChatId?: string | null;
+  notifyWechatChatId?: string | null;
+  targetSessionId?: string | null;
+  targetName?: string | null;
+}
+
+export interface TargetDirectoryEntry {
+  source: string;
+  targetId: string;
+  roomKey: string;
+  title?: string | null;
+  chatId?: string | null;
+  notifyWechatChatId?: string | null;
+  targetSessionId?: string | null;
+  kind?: string;
+  circle?: VaultVisibility | null;
+  metadata?: Record<string, unknown>;
+}
+
+export interface TargetDirectoryResolution {
+  status: 'matched' | 'not_found' | 'ambiguous';
+  target?: TargetDirectoryEntry;
+  candidates?: TargetDirectoryEntry[];
+  detail?: string;
+}
+
+export interface TargetDirectoryListOptions {
+  source?: string;
+  query?: string;
+  kind?: string;
+  limit?: number;
+}
+
+export interface TargetDirectoryProvider {
+  readonly id?: string;
+  readonly source?: string;
+  resolveTarget(
+    query: TargetDirectoryQuery,
+  ): Promise<TargetDirectoryResolution | null> | TargetDirectoryResolution | null;
+  listTargets(
+    opts?: TargetDirectoryListOptions,
+  ): Promise<TargetDirectoryEntry[]> | TargetDirectoryEntry[];
+}
+
+export type ThreadLifecycleState = 'closed' | 'merged' | 'ended';
+
+export interface ThreadLifecycleEvent {
+  source: string;
+  threadKey: string;
+  entityKey: string | null;
+  state: ThreadLifecycleState;
+  lifecycleOnly: boolean;
+  inboxId: string;
+  event: NormalizedEvent;
+  subscription: ThreadSubscription | null;
+  occurredAt: string;
+}
+
+export type ThreadLifecycleHandler = (
+  lifecycle: ThreadLifecycleEvent,
+) => Promise<void> | void;
+
 export interface GuardContext {
   hook?: 'beforeEnterRoom' | 'beforeSendOut';
   source?: string;
@@ -40,6 +278,7 @@ export interface GuardContext {
   sinkId?: string;
   roomKey?: string;
   sessionId?: string | null;
+  targetCircle?: VaultVisibility | null;
   workstreamId?: string | null;
   event?: NormalizedEvent;
   target?: Record<string, unknown>;
@@ -52,6 +291,10 @@ export interface GuardDecision {
   reason?: string;
   code?: string;
   guardName?: string;
+  stageOnly?: boolean;
+  tainted?: boolean;
+  publicTaintWarning?: boolean;
+  warningText?: string;
   metadata?: Record<string, unknown>;
 }
 
@@ -66,6 +309,10 @@ export interface DoorGuard {
   beforeSendOut(ctx?: GuardContext): Promise<GuardDecision>;
   registerGuard(hook: GuardHook): () => void;
   listGuards(): string[];
+  setSessionTaintChecker?(checker: ((sessionId: string) => boolean) | null): void;
+  setSessionTargetCircleResolver?(
+    resolver: ((sessionId: string) => VaultVisibility | null | undefined) | null,
+  ): void;
 }
 
 export interface NormalizedEvent {
@@ -156,7 +403,7 @@ export interface IngestResult {
   accepted: boolean;
   deduped?: boolean;
   inboxId?: string;
-  routedVia?: 'subscription' | 'router' | 'rule' | 'inbox';
+  routedVia?: 'subscription' | 'router' | 'rule' | 'inbox' | 'lifecycle';
 }
 
 export interface ResolvedEntityContext {
@@ -183,6 +430,7 @@ export interface SinkInvokeInput {
   payload: Record<string, unknown>;
   idempotencyKey: string;
   sessionId?: string;
+  targetCircle?: VaultVisibility;
   stageOnly?: boolean;
   approved?: boolean;
 }
@@ -193,6 +441,9 @@ export interface SinkInvokeResult {
   draftId?: string;
   externalUrl?: string;
   detail?: string;
+  stageOnlyForced?: boolean;
+  publicTaintWarning?: boolean;
+  warningText?: string;
 }
 
 export interface ActionSink {
@@ -440,6 +691,19 @@ export interface PersonaWardrobe {
   importFromWxarcSqlite?(sqlitePath: string): WxarcImportResult;
   sampleInfo?(): unknown;
   importFoundation?(bundle: unknown, sources?: unknown): unknown;
+  resolveVaultVisibility?(roomKey: string): VaultVisibility;
+  searchVaultKnowledge?(query: {
+    query: string;
+    allowedCircles: ReadonlyArray<VaultVisibility>;
+    person?: string;
+    since?: string;
+    until?: string;
+    limit?: number;
+  }): Promise<VaultSearchHit[]> | VaultSearchHit[];
+  getVaultKnowledgeContext?(
+    itemId: string,
+    opts?: VaultContextOptions & { allowedCircles?: ReadonlyArray<VaultVisibility> },
+  ): Promise<unknown> | unknown;
 }
 
 export interface WechatSendInput {
@@ -513,6 +777,12 @@ export interface AdminWechatMessage {
   quotedText?: string;
   seq?: number;
   timestamp?: number;
+  sourceKey?: string;
+  localType?: number;
+  imagePath?: string;
+  voiceTranscript?: string;
+  articleSummary?: string;
+  mediaPaths?: string[];
 }
 
 export interface AdminWechatHandleResult {
@@ -736,6 +1006,7 @@ export interface HubStatus {
   pendingDrafts: number;
   autoSessionsThisHour: number;
   configRevision: number;
+  vaultProviders?: number;
 }
 
 export interface HubService {
@@ -743,6 +1014,7 @@ export interface HubService {
   readonly wardrobe?: PersonaWardrobe | null;
   readonly guard: DoorGuard;
   readonly db: WatcherDb;
+  readonly vault?: VaultService;
 
   getWardrobe(): PersonaWardrobe | null;
 
@@ -755,6 +1027,24 @@ export interface HubService {
   listSubscriptions(filter?: { source?: string; status?: string }): ThreadSubscription[];
 
   onUnclaimedEvent(handler: UnclaimedEventHandler): () => void;
+  onThreadLifecycle?(handler: ThreadLifecycleHandler): () => void;
+
+  registerVaultProvider?(provider: VaultProvider): () => void;
+
+  registerSessionPrincipal?(principal: SessionPrincipal): () => void;
+  getSessionPrincipal?(sessionId: string): SessionPrincipal | null;
+  setSessionTurnOverride?(sessionId: string, tier: SessionVaultTier, ttlMs?: number): void;
+  clearSessionTurnOverride?(sessionId: string): void;
+  markSessionTainted?(sessionId: string, reason?: string): void;
+  isSessionTainted?(sessionId: string): boolean;
+  markTurnPrivateRead?(sessionId: string): void;
+  clearTurnPrivateRead?(sessionId: string): void;
+  isTurnPrivateRead?(sessionId: string): boolean;
+  resolveSessionPrincipal?(exec?: ToolExecutionContext): ResolvedSessionPrincipal;
+
+  registerTargetDirectory?(provider: TargetDirectoryProvider): () => void;
+  resolveTarget?(query: TargetDirectoryQuery): Promise<TargetDirectoryResolution>;
+  listTargets?(opts?: TargetDirectoryListOptions): Promise<TargetDirectoryEntry[]>;
 
   registerSource(source: WatchSource): () => void;
   registerResolver(resolver: EntityResolver): () => void;
@@ -783,6 +1073,7 @@ export type WatcherService = HubService;
 export interface CordisHubContext {
   hub: HubService;
   watcher: HubService;
+  vault?: VaultService;
   personaWardrobe?: PersonaWardrobe;
 }
 
