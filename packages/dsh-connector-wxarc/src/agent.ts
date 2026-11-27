@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
-import { adminPrincipal, workspaceKey } from './admin.js';
+import type { HubService } from '@local/dsh-hub/contracts';
+import { adminPrincipal, resolveOwnerId, workspaceKey } from './admin.js';
 import type { AdminEventLike, AdminPolicyLike } from './admin.js';
 import { decisionPrompt, parseReply } from './ai.js';
 import type { WechatApprovals } from './approvals.js';
@@ -190,6 +191,8 @@ export interface AgentBridgeOptions {
     signal: AbortSignal,
   ) => Promise<{ tags: string[] } | null>;
   approvals?: WechatApprovals;
+  hub?: Pick<HubService, 'registerSessionPrincipal'>;
+  isRouterManagedAdmin?: () => boolean;
   settings: () => {
     revision?: number;
     policy: AdminPolicyLike & Record<string, any>;
@@ -282,7 +285,7 @@ function conversationEnvelope(
     policy: {
       ownId: policy.ownId,
       personaId: policy.personaId,
-      controllerId: policy.controllerId,
+      controllerId: resolveOwnerId(policy),
       instructions: policy.instructions,
     },
     event: minimalAdminEvent(event),
@@ -330,9 +333,12 @@ export class AgentBridge {
   extractVisualTags?: AgentBridgeOptions['extractVisualTags'];
   optionalNasVisionTags?: AgentBridgeOptions['optionalNasVisionTags'];
   approvals?: WechatApprovals;
+  hub?: Pick<HubService, 'registerSessionPrincipal'>;
+  isRouterManagedAdmin?: () => boolean;
   settings: AgentBridgeOptions['settings'];
   closed: boolean;
   disposers: Array<() => void>;
+  sessionPrincipalDisposers: Map<string, () => void>;
   creation: Map<string, Promise<AgentConversationRow>>;
   draining: Set<Promise<void>>;
   starting: Set<string>;
@@ -349,6 +355,8 @@ export class AgentBridge {
       extractVisualTags,
       optionalNasVisionTags,
       approvals,
+      hub,
+      isRouterManagedAdmin,
       settings,
     }: AgentBridgeOptions,
   ) {
@@ -361,9 +369,12 @@ export class AgentBridge {
     this.extractVisualTags = extractVisualTags;
     this.optionalNasVisionTags = optionalNasVisionTags;
     this.approvals = approvals;
+    this.hub = hub;
+    this.isRouterManagedAdmin = isRouterManagedAdmin;
     this.settings = settings;
     this.closed = false;
     this.disposers = [];
+    this.sessionPrincipalDisposers = new Map();
     this.creation = new Map();
     this.draining = new Set();
     this.starting = new Set();
@@ -409,6 +420,7 @@ export class AgentBridge {
           return;
         }
         this.syncAdmin(agent, row);
+        this.syncExternalSessionPrincipal(row);
         if (this.interrupted.delete(agent.id)) {
           agent.inbox.clear();
           agent.cancel({
@@ -537,6 +549,90 @@ export class AgentBridge {
         },
       ),
     );
+    if (this.hub) {
+      this.syncAllExternalSessionPrincipals();
+    }
+  }
+
+  setHub(hub?: Pick<HubService, 'registerSessionPrincipal'>): void {
+    this.clearExternalSessionPrincipals();
+    this.hub = hub;
+    if (hub) {
+      this.syncAllExternalSessionPrincipals();
+    }
+  }
+
+  setRouterManagedAdmin(fn?: () => boolean): void {
+    this.isRouterManagedAdmin = fn;
+  }
+
+  private clearExternalSessionPrincipals(): void {
+    for (const dispose of this.sessionPrincipalDisposers.values()) {
+      try {
+        dispose();
+      } catch {
+        void 0;
+      }
+    }
+    this.sessionPrincipalDisposers.clear();
+  }
+
+  private extractRowChatId(row: AgentConversationRow): string | null {
+    try {
+      const parsed = JSON.parse(row.context) as {
+        event?: { session?: string; user_name?: string };
+      };
+      const chatId = (parsed.event?.session || parsed.event?.user_name || '').trim();
+      return chatId || null;
+    } catch {
+      return null;
+    }
+  }
+
+  syncExternalSessionPrincipal(row: AgentConversationRow): void {
+    if (!this.hub?.registerSessionPrincipal) {
+      return;
+    }
+    const existingDispose = this.sessionPrincipalDisposers.get(row.session_id);
+    if (this.trusted(row)) {
+      if (existingDispose) {
+        try {
+          existingDispose();
+        } catch {
+          void 0;
+        }
+        this.sessionPrincipalDisposers.delete(row.session_id);
+      }
+      return;
+    }
+    if (existingDispose) {
+      try {
+        existingDispose();
+      } catch {
+        void 0;
+      }
+    }
+    const chatId = this.extractRowChatId(row);
+    const dispose = this.hub.registerSessionPrincipal({
+      sessionId: row.session_id,
+      role: 'external_chat',
+      tier: 0,
+      trustLevel: 'untrusted',
+      boundRoomKey: chatId,
+    });
+    this.sessionPrincipalDisposers.set(row.session_id, dispose);
+  }
+
+  syncAllExternalSessionPrincipals(): void {
+    if (!this.hub?.registerSessionPrincipal) {
+      return;
+    }
+    const rows = this.store.db
+      .prepare('SELECT * FROM dsh_conversations')
+      .all() as unknown as AgentConversationRow[];
+    for (const row of rows) {
+      this.syncExternalSessionPrincipal(row);
+    }
   }
 
   delegationDepthOf(agent: DshAgentLike | undefined): number {
@@ -741,6 +837,9 @@ export class AgentBridge {
   }
 
   trusted(row: AgentConversationRow): string | null {
+    if (this.isRouterManagedAdmin?.()) {
+      return null;
+    }
     const c = JSON.parse(row.context) as {
       policy: AdminPolicyLike & Record<string, any>;
       event: AdminEventLike;
@@ -790,6 +889,7 @@ export class AgentBridge {
       if (a) {
         this.syncAdmin(a, row);
       }
+      this.syncExternalSessionPrincipal(row);
     }
   }
 
@@ -797,18 +897,47 @@ export class AgentBridge {
     const rows = this.store.db
       .prepare('SELECT * FROM dsh_conversations')
       .all() as unknown as AgentConversationRow[];
+    const seenSessionIds = new Set<string>();
     for (const row of rows) {
-      if (
-        !this.trusted(row) &&
-        !this.store.db
+      seenSessionIds.add(row.session_id);
+      const isLegacyAdmin = Boolean(
+        this.store.db
           .prepare('SELECT 1 FROM wxarc_admin_sessions WHERE session_id=?')
-          .get(row.session_id)
-      ) {
+          .get(row.session_id),
+      );
+      if (!this.trusted(row) && !isLegacyAdmin) {
+        this.syncExternalSessionPrincipal(row);
         continue;
       }
       const result = await this.ctx.sessionController.resolveAgent(row.session_id);
       if (result.agent) {
         this.syncAdmin(result.agent, row);
+      } else if (isLegacyAdmin && !this.trusted(row) && result.error?.code === 'session/not-found') {
+        this.store.db
+          .prepare('DELETE FROM wxarc_admin_sessions WHERE session_id=?')
+          .run(row.session_id);
+      }
+      this.syncExternalSessionPrincipal(row);
+    }
+    const orphanAdmins = this.store.db
+      .prepare('SELECT session_id FROM wxarc_admin_sessions')
+      .all() as unknown as Array<{ session_id: string }>;
+    for (const entry of orphanAdmins) {
+      if (seenSessionIds.has(entry.session_id)) {
+        continue;
+      }
+      if (!this.isRouterManagedAdmin?.()) {
+        continue;
+      }
+      const result = await this.ctx.sessionController.resolveAgent(entry.session_id);
+      if (result.agent) {
+        this.ctx.permissionPresets.set(result.agent.session, 'workspace-write');
+        this.ctx.approval.setPolicy(result.agent, 'ask');
+      }
+      if (result.agent || result.error?.code === 'session/not-found') {
+        this.store.db
+          .prepare('DELETE FROM wxarc_admin_sessions WHERE session_id=?')
+          .run(entry.session_id);
       }
     }
   }
@@ -1120,6 +1249,7 @@ export class AgentBridge {
       throw new Error('DSH 会话未能启动');
     }
     this.syncAdmin(result.agent, row);
+    this.syncExternalSessionPrincipal(row);
     await this.ctx.workspaceRegistry
       .get(workspace.workspace.workspaceId)
       .attachSession(row.session_id);
@@ -1746,6 +1876,7 @@ export class AgentBridge {
       ...owned.map((r) => this.ctx.agents.get(r.session_id)?.whenIdle()),
     ]);
     this.closed = true;
+    this.clearExternalSessionPrincipals();
     for (const dispose of this.disposers.reverse()) {
       dispose();
     }

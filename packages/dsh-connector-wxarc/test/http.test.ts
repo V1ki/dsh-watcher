@@ -136,13 +136,13 @@ test('mounted plugin exposes read-only HTTP and tools, reports unavailable sourc
         'wxarc_nas_search',
       ],
     );
-    assert.equal(
-      (await definitions.find((d) => d.name === 'wxarc_status')!.execute({})).automaticAI,
-      false,
+    await assert.rejects(
+      () => definitions.find((d) => d.name === 'wxarc_status')!.execute({}),
+      /NAS_SEARCH_FORBIDDEN|OWNER_TOOL_FORBIDDEN|仅允许/,
     );
-    assert.deepEqual(
-      (await definitions.find((d) => d.name === 'wxarc_messages')!.execute({})).events,
-      [],
+    await assert.rejects(
+      () => definitions.find((d) => d.name === 'wxarc_messages')!.execute({}),
+      /NAS_SEARCH_FORBIDDEN|OWNER_TOOL_FORBIDDEN|仅允许/,
     );
     const rendered = definitions
       .find((d) => d.name === 'wxarc_sticker_search')!

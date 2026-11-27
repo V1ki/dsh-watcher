@@ -18,7 +18,22 @@ export interface AdminEventLike {
 export interface AdminPolicyLike {
   ownId?: string;
   personaId?: string;
+  controllerId?: string;
   adminIds?: string[];
+}
+
+export function resolveOwnerId(policy: AdminPolicyLike | null | undefined): string {
+  const controller = typeof policy?.controllerId === 'string' ? policy.controllerId.trim() : '';
+  if (controller) {
+    return controller;
+  }
+  if (Array.isArray(policy?.adminIds)) {
+    const first = policy.adminIds.find((item) => typeof item === 'string' && item.trim().length > 0);
+    if (first) {
+      return first.trim();
+    }
+  }
+  return '';
 }
 
 export function adminPrincipal(
@@ -26,10 +41,12 @@ export function adminPrincipal(
   policy: AdminPolicyLike,
 ): string | null {
   const id = event?.senderId;
+  const ownerId = resolveOwnerId(policy);
   if (
     !id ||
+    !ownerId ||
     event?.kind !== 'text' ||
-    !policy.adminIds?.includes(id) ||
+    id !== ownerId ||
     !event.session ||
     event.session !== id ||
     event.session.endsWith('@chatroom')
@@ -67,11 +84,13 @@ export function workspaceKey(event: AdminEventLike, policy: AdminPolicyLike): st
     event.kind === 'sns' ? event.user_name : event.session,
     policy.personaId,
   ];
+  const ownerId = resolveOwnerId(policy);
   if (
     event.kind === 'text' &&
     !event.session?.endsWith('@chatroom') &&
     event.session &&
-    policy.adminIds?.includes(event.session) &&
+    ownerId &&
+    event.session === ownerId &&
     !adminPrincipal(event, policy)
   ) {
     parts.push('unverified');

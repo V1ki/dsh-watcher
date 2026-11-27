@@ -1,5 +1,6 @@
 import { randomBytes } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
+import { resolveOwnerId } from './admin.js';
 
 export interface ApprovalStoreLike {
   db: DatabaseSync;
@@ -9,6 +10,7 @@ export interface ApprovalSettingsSnapshot {
   revision?: number;
   policy: {
     controllerId?: string;
+    adminIds?: string[];
   };
 }
 
@@ -194,7 +196,7 @@ export class WechatApprovals {
       !op?.taskEligible ||
       run.manual ||
       run.preview ||
-      grant.owner !== settings.policy.controllerId ||
+      grant.owner !== resolveOwnerId(settings.policy) ||
       grant.revision !== settings.revision ||
       grant.session !== exec.agent.id ||
       grant.expires <= Date.now()
@@ -225,7 +227,7 @@ export class WechatApprovals {
     if (this.forwarded.has(req)) {
       return next();
     }
-    const owner = this.settings().policy.controllerId;
+    const owner = resolveOwnerId(this.settings().policy);
     const operation = this.executions.get(`${req.agent.id}:${req.callId}`);
     if (!owner || !run || run.preview || run.manual || !operation) {
       return next();
@@ -297,7 +299,7 @@ export class WechatApprovals {
         let outcome = initialOutcome;
         const cfg = this.settings();
         if (
-          cfg.policy.controllerId !== owner ||
+          resolveOwnerId(cfg.policy) !== owner ||
           (outcome === 'allowed-task' && !operation.taskEligible)
         ) {
           outcome = 'cancelled';
@@ -417,7 +419,7 @@ export class WechatApprovals {
     ) {
       throw new Error('此次操作确认已失效');
     }
-    if (row.owner_id !== this.settings().policy.controllerId) {
+    if (row.owner_id !== resolveOwnerId(this.settings().policy)) {
       throw Error('审批人已改变');
     }
     if (outcome === 'allowed-task' && !row.task_eligible) {
@@ -440,7 +442,7 @@ export class WechatApprovals {
   }
 
   consume(event: ApprovalConsumeEventLike): boolean {
-    const owner = this.settings().policy.controllerId;
+    const owner = resolveOwnerId(this.settings().policy);
     if (
       !owner ||
       event.kind !== 'text' ||

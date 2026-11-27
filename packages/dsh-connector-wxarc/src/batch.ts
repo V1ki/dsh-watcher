@@ -1,4 +1,5 @@
 import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import { resolveOwnerId } from './admin.js';
 import { replyMessages, replyTargetContext } from './reply-target.js';
 import { messageBody, isQuote } from './core.js';
 import type { WxarcEvent } from './core.js';
@@ -10,6 +11,7 @@ export interface BatchPolicy {
   ownId?: string;
   personaId?: string;
   controllerId?: string;
+  adminIds?: string[];
   debounceMs: number;
   debounceMaxMessages: number;
 }
@@ -200,6 +202,7 @@ export class ChatBatches {
   pending(job: BatchJob): BatchJob[] {
     if (!this.enabled(job.event)) return [];
     const p = this.auto.settings().policy;
+    const ownerId = resolveOwnerId(p);
     const authors = new Set(messagesOf(job.event).map((e) => e.senderId));
     return this.queued(job.event).filter((j) => {
       const e: WxarcEvent = { ...j.event, botNames: j.event.botNames || job.event.botNames };
@@ -209,7 +212,7 @@ export class ChatBatches {
       return (
         authors.has(e.senderId) ||
         addressed ||
-        Boolean(command(e) && e.senderId === p.controllerId)
+        Boolean(command(e) && ownerId && e.senderId === ownerId)
       );
     });
   }
@@ -218,10 +221,12 @@ export class ChatBatches {
     if (!this.enabled(job.event)) return false;
     const ids = new Set(messagesOf(job.event).map((e) => e.senderId));
     const p = this.auto.settings().policy;
+    const ownerId = resolveOwnerId(p);
     const row = this.pending(job).find(
       (j) =>
         command(j.event) &&
-        ((ids.size === 1 && ids.has(j.event.senderId)) || j.event.senderId === p.controllerId),
+        ((ids.size === 1 && ids.has(j.event.senderId)) ||
+          Boolean(ownerId && j.event.senderId === ownerId)),
     );
     if (!row) return false;
     const action = command(row.event);
@@ -306,12 +311,13 @@ export class ChatBatches {
     const state = this.state(event);
     const group = Boolean(event.session?.endsWith('@chatroom'));
     this.auto.assertCurrent(anchor, signal);
+    const ownerId = resolveOwnerId(p);
     const addressed = messages.some((e) => explicitAddress(e, p));
     const control = messages.find(
       (e) =>
         command(e) &&
         (explicitAddress(e, p) ||
-          e.senderId === p.controllerId ||
+          Boolean(ownerId && e.senderId === ownerId) ||
           (state.last_sender === e.senderId && this.auto.now() - state.last_reply_at < 120000)),
     );
     let skip = '';

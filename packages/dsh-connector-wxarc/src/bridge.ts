@@ -1,5 +1,6 @@
 import { timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { resolveOwnerId } from './admin.js';
 import type {
   Automation,
   MemoNudgeQueueInput,
@@ -144,7 +145,7 @@ export class WxarcBridge {
     }
     const policy = this.automation.settings().policy;
     const ownId = (policy.ownId || '').trim();
-    const controllerId = (policy.controllerId || '').trim();
+    const controllerId = resolveOwnerId(policy);
     const { queueDepth, activeDeliveryId } = this.automation.proactiveStatus();
     return {
       ok: true,

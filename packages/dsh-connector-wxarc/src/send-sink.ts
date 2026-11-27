@@ -5,6 +5,7 @@ import type {
   HubService,
   SinkInvokeInput,
   SinkInvokeResult,
+  VaultVisibility,
   WatcherDb,
   WatcherService,
   WechatSendResult,
@@ -21,6 +22,8 @@ export interface WechatSendSinkConfig {
   defaultNotifyTarget?: string;
   allowedTargets?: string[];
   requireApprovalByDefault?: boolean;
+  controllerId?: string;
+  resolveTargetCircle?: (chatId: string) => VaultVisibility | null | undefined;
 }
 
 export type DbHandle = WatcherDb | DatabaseSync | null | undefined;
@@ -41,10 +44,14 @@ export interface ToolExecutionContext {
   agent?: {
     id?: string;
     session?: {
+      id?: string;
       header?: {
         cwd?: string;
         delegationDepth?: number;
         origin?: string;
+        parentSession?: string;
+        parentSessionId?: string;
+        rootSessionId?: string;
       };
     };
   };
@@ -64,9 +71,12 @@ export interface ToolsRegistryLike {
   register?: (def: WechatToolDefinition) => (() => void) | void;
 }
 
+export type WechatToolHubLike = Pick<HubService, 'invokeSink'> &
+  Partial<Pick<HubService, 'resolveSessionPrincipal' | 'isSessionTainted' | 'guard'>>;
+
 export interface WechatToolContextLike {
-  hub?: Pick<HubService, 'invokeSink'>;
-  watcher?: Pick<WatcherService, 'invokeSink'>;
+  hub?: WechatToolHubLike;
+  watcher?: WechatToolHubLike | Pick<WatcherService, 'invokeSink'>;
   get?: (serviceName: string) => unknown;
   tools?: ToolsRegistryLike;
 }
@@ -456,10 +466,69 @@ export function registerWechatSendTool(
     },
     execute: async (args, exec) => {
       const { sessionId } = assertRootSessionCaller(exec);
+      const service = (ctx.hub ?? ctx.watcher) as WechatToolHubLike | undefined;
+      if (!service) {
+        return { status: 'failed', detail: 'Hub service unavailable for wxarc.send' };
+      }
+
+      const principal =
+        typeof service.resolveSessionPrincipal === 'function'
+          ? service.resolveSessionPrincipal(exec)
+          : null;
+      if (principal) {
+        if (
+          !principal.sessionId ||
+          principal.tier !== 3 ||
+          principal.delegationDepth !== 0 ||
+          principal.isSubagent
+        ) {
+          throw new Error(
+            'wxarc_proactive_send requires a verified tier-3 root session (delegationDepth=0).',
+          );
+        }
+      }
+
+      const effectiveSessionId = principal?.rootSessionId || sessionId;
       const chatId = String(args.chatId || config.defaultNotifyTarget || '').trim();
       const text = args.text as string | string[];
       const reason = typeof args.reason === 'string' ? args.reason : undefined;
-      const stageOnly = args.stageOnly === true ? true : undefined;
+      let stageOnly: boolean | undefined = args.stageOnly === true ? true : undefined;
+
+      const isTainted = Boolean(
+        principal?.tainted ||
+          service.isSessionTainted?.(sessionId) ||
+          (effectiveSessionId !== sessionId && service.isSessionTainted?.(effectiveSessionId)),
+      );
+      const isGroupTarget = chatId.endsWith('@chatroom');
+      const boundRoomKey = principal?.boundRoomKey || null;
+      const isCrossRoom =
+        isGroupTarget ||
+        Boolean(boundRoomKey && boundRoomKey !== chatId && boundRoomKey !== `wechat:${chatId}`);
+      const targetCircle =
+        config.resolveTargetCircle?.(chatId) ?? (isGroupTarget ? 'external' : undefined);
+
+      if (service.guard?.beforeSendOut) {
+        const gate = await service.guard.beforeSendOut({
+          hook: 'beforeSendOut',
+          sinkId,
+          action: 'send',
+          sessionId: effectiveSessionId,
+          targetCircle: targetCircle ?? null,
+          target: { chatId },
+          payload: { text, reason },
+        });
+        if (!gate.allow) {
+          return { status: 'skipped', detail: gate.reason ?? 'blocked_by_guard' };
+        }
+        if (gate.stageOnly === true) {
+          stageOnly = true;
+        }
+      }
+
+      if (isTainted || isCrossRoom) {
+        stageOnly = true;
+      }
+
       const idempotencyKey =
         typeof args.idempotencyKey === 'string' && args.idempotencyKey.trim()
           ? args.idempotencyKey.trim()
@@ -472,13 +541,10 @@ export function registerWechatSendTool(
         payload: { text, reason },
         previewText: `[WeChat -> ${chatId}] ${previewBody.slice(0, 120)}`,
         idempotencyKey,
-        sessionId,
+        sessionId: effectiveSessionId,
+        ...(targetCircle ? { targetCircle } : {}),
         stageOnly,
       };
-      const service = ctx.hub ?? ctx.watcher;
-      if (!service) {
-        return { status: 'failed', detail: 'Hub service unavailable for wxarc.send' };
-      }
       return service.invokeSink(sinkId, invokeInput);
     },
   });

@@ -3,9 +3,11 @@ import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { WxarcBridgeHttpError, WxarcBridgeSecurityError, type FetchLike, type FetchResponseLike } from './transport.js';
 
-export const DEFAULT_NAS_ARCHIVE_URL = 'http://192.168.2.177:28787';
+export const DEFAULT_NAS_ARCHIVE_URL = '';
 export const DEFAULT_NAS_SEARCH_LIMIT = 15;
 export const MAX_NAS_SEARCH_LIMIT = 20;
+const DEFAULT_NAS_CONTEXT_WINDOW = 5;
+const MAX_NAS_CONTEXT_WINDOW = 15;
 const MAX_NAS_RESPONSE_BYTES = 4 * 1024 * 1024;
 const MAX_ITEM_TEXT_CHARS = 500;
 const DEFAULT_NAS_TIMEOUT_MS = 12_000;
@@ -58,6 +60,24 @@ export interface NasSearchOptions {
   archivePath?: string;
   fetcher?: FetchLike;
   timeoutMs?: number;
+}
+
+export interface NasContextInput {
+  session: string;
+  itemId?: string | number;
+  ts?: number;
+  before?: number;
+  after?: number;
+}
+
+export interface NasContextEntry extends NasSearchItem {
+  isTarget?: boolean;
+}
+
+export interface NasContextResult {
+  session: string;
+  sessionName?: string;
+  items: NasContextEntry[];
 }
 
 export function validateNasArchiveUrl(rawUrl: string): string {
@@ -576,4 +596,245 @@ export async function searchNasArchive(
     truncated: filtered.length > limit || normalized.length > limit,
     items,
   };
+}
+
+function clampContextWindow(raw: unknown): number {
+  const num = Number(raw);
+  if (!Number.isFinite(num) || num < 0) {
+    return DEFAULT_NAS_CONTEXT_WINDOW;
+  }
+  return Math.max(0, Math.min(MAX_NAS_CONTEXT_WINDOW, Math.floor(num)));
+}
+
+function sliceContextItems(
+  ordered: NasSearchItem[],
+  targetId: string,
+  targetTs: number | undefined,
+  before: number,
+  after: number,
+  session: string,
+): NasContextResult | null {
+  if (ordered.length === 0) {
+    return null;
+  }
+  let targetIndex = -1;
+  if (targetId) {
+    targetIndex = ordered.findIndex(
+      (item) => item.id !== undefined && String(item.id) === targetId,
+    );
+  }
+  if (targetIndex < 0 && typeof targetTs === 'number' && Number.isFinite(targetTs)) {
+    targetIndex = ordered.findIndex((item) => item.ts === targetTs);
+  }
+  if (targetIndex < 0) {
+    return null;
+  }
+  const start = Math.max(0, targetIndex - before);
+  const end = Math.min(ordered.length, targetIndex + after + 1);
+  const windowItems: NasContextEntry[] = ordered.slice(start, end).map((item, offset) => ({
+    ...item,
+    isTarget: start + offset === targetIndex,
+  }));
+  const sessionName =
+    windowItems.find((item) => item.sessionName)?.sessionName ||
+    ordered.find((item) => item.sessionName)?.sessionName;
+  return {
+    session,
+    ...(sessionName ? { sessionName } : {}),
+    items: windowItems,
+  };
+}
+
+function readLocalArchiveContext(
+  archivePath: string,
+  session: string,
+  targetId: string,
+  targetTs: number | undefined,
+  before: number,
+  after: number,
+): NasContextResult | null {
+  if (!existsSync(archivePath)) {
+    return null;
+  }
+  let targetPath = archivePath;
+  const st = statSync(targetPath);
+  if (st.isDirectory()) {
+    const appDb = join(targetPath, 'app-state', 'app.db');
+    if (existsSync(appDb) && statSync(appDb).isFile()) {
+      targetPath = appDb;
+    } else {
+      return null;
+    }
+  } else if (!st.isFile()) {
+    return null;
+  }
+
+  if (targetPath.endsWith('.jsonl') || targetPath.endsWith('.json')) {
+    const raw = readFileSync(targetPath, 'utf8');
+    const parsedRows: unknown[] = [];
+    if (targetPath.endsWith('.json')) {
+      const obj = JSON.parse(raw) as unknown;
+      if (Array.isArray(obj)) {
+        parsedRows.push(...obj);
+      } else if (obj && typeof obj === 'object' && Array.isArray((obj as { items?: unknown[] }).items)) {
+        parsedRows.push(...(obj as { items: unknown[] }).items);
+      }
+    } else {
+      for (const line of raw.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          parsedRows.push(JSON.parse(trimmed));
+        } catch {
+          void 0;
+        }
+      }
+    }
+    const ordered = parsedRows
+      .map(normalizeNasItem)
+      .filter((x): x is NasSearchItem => x !== null && (x.session || '') === session)
+      .sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+    return sliceContextItems(ordered, targetId, targetTs, before, after, session);
+  }
+
+  const db = new DatabaseSync(targetPath, { readOnly: true });
+  try {
+    const tables = (
+      db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all() as unknown as Array<{
+        name: string;
+      }>
+    ).map((r) => r.name);
+
+    const ordered: NasSearchItem[] = [];
+    if (tables.includes('messages')) {
+      const colNames = new Set(
+        (db.prepare('PRAGMA table_info(messages)').all() as unknown as Array<{ name: string }>).map(
+          (c) => c.name,
+        ),
+      );
+      const hasNamesTable = tables.includes('names');
+      let rows: Array<Record<string, unknown>>;
+      if (colNames.has('session_name') && colNames.has('sender_id')) {
+        rows = db
+          .prepare(
+            'SELECT id, session, session_name, sender, sender_id, text, ts FROM messages WHERE session = ? ORDER BY ts ASC, id ASC',
+          )
+          .all(session) as unknown as Array<Record<string, unknown>>;
+      } else if (hasNamesTable) {
+        rows = db
+          .prepare(
+            "SELECT m.id, m.session, COALESCE(ns.name, '') AS session_name, COALESCE(nu.name, m.sender) AS sender_name, m.sender, m.text, m.ts FROM messages m LEFT JOIN names ns ON ns.username = m.session LEFT JOIN names nu ON nu.username = m.sender WHERE m.session = ? ORDER BY m.ts ASC, m.id ASC",
+          )
+          .all(session) as unknown as Array<Record<string, unknown>>;
+      } else {
+        rows = db
+          .prepare(
+            'SELECT id, session, sender, text, ts FROM messages WHERE session = ? ORDER BY ts ASC, id ASC',
+          )
+          .all(session) as unknown as Array<Record<string, unknown>>;
+      }
+      for (const row of rows) {
+        const item = normalizeNasItem(row);
+        if (item) ordered.push(item);
+      }
+    } else if (tables.includes('events')) {
+      const rows = db
+        .prepare(
+          "SELECT event_id AS id, payload FROM events WHERE kind='text' AND json_extract(payload,'$.session')=? ORDER BY seq ASC",
+        )
+        .all(session) as unknown as Array<{ id: number; payload: string }>;
+      for (const row of rows) {
+        try {
+          const parsed = JSON.parse(row.payload) as Record<string, unknown>;
+          const item = normalizeNasItem({ id: row.id, ...parsed });
+          if (item) ordered.push(item);
+        } catch {
+          void 0;
+        }
+      }
+    } else {
+      return null;
+    }
+
+    return sliceContextItems(ordered, targetId, targetTs, before, after, session);
+  } finally {
+    db.close();
+  }
+}
+
+export async function getNasArchiveContext(
+  input: NasContextInput,
+  options: NasSearchOptions = {},
+  signal?: AbortSignal,
+): Promise<NasContextResult | null> {
+  const session = typeof input.session === 'string' ? input.session.trim() : '';
+  if (!session) {
+    return null;
+  }
+  const targetId =
+    input.itemId !== undefined && input.itemId !== null ? String(input.itemId).trim() : '';
+  const targetTs =
+    typeof input.ts === 'number' && Number.isFinite(input.ts) ? Math.floor(input.ts) : undefined;
+  const before = clampContextWindow(input.before);
+  const after = clampContextWindow(input.after);
+
+  const trimmedArchivePath = options.archivePath?.trim() || '';
+  const passwordFile = trimmedArchivePath ? resolveNasPasswordFile(trimmedArchivePath) : null;
+
+  if (trimmedArchivePath && !passwordFile) {
+    return readLocalArchiveContext(trimmedArchivePath, session, targetId, targetTs, before, after);
+  }
+
+  const baseUrl = validateNasArchiveUrl(options.baseUrl ?? DEFAULT_NAS_ARCHIVE_URL);
+  const fetcher = options.fetcher ?? (globalThis.fetch as unknown as FetchLike);
+  const timeoutMs = Math.max(1000, Number(options.timeoutMs) || DEFAULT_NAS_TIMEOUT_MS);
+
+  let cookieHeader: string | undefined;
+  if (passwordFile) {
+    const password = readNasPassword(passwordFile);
+    cookieHeader = await loginNasSession(baseUrl, password, fetcher, timeoutMs, signal);
+  }
+
+  const params = new URLSearchParams();
+  params.set('session', session);
+  params.set('limit', String(Math.min(100, Math.max(30, (before + after + 1) * 4))));
+  if (targetId) {
+    params.set('around_id', targetId);
+  }
+  if (before > 0) {
+    params.set('before', String(before));
+  }
+  if (after > 0) {
+    params.set('after', String(after));
+  }
+
+  let rawPayload: unknown;
+  try {
+    rawPayload = await fetchNasJson(
+      `${baseUrl}/api/messages?${params.toString()}`,
+      fetcher,
+      timeoutMs,
+      signal,
+      cookieHeader,
+    );
+  } catch (err) {
+    if (err instanceof WxarcBridgeHttpError && err.statusCode === 404) {
+      rawPayload = await fetchNasJson(
+        `${baseUrl}/api/search?${params.toString()}`,
+        fetcher,
+        timeoutMs,
+        signal,
+        cookieHeader,
+      );
+    } else {
+      throw err;
+    }
+  }
+
+  const ordered = extractResponseArray(rawPayload)
+    .map(normalizeNasItem)
+    .filter((item): item is NasSearchItem => item !== null && (!item.session || item.session === session))
+    .sort((a, b) => (a.ts ?? 0) - (b.ts ?? 0));
+
+  return sliceContextItems(ordered, targetId, targetTs, before, after, session);
 }

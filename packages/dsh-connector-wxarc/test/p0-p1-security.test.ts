@@ -9,6 +9,7 @@ import { Automation } from '../src/automation.js';
 import { Store } from '../src/core.js';
 import { computeIncludeOwnerMemory, resolvePersonas } from '../src/index.js';
 import {
+  DEFAULT_NAS_ARCHIVE_URL,
   MAX_NAS_SEARCH_LIMIT,
   UNTRUSTED_NAS_MATERIAL_WARNING,
   assertNasSearchAuthorized,
@@ -568,14 +569,19 @@ test('P1: wxarc_targets resolves unique rooms and rejects missing, ambiguous, or
   assert.equal(memoMatched.target?.targetSessionId, 'sess-family-1');
 });
 
-test('P1 Track A: wxarc_nas_search blocks port 8765, caps results/text, marks untrusted reference framing, and supports HTTP + read-only SQLite', async (t) => {
+test('P1 Track A: wxarc_nas_search blocks port 8765, removes hardcoded LAN default IP, caps results/text, marks untrusted reference framing, and supports HTTP + read-only SQLite', async (t) => {
+  assert.equal(DEFAULT_NAS_ARCHIVE_URL, '');
+  await assert.rejects(
+    () => searchNasArchive({ query: '合同' }),
+    (err: unknown) => err instanceof WxarcBridgeSecurityError && err.code === 'EMPTY_NAS_URL',
+  );
   assert.throws(
     () => validateNasArchiveUrl('http://127.0.0.1:8765'),
     (err: unknown) =>
       err instanceof WxarcBridgeSecurityError && err.code === 'PERSONAL_WXARC_FORBIDDEN',
   );
   assert.throws(
-    () => validateNasArchiveUrl('http://192.168.2.177:8765'),
+    () => validateNasArchiveUrl('http://198.51.100.10:8765'),
     (err: unknown) =>
       err instanceof WxarcBridgeSecurityError && err.code === 'PERSONAL_WXARC_FORBIDDEN',
   );
@@ -599,7 +605,7 @@ test('P1 Track A: wxarc_nas_search blocks port 8765, caps results/text, marks un
   const httpRes = await searchNasArchive(
     { query: '合同编号A123', limit: 99 },
     {
-      baseUrl: 'http://192.168.2.177:28787',
+      baseUrl: 'http://198.51.100.10:28787',
       fetcher: async (url, init) => {
         fetchedUrls.push(url);
         assert.equal(init?.redirect, 'error');
@@ -679,7 +685,7 @@ test('P1 Track A: wxarc_nas_search blocks port 8765, caps results/text, marks un
   const authedRes = await searchNasArchive(
     { query: '黄桃', limit: 5 },
     {
-      baseUrl: 'http://192.168.2.177:28787',
+      baseUrl: 'http://198.51.100.10:28787',
       archivePath: nasDir,
       fetcher: async (url, init) => {
         const headers = (init?.headers ?? {}) as Record<string, string>;

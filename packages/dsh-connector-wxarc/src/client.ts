@@ -576,7 +576,13 @@
               if (!abort.signal.aborted) {
                 setData(d);
                 if (!initialized.current) {
-                  setForm(d.policy);
+                  setForm({
+                    ...d.policy,
+                    controllerId:
+                      (d.policy.controllerId || '').trim() ||
+                      (d.policy.adminIds?.[0] || '').trim(),
+                    adminIds: [],
+                  });
                   setRevision(d.revision);
                   initialized.current = true;
                 }
@@ -637,7 +643,8 @@
               {
                 policy: {
                   ...form,
-                  adminIds: (form.adminIds || []).map((x) => x.trim()).filter(Boolean),
+                  controllerId: (form.controllerId || '').trim(),
+                  adminIds: [],
                 },
                 revision,
               },
@@ -658,7 +665,12 @@
           try {
             const d = await api<AutomationResponse>('/wxarc/automation');
             setData(d);
-            setForm(d.policy);
+            setForm({
+              ...d.policy,
+              controllerId:
+                (d.policy.controllerId || '').trim() || (d.policy.adminIds?.[0] || '').trim(),
+              adminIds: [],
+            });
             setRevision(d.revision);
             setError('');
             setNotice('已重新读取设置。');
@@ -666,22 +678,6 @@
             setError(errMessage(e));
           }
         };
-
-        const field = (
-          label: string,
-          key: 'controllerId',
-          placeholder: string,
-        ): ReactElement =>
-          h(
-            'label',
-            null,
-            label,
-            h('input', {
-              value: form ? form[key] : '',
-              placeholder,
-              onChange: (e: ChangeEvent) => edit(key, e.target.value),
-            }),
-          );
 
         return h(
           'details',
@@ -816,22 +812,17 @@
                   h(
                     'label',
                     { className: 'wxarc-wide' },
-                    '微信管理员（每行一个内部 ID）',
-                    h('textarea', {
-                      value: (form.adminIds || []).join('\n'),
-                      onChange: (e: ChangeEvent) => edit('adminIds', e.target.value.split('\n')),
+                    '唯一主人微信内部 ID（controllerId）',
+                    h('input', {
+                      value: form.controllerId,
                       placeholder: 'wxid_…',
+                      onChange: (e: ChangeEvent) => edit('controllerId', e.target.value),
                     }),
                     h(
                       'small',
                       null,
-                      '仅身份已核实的管理员私聊可访问 Mac mini 工作区以外的文件。所有群消息均使用普通群聊工作区。',
+                      '已收敛为单一主人配置：仅此微信账号私聊拥有主人总控、Router 审批与跨渠道查档权限。所有外部群聊均受限在对应群工作区。',
                     ),
-                  ),
-                  field(
-                    '接收审批通知的本人私聊 ID',
-                    'controllerId',
-                    '填写你自己的微信内部 ID，用于接收工具审批通知',
                   ),
                   h(
                     'label',

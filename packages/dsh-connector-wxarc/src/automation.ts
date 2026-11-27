@@ -8,12 +8,12 @@ import type {
   AdminWechatHandler,
   AdminWechatMessage,
 } from '@local/dsh-hub/contracts';
-import { workspaceKey } from './admin.js';
+import { resolveOwnerId, workspaceKey } from './admin.js';
 import { decide } from './ai.js';
 import type { WechatApprovals } from './approvals.js';
 import type { AgentBridge } from './agent.js';
 import { ChatBatches, messagesOf } from './batch.js';
-import { messageBody } from './core.js';
+import { isQuote, messageBody } from './core.js';
 import {
   loadLocalImage,
   outgoingImage,
@@ -459,6 +459,91 @@ function normalizeTimestampMs(rawTs: unknown): number {
   return num < 10_000_000_000 ? Math.floor(num * 1000) : Math.floor(num);
 }
 
+function isAdminMultimodalEvent(event: Record<string, any>): boolean {
+  if (event.kind !== 'text') {
+    return false;
+  }
+  const baseType = typeof event.local_type === 'number' ? event.local_type % 4294967296 : 0;
+  if (baseType === 3 || baseType === 34 || baseType === 43) {
+    return true;
+  }
+  if (baseType === 49 && !isQuote(event)) {
+    return true;
+  }
+  return false;
+}
+
+function buildAdminArticleSummary(article: Record<string, any> | undefined): string | undefined {
+  if (!article || typeof article !== 'object') {
+    return undefined;
+  }
+  const title = typeof article.title === 'string' ? article.title.trim() : '';
+  const body = typeof article.text === 'string' ? article.text.replace(/\s+/g, ' ').trim() : '';
+  if (!title && !body) {
+    return undefined;
+  }
+  const combined = title && body ? `《${title}》\n${body}` : title || body;
+  return combined.length > 1500 ? `${combined.slice(0, 1499).trimEnd()}…` : combined;
+}
+
+function buildAdminWechatMessage(
+  source: Record<string, any>,
+  enriched: Record<string, any>,
+  event: Record<string, any>,
+  baseLocalType: number,
+): AdminWechatMessage {
+  const quote = enriched.quote ?? source.quote ?? event.quote;
+  const quotedText = typeof quote?.text === 'string' && quote.text ? quote.text : undefined;
+  const extractedText =
+    typeof quote?.body === 'string' && quote.body
+      ? quote.body
+      : messageBody(enriched) || String(source.text ?? event.text ?? '');
+
+  const mediaPathSet = new Set<string>();
+  const addMediaPath = (raw: unknown): void => {
+    if (typeof raw === 'string' && raw.trim()) {
+      mediaPathSet.add(raw.trim());
+    }
+  };
+  addMediaPath(enriched.image?.path);
+  addMediaPath(enriched.voice?.wavPath);
+  addMediaPath(enriched.video?.poster?.path);
+  if (Array.isArray(enriched.video?.keyframes)) {
+    for (const frame of enriched.video.keyframes as Array<Record<string, unknown>>) {
+      addMediaPath(frame?.path);
+    }
+  }
+  const mediaPaths = Array.from(mediaPathSet);
+  const imagePath =
+    (typeof enriched.image?.path === 'string' && enriched.image.path.trim()) ||
+    (typeof enriched.video?.poster?.path === 'string' && enriched.video.poster.path.trim()) ||
+    undefined;
+  const voiceTranscript =
+    (typeof enriched.voice?.transcript === 'string' && enriched.voice.transcript.trim()) ||
+    (typeof enriched.video?.transcript === 'string' && enriched.video.transcript.trim()) ||
+    undefined;
+  const articleSummary = buildAdminArticleSummary(enriched.article);
+  const sourceKey =
+    typeof source.sourceKey === 'string' && source.sourceKey.trim()
+      ? source.sourceKey.trim()
+      : undefined;
+
+  return {
+    session: source.session,
+    senderId: source.senderId,
+    text: extractedText,
+    ...(quotedText ? { quotedText } : {}),
+    seq: event.seq,
+    timestamp: event.ts,
+    ...(sourceKey ? { sourceKey } : {}),
+    ...(baseLocalType > 0 ? { localType: baseLocalType } : {}),
+    ...(imagePath ? { imagePath } : {}),
+    ...(voiceTranscript ? { voiceTranscript } : {}),
+    ...(articleSummary ? { articleSummary } : {}),
+    ...(mediaPaths.length > 0 ? { mediaPaths } : {}),
+  };
+}
+
 export function validatePolicy(input: unknown): AutomationPolicy {
   if (!input || typeof input !== 'object') {
     throw new Error('自动回复设置无效');
@@ -475,11 +560,10 @@ export function validatePolicy(input: unknown): AutomationPolicy {
   }
   if (
     !Array.isArray(p.adminIds) ||
-    p.adminIds.length > 32 ||
-    p.adminIds.some((x) => typeof x !== 'string' || !/^wxid_[a-zA-Z0-9_-]{1,100}$/.test(x)) ||
-    new Set(p.adminIds).size !== p.adminIds.length
+    p.adminIds.length > 1 ||
+    p.adminIds.some((x) => typeof x !== 'string' || !/^wxid_[a-zA-Z0-9_-]{1,100}$/.test(x))
   ) {
-    throw Error('管理员需填写不重复的微信内部 ID（wxid_ 开头，最多 32 个）');
+    throw Error('已收敛为单一主人配置：请在 controllerId 中填写唯一主人微信内部 ID（兼容字段 adminIds 最多允许 1 个）');
   }
   for (const key of [
     'provider',
@@ -492,6 +576,10 @@ export function validatePolicy(input: unknown): AutomationPolicy {
     if (typeof p[key] !== 'string' || p[key].length > (key === 'instructions' ? 6000 : 200)) {
       throw new Error('模型或身份设置无效');
     }
+  }
+  p.controllerId = p.controllerId.trim();
+  if (p.controllerId) {
+    p.adminIds = [];
   }
   if (!Number.isInteger(p.maxAgeSeconds) || p.maxAgeSeconds < 30 || p.maxAgeSeconds > 3600) {
     throw new Error('消息时效设置无效');
@@ -602,6 +690,7 @@ export class Automation {
   private proactiveQueueDepth: number;
   private activeProactiveId: string | null;
   private readonly inFlightProactive: Map<string, Promise<ProactiveSendResult>>;
+  private readonly pendingAdminTasks: Set<Promise<void>>;
 
   constructor({
     store,
@@ -652,6 +741,7 @@ export class Automation {
     this.proactiveQueueDepth = 0;
     this.activeProactiveId = null;
     this.inFlightProactive = new Map();
+    this.pendingAdminTasks = new Set();
     store.db.exec(`CREATE TABLE IF NOT EXISTS automation_jobs (
       id INTEGER PRIMARY KEY AUTOINCREMENT, event_seq INTEGER NOT NULL UNIQUE, source_key TEXT NOT NULL UNIQUE,
       revision INTEGER NOT NULL, event TEXT NOT NULL, rule TEXT NOT NULL, status TEXT NOT NULL,
@@ -851,6 +941,96 @@ export class Automation {
     this.adminWechatHandler = handler;
   }
 
+  private dispatchAdminReplyAsync(
+    replySession: string,
+    eventSeq: number,
+    replyText: string,
+    replyImagePath?: string,
+  ): void {
+    const replyKey = 'admin-wechat-reply:' + eventSeq;
+    const task = (async () => {
+      const result = await this.sendProactive({
+        session: replySession,
+        text: replyText,
+        imagePath: replyImagePath,
+        idempotencyKey: replyKey,
+        mode: 'send',
+        reason: 'admin_wechat_handler',
+      });
+      if (result.status !== 'sent' && result.status !== 'staged') {
+        this.logger?.warn?.(
+          `管理员微信自动回复未送达（session=${replySession}, key=${replyKey}, status=${result.status}）：${result.detail || '未知原因'}`,
+        );
+        if (result.status === 'failed' && replyImagePath && replyText.trim()) {
+          const fallbackResult = await this.sendProactive({
+            session: replySession,
+            text: replyText,
+            idempotencyKey: replyKey + ':text-fallback',
+            mode: 'send',
+            reason: 'admin_wechat_handler_text_fallback',
+          });
+          if (fallbackResult.status !== 'sent' && fallbackResult.status !== 'staged') {
+            this.logger?.warn?.(
+              `管理员微信纯文字降级回复未送达（session=${replySession}, key=${replyKey}:text-fallback, status=${fallbackResult.status}）：${fallbackResult.detail || '未知原因'}`,
+            );
+          }
+        }
+      }
+    })().catch((err) => {
+      this.logger?.warn?.(
+        '管理员微信自动回复发送失败：' + (err instanceof Error ? err.message : String(err)),
+      );
+    });
+    this.pendingAdminTasks.add(task);
+    void task.finally(() => this.pendingAdminTasks.delete(task));
+  }
+
+  private dispatchAdminMultimodalAsync(params: {
+    source: Record<string, any>;
+    event: Record<string, any>;
+    baseLocalType: number;
+    ownerId: string;
+    rule: Record<string, any>;
+  }): void {
+    const handler = this.adminWechatHandler;
+    if (!handler) {
+      return;
+    }
+    const { source, event, baseLocalType, ownerId, rule } = params;
+    const task = (async () => {
+      let enriched = source;
+      const signal = AbortSignal.any([this.controller.signal, AbortSignal.timeout(120000)]);
+      try {
+        enriched = (await this.enrich(source, rule, signal)) || source;
+      } catch (err) {
+        this.logger?.warn?.(
+          '主人微信多模态旁路预处理失败，已降级透传：' +
+            (err instanceof Error ? err.message : String(err)),
+        );
+      }
+      if (this.stopped || this.controller.signal.aborted) {
+        return;
+      }
+      const adminMsg = buildAdminWechatMessage(source, enriched, event, baseLocalType);
+      try {
+        const res = (await handler(adminMsg)) as AdminWechatHandleResult | void;
+        if (res?.handled === true && (res.replyText || res.imagePath)) {
+          this.dispatchAdminReplyAsync(ownerId, event.seq, res.replyText || '', res.imagePath);
+        }
+      } catch (err) {
+        this.logger?.warn?.(
+          '管理员微信多模态消息处理失败：' + (err instanceof Error ? err.message : String(err)),
+        );
+      }
+    })().catch((err) => {
+      this.logger?.warn?.(
+        '管理员微信多模态旁路异常：' + (err instanceof Error ? err.message : String(err)),
+      );
+    });
+    this.pendingAdminTasks.add(task);
+    void task.finally(() => this.pendingAdminTasks.delete(task));
+  }
+
   async collect(
     selectedRows?: Array<{ seq: number; payload: string }>,
     manualAt = 0,
@@ -859,6 +1039,7 @@ export class Automation {
     if (!policy.enabled || !this.listener.status().healthy) {
       return;
     }
+    const ownerId = resolveOwnerId(policy);
     const rows =
       selectedRows ||
       (this.store.db
@@ -880,12 +1061,19 @@ export class Automation {
       const isAdminSession = Boolean(
         this.adminWechatHandler &&
           event.kind === 'text' &&
-          policy.controllerId &&
-          event.session === policy.controllerId,
+          ownerId &&
+          event.session === ownerId,
       );
       let source: any;
       let problem: string | undefined;
       let pendingAdminReply: { replyText?: string; imagePath?: string } | null = null;
+      let pendingAdminMultimodal: {
+        source: Record<string, any>;
+        event: Record<string, any>;
+        baseLocalType: number;
+        ownerId: string;
+        rule: Record<string, any>;
+      } | null = null;
       const baseLocalType =
         typeof event.local_type === 'number' ? event.local_type % 4294967296 : 0;
       const isSupportedTextType = [1, 3, 34, 43, 47, 49].includes(baseLocalType);
@@ -901,7 +1089,15 @@ export class Automation {
           source = this.resolveSource(this.wxarcHome, event);
           validateAccount(source, policy.ownId, this.listener.wechatRoot as string);
           delete source.account;
-          if (this.approvals?.consume(source)) {
+          const isRouterOwnerDm = Boolean(
+            this.adminWechatHandler &&
+              source &&
+              event.kind === 'text' &&
+              ownerId &&
+              source.session === ownerId &&
+              source.senderId === ownerId,
+          );
+          if (!isRouterOwnerDm && this.approvals?.consume(source)) {
             source = null;
           }
           if (
@@ -920,54 +1116,57 @@ export class Automation {
           ) {
             source = null;
           }
-          if (
-            this.adminWechatHandler &&
-            source &&
-            event.kind === 'text' &&
-            policy.controllerId &&
-            source.session === policy.controllerId &&
-            source.senderId === policy.controllerId
-          ) {
-            let enrichedSource = source;
-            if (typeof this.listener.enrichQuote === 'function' && !source.quote?.text) {
-              try {
-                enrichedSource = (await this.listener.enrichQuote(source)) || source;
-              } catch {
-                enrichedSource = source;
-              }
-            }
-            const quote = enrichedSource.quote ?? event.quote;
-            const quotedText =
-              typeof quote?.text === 'string' && quote.text ? quote.text : undefined;
-            const extractedText =
-              typeof quote?.body === 'string' && quote.body
-                ? quote.body
-                : messageBody(enrichedSource) || String(source.text ?? event.text ?? '');
-            const adminMsg: AdminWechatMessage = {
-              session: source.session,
-              senderId: source.senderId,
-              text: extractedText,
-              quotedText,
-              seq: event.seq,
-              timestamp: event.ts,
-            };
-            try {
-              const res = (await this.adminWechatHandler(adminMsg)) as
-                | AdminWechatHandleResult
-                | void;
-              if (res?.handled === true) {
-                source = null;
-                if (res.replyText || res.imagePath) {
-                  pendingAdminReply = {
-                    replyText: res.replyText,
-                    imagePath: res.imagePath,
-                  };
+          if (isRouterOwnerDm && source) {
+            if (isAdminMultimodalEvent(event)) {
+              pendingAdminMultimodal = {
+                source,
+                event,
+                baseLocalType,
+                ownerId,
+                rule: rule || {
+                  kind: 'text',
+                  sourceId: ownerId,
+                  title: event.session_name || ownerId,
+                },
+              };
+              source = null;
+            } else {
+              let enrichedSource = source;
+              if (
+                isQuote(source) &&
+                typeof this.listener.enrichQuote === 'function' &&
+                !source.quote?.text
+              ) {
+                try {
+                  enrichedSource = (await this.listener.enrichQuote(source)) || source;
+                } catch {
+                  enrichedSource = source;
                 }
               }
-            } catch (err) {
-              this.logger?.warn?.(
-                '管理员微信消息处理失败：' + (err instanceof Error ? err.message : String(err)),
+              const adminMsg = buildAdminWechatMessage(
+                source,
+                enrichedSource,
+                event,
+                baseLocalType,
               );
+              try {
+                const res = (await this.adminWechatHandler!(adminMsg)) as
+                  | AdminWechatHandleResult
+                  | void;
+                if (res?.handled === true) {
+                  source = null;
+                  if (res.replyText || res.imagePath) {
+                    pendingAdminReply = {
+                      replyText: res.replyText,
+                      imagePath: res.imagePath,
+                    };
+                  }
+                }
+              } catch (err) {
+                this.logger?.warn?.(
+                  '管理员微信消息处理失败：' + (err instanceof Error ? err.message : String(err)),
+                );
+              }
             }
           }
           if (!inPolicyScope) {
@@ -1029,44 +1228,16 @@ export class Automation {
         this.store.db.exec('ROLLBACK');
         throw e;
       }
+      if (pendingAdminMultimodal) {
+        this.dispatchAdminMultimodalAsync(pendingAdminMultimodal);
+      }
       if (pendingAdminReply) {
-        const replySession = policy.controllerId;
-        const replyKey = 'admin-wechat-reply:' + event.seq;
-        const replyText = pendingAdminReply.replyText || '';
-        const replyImagePath = pendingAdminReply.imagePath;
-        void (async () => {
-          const result = await this.sendProactive({
-            session: replySession,
-            text: replyText,
-            imagePath: replyImagePath,
-            idempotencyKey: replyKey,
-            mode: 'send',
-            reason: 'admin_wechat_handler',
-          });
-          if (result.status !== 'sent' && result.status !== 'staged') {
-            this.logger?.warn?.(
-              `管理员微信自动回复未送达（session=${replySession}, key=${replyKey}, status=${result.status}）：${result.detail || '未知原因'}`,
-            );
-            if (result.status === 'failed' && replyImagePath && replyText.trim()) {
-              const fallbackResult = await this.sendProactive({
-                session: replySession,
-                text: replyText,
-                idempotencyKey: replyKey + ':text-fallback',
-                mode: 'send',
-                reason: 'admin_wechat_handler_text_fallback',
-              });
-              if (fallbackResult.status !== 'sent' && fallbackResult.status !== 'staged') {
-                this.logger?.warn?.(
-                  `管理员微信纯文字降级回复未送达（session=${replySession}, key=${replyKey}:text-fallback, status=${fallbackResult.status}）：${fallbackResult.detail || '未知原因'}`,
-                );
-              }
-            }
-          }
-        })().catch((err) => {
-          this.logger?.warn?.(
-            '管理员微信自动回复发送失败：' + (err instanceof Error ? err.message : String(err)),
-          );
-        });
+        this.dispatchAdminReplyAsync(
+          ownerId,
+          event.seq,
+          pendingAdminReply.replyText || '',
+          pendingAdminReply.imagePath,
+        );
       }
     }
   }
@@ -1724,7 +1895,7 @@ export class Automation {
       const originRun = this.agentBridge!.run(notice.run_id)!;
       const origin = this.job(originRun.job_id!);
       try {
-        if (!this.listener.status().healthy || current.policy.controllerId !== notice.owner_id) {
+        if (!this.listener.status().healthy || resolveOwnerId(current.policy) !== notice.owner_id) {
           throw new Error('采集状态或控制者身份发生变化');
         }
         let source: Record<string, any> | undefined;
@@ -3313,6 +3484,7 @@ export class Automation {
   async close(): Promise<void> {
     this.stop();
     await this.manual?.catch(() => {});
+    await Promise.allSettled([...this.pendingAdminTasks]);
     await this.proactiveQueue.catch(() => {});
     if (this.lease) {
       this.lease.close();
