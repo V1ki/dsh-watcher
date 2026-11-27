@@ -11,6 +11,7 @@ export type DbHandle = HubDb | DatabaseSync;
 
 export interface CreateMemoInput {
   id?: string;
+  idempotencyKey?: string | null;
   kind: MemoKind;
   roomKey: string;
   targetSessionId?: string | null;
@@ -32,6 +33,18 @@ export interface CreateMemoInput {
   nextCheckAt?: string | null;
   notifyWechatChatId?: string | null;
   metadata?: Record<string, unknown>;
+}
+
+export interface CreateMemoResult {
+  memo: MemoRecord;
+  deduplicated: boolean;
+}
+
+export interface CancelMemoOptions {
+  roomKey?: string | null;
+  targetSessionId?: string | null;
+  allowCrossRoom?: boolean;
+  now?: Date;
 }
 
 export interface ListMemosFilter {
@@ -81,6 +94,23 @@ export class MemoRoomCapError extends Error {
     this.roomKey = roomKey;
     this.activeCount = activeCount;
     this.limit = limit;
+  }
+}
+
+export class MemoIdempotencyConflictError extends Error {
+  readonly code = 'MEMO_IDEMPOTENCY_CONFLICT';
+  readonly idempotencyKey: string;
+  readonly requestedRoomKey: string;
+  readonly existingRoomKey: string;
+
+  constructor(idempotencyKey: string, requestedRoomKey: string, existingRoomKey: string) {
+    super(
+      `Idempotency key "${idempotencyKey}" is already bound to room "${existingRoomKey}" and cannot be reused for "${requestedRoomKey}"`,
+    );
+    this.name = 'MemoIdempotencyConflictError';
+    this.idempotencyKey = idempotencyKey;
+    this.requestedRoomKey = requestedRoomKey;
+    this.existingRoomKey = existingRoomKey;
   }
 }
 
@@ -257,6 +287,7 @@ export class MemoStore {
   readonly proactiveBudgetMode: ProactiveBudgetMode;
   readonly proactiveBudgetHours: number;
   readonly proactiveBudgetMaxPerRoom: number;
+  private savepointSeq: number;
 
   constructor(handle: DbHandle, options: MemoStoreOptions = {}) {
     this.db = resolveSqlite(handle);
@@ -265,6 +296,87 @@ export class MemoStore {
       options.proactiveBudgetMode === 'rolling' ? 'rolling' : 'calendar_day';
     this.proactiveBudgetHours = Math.max(1, Number(options.proactiveBudgetHours) || 18);
     this.proactiveBudgetMaxPerRoom = Math.max(1, Number(options.proactiveBudgetMaxPerRoom) || 1);
+    this.savepointSeq = 0;
+    this.ensureSchema();
+  }
+
+  private runInTransaction<T>(fn: () => T): T {
+    const dbWithTx = this.db as DatabaseSync & { isTransaction?: boolean };
+    const nested = Boolean(dbWithTx.isTransaction);
+    if (!nested) {
+      this.db.exec('BEGIN IMMEDIATE');
+      try {
+        const result = fn();
+        this.db.exec('COMMIT');
+        return result;
+      } catch (err) {
+        try {
+          this.db.exec('ROLLBACK');
+        } catch {
+          void 0;
+        }
+        throw err;
+      }
+    }
+    this.savepointSeq += 1;
+    const sp = `memo_sp_${this.savepointSeq}`;
+    this.db.exec(`SAVEPOINT ${sp}`);
+    try {
+      const result = fn();
+      this.db.exec(`RELEASE SAVEPOINT ${sp}`);
+      return result;
+    } catch (err) {
+      try {
+        this.db.exec(`ROLLBACK TO SAVEPOINT ${sp}`);
+        this.db.exec(`RELEASE SAVEPOINT ${sp}`);
+      } catch {
+        void 0;
+      }
+      throw err;
+    }
+  }
+
+  private ensureSchema(): void {
+    const hasMemos = this.db
+      .prepare("SELECT 1 AS found FROM sqlite_master WHERE type = 'table' AND name = 'memos'")
+      .get() as { found: number } | undefined;
+    if (!hasMemos?.found) {
+      return;
+    }
+    this.db.exec('PRAGMA foreign_keys = ON;');
+    const dbList = this.db.prepare('PRAGMA database_list').all() as unknown as Array<{
+      name?: string;
+      file?: string;
+    }>;
+    const mainDb = dbList.find((row) => row.name === 'main');
+    if (mainDb?.file && mainDb.file.trim() !== '') {
+      this.db.exec('PRAGMA journal_mode = WAL;');
+    }
+    this.runInTransaction(() => {
+      this.db.exec(
+        `CREATE TABLE IF NOT EXISTS memo_idempotency (
+           idempotency_key TEXT PRIMARY KEY,
+           room_key        TEXT NOT NULL,
+           memo_id         TEXT NOT NULL REFERENCES memos(id) ON DELETE CASCADE,
+           created_at      TEXT NOT NULL
+         ) STRICT;
+         CREATE INDEX IF NOT EXISTS idx_memo_idempotency_memo_id
+           ON memo_idempotency (memo_id);`,
+      );
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO memo_idempotency (idempotency_key, room_key, memo_id, created_at)
+           SELECT
+             TRIM(CAST(json_extract(metadata_json, '$.idempotencyKey') AS TEXT)),
+             room_key,
+             id,
+             created_at
+           FROM memos
+           WHERE json_extract(metadata_json, '$.idempotencyKey') IS NOT NULL
+             AND TRIM(CAST(json_extract(metadata_json, '$.idempotencyKey') AS TEXT)) != ''`,
+        )
+        .run();
+    });
   }
 
   countActiveMemos(roomKey: string): number {
@@ -278,6 +390,13 @@ export class MemoStore {
     input: CreateMemoInput,
     options: { maxActivePerRoom?: number; now?: Date } = {},
   ): MemoRecord {
+    return this.createMemoWithIdempotency(input, options).memo;
+  }
+
+  createMemoWithIdempotency(
+    input: CreateMemoInput,
+    options: { maxActivePerRoom?: number; now?: Date } = {},
+  ): CreateMemoResult {
     if (!VALID_KINDS.has(input.kind)) {
       throw new TypeError(`Invalid memo kind: ${String(input.kind)}`);
     }
@@ -294,17 +413,17 @@ export class MemoStore {
       throw new TypeError(`Invalid memo status: ${String(status)}`);
     }
 
+    const idempotencyKey =
+      typeof input.idempotencyKey === 'string' && input.idempotencyKey.trim()
+        ? input.idempotencyKey.trim()
+        : null;
     const cap = Math.max(1, Number(options.maxActivePerRoom) || this.maxActivePerRoom);
-    if (status === 'active') {
-      const activeCount = this.countActiveMemos(roomKey);
-      if (activeCount >= cap) {
-        throw new MemoRoomCapError(roomKey, activeCount, cap);
-      }
-    }
-
     const nowIso = (options.now ?? new Date()).toISOString();
     const id = input.id?.trim() || `memo_${randomUUID()}`;
     const metadata: Record<string, unknown> = { ...(input.metadata ?? {}) };
+    if (idempotencyKey) {
+      metadata.idempotencyKey = idempotencyKey;
+    }
     if (input.knownFactsUpdatedAt) {
       metadata.knownFactsUpdatedAt = input.knownFactsUpdatedAt;
     } else if (
@@ -314,55 +433,97 @@ export class MemoStore {
       metadata.knownFactsUpdatedAt = nowIso;
     }
 
-    this.db
-      .prepare(
-        `INSERT INTO memos (
-           id, kind, room_key, target_session_id, target_chat_id, source, title, basis,
-           window_start, window_end, random_fire_at, interval_hours, expires_at,
-           keywords_json, known_facts_json, accept_criteria, official_domains_json,
-           status, last_checked_at, next_check_at, notify_wechat_chat_id, result_summary,
-           metadata_json, created_at, updated_at
-         ) VALUES (
-           ?, ?, ?, ?, ?, ?, ?, ?,
-           ?, ?, ?, ?, ?,
-           ?, ?, ?, ?,
-           ?, ?, ?, ?, ?,
-           ?, ?, ?
-         )`,
-      )
-      .run(
-        id,
-        input.kind,
-        roomKey,
-        input.targetSessionId ?? null,
-        input.targetChatId ?? null,
-        input.source?.trim() || 'manual',
-        String(input.title ?? '').trim(),
-        basis,
-        input.windowStart ?? null,
-        input.windowEnd ?? null,
-        input.randomFireAt ?? null,
-        input.intervalHours ?? null,
-        input.expiresAt ?? null,
-        JSON.stringify(normalizeStringList(input.keywords)),
-        JSON.stringify(normalizeStringList(input.knownFacts)),
-        input.acceptCriteria?.trim() || null,
-        JSON.stringify(normalizeStringList(input.officialDomains)),
-        status,
-        null,
-        input.nextCheckAt ?? input.randomFireAt ?? null,
-        input.notifyWechatChatId ?? null,
-        null,
-        JSON.stringify(metadata),
-        nowIso,
-        nowIso,
-      );
+    return this.runInTransaction(() => {
+      if (idempotencyKey) {
+        const existingKey = this.db
+          .prepare(
+            'SELECT room_key, memo_id FROM memo_idempotency WHERE idempotency_key = ?',
+          )
+          .get(idempotencyKey) as { room_key: string; memo_id: string } | undefined;
+        if (existingKey) {
+          if (existingKey.room_key !== roomKey) {
+            throw new MemoIdempotencyConflictError(
+              idempotencyKey,
+              roomKey,
+              existingKey.room_key,
+            );
+          }
+          const existingMemo = this.getMemo(existingKey.memo_id);
+          if (existingMemo) {
+            return { memo: existingMemo, deduplicated: true };
+          }
+          this.db
+            .prepare('DELETE FROM memo_idempotency WHERE idempotency_key = ?')
+            .run(idempotencyKey);
+        }
+      }
 
-    const created = this.getMemo(id);
-    if (!created) {
-      throw new Error(`Failed to persist memo ${id}`);
-    }
-    return created;
+      if (status === 'active') {
+        const activeCount = this.countActiveMemos(roomKey);
+        if (activeCount >= cap) {
+          throw new MemoRoomCapError(roomKey, activeCount, cap);
+        }
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO memos (
+             id, kind, room_key, target_session_id, target_chat_id, source, title, basis,
+             window_start, window_end, random_fire_at, interval_hours, expires_at,
+             keywords_json, known_facts_json, accept_criteria, official_domains_json,
+             status, last_checked_at, next_check_at, notify_wechat_chat_id, result_summary,
+             metadata_json, created_at, updated_at
+           ) VALUES (
+             ?, ?, ?, ?, ?, ?, ?, ?,
+             ?, ?, ?, ?, ?,
+             ?, ?, ?, ?,
+             ?, ?, ?, ?, ?,
+             ?, ?, ?
+           )`,
+        )
+        .run(
+          id,
+          input.kind,
+          roomKey,
+          input.targetSessionId ?? null,
+          input.targetChatId ?? null,
+          input.source?.trim() || 'manual',
+          String(input.title ?? '').trim(),
+          basis,
+          input.windowStart ?? null,
+          input.windowEnd ?? null,
+          input.randomFireAt ?? null,
+          input.intervalHours ?? null,
+          input.expiresAt ?? null,
+          JSON.stringify(normalizeStringList(input.keywords)),
+          JSON.stringify(normalizeStringList(input.knownFacts)),
+          input.acceptCriteria?.trim() || null,
+          JSON.stringify(normalizeStringList(input.officialDomains)),
+          status,
+          null,
+          input.nextCheckAt ?? input.randomFireAt ?? null,
+          input.notifyWechatChatId ?? null,
+          null,
+          JSON.stringify(metadata),
+          nowIso,
+          nowIso,
+        );
+
+      if (idempotencyKey) {
+        this.db
+          .prepare(
+            `INSERT INTO memo_idempotency (idempotency_key, room_key, memo_id, created_at)
+             VALUES (?, ?, ?, ?)`,
+          )
+          .run(idempotencyKey, roomKey, id, nowIso);
+      }
+
+      const created = this.getMemo(id);
+      if (!created) {
+        throw new Error(`Failed to persist memo ${id}`);
+      }
+      return { memo: created, deduplicated: false };
+    });
   }
 
   getMemo(id: string): MemoRecord | null {
@@ -522,11 +683,92 @@ export class MemoStore {
     return this.getMemo(id);
   }
 
-  cancelMemo(id: string, reason = 'cancelled', now: Date = new Date()): MemoRecord | null {
-    return this.updateMemoStatus(id, 'torn', {
-      resultSummary: reason,
-      nextCheckAt: null,
-      now,
+  cancelMemo(
+    id: string,
+    reason = 'cancelled',
+    nowOrOptions?: Date | CancelMemoOptions,
+  ): MemoRecord | null {
+    const memoId = String(id || '').trim();
+    if (!memoId) return null;
+
+    const opts: CancelMemoOptions =
+      nowOrOptions instanceof Date
+        ? { now: nowOrOptions, allowCrossRoom: true }
+        : nowOrOptions === undefined
+          ? { allowCrossRoom: true }
+          : nowOrOptions;
+
+    const allowCrossRoom = opts.allowCrossRoom === true;
+    const requiredRoomKey =
+      typeof opts.roomKey === 'string' && opts.roomKey.trim() ? opts.roomKey.trim() : null;
+    const requiredSessionId =
+      typeof opts.targetSessionId === 'string' && opts.targetSessionId.trim()
+        ? opts.targetSessionId.trim()
+        : null;
+
+    if (!allowCrossRoom && !requiredRoomKey && !requiredSessionId) {
+      return null;
+    }
+
+    const nowIso = (opts.now ?? new Date()).toISOString();
+
+    return this.runInTransaction(() => {
+      let existingRow: RawMemoRow | undefined;
+      if (allowCrossRoom) {
+        if (requiredRoomKey) {
+          existingRow = this.db
+            .prepare('SELECT * FROM memos WHERE id = ? AND room_key = ?')
+            .get(memoId, requiredRoomKey) as RawMemoRow | undefined;
+        } else {
+          existingRow = this.db
+            .prepare('SELECT * FROM memos WHERE id = ?')
+            .get(memoId) as RawMemoRow | undefined;
+        }
+      } else if (requiredRoomKey && requiredSessionId) {
+        existingRow = this.db
+          .prepare(
+            'SELECT * FROM memos WHERE id = ? AND room_key = ? AND (room_key = ? OR target_session_id = ?)',
+          )
+          .get(memoId, requiredRoomKey, `session:${requiredSessionId}`, requiredSessionId) as
+          | RawMemoRow
+          | undefined;
+      } else if (requiredRoomKey) {
+        existingRow = this.db
+          .prepare('SELECT * FROM memos WHERE id = ? AND room_key = ?')
+          .get(memoId, requiredRoomKey) as RawMemoRow | undefined;
+      } else if (requiredSessionId) {
+        existingRow = this.db
+          .prepare(
+            'SELECT * FROM memos WHERE id = ? AND (room_key = ? OR target_session_id = ?)',
+          )
+          .get(memoId, `session:${requiredSessionId}`, requiredSessionId) as
+          | RawMemoRow
+          | undefined;
+      }
+
+      if (!existingRow) {
+        return null;
+      }
+
+      const res = this.db
+        .prepare(
+          `UPDATE memos
+           SET status = 'torn',
+               result_summary = ?,
+               next_check_at = NULL,
+               updated_at = ?
+           WHERE id = ? AND room_key = ?`,
+        )
+        .run(reason, nowIso, existingRow.id, existingRow.room_key);
+
+      if (Number(res.changes) === 0) {
+        return null;
+      }
+
+      const updated = this.db
+        .prepare('SELECT * FROM memos WHERE id = ? AND room_key = ?')
+        .get(existingRow.id, existingRow.room_key) as RawMemoRow | undefined;
+      return updated ? mapMemoRow(updated) : null;
     });
   }
 

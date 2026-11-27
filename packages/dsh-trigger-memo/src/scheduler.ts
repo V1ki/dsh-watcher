@@ -8,7 +8,12 @@ import type {
   WatchSource,
   WechatAtmosphere,
 } from '@local/dsh-hub/contracts';
-import { MemoStore, type CreateMemoInput, type ProactiveBudgetMode } from './store.js';
+import {
+  MemoStore,
+  type CreateMemoInput,
+  type CreateMemoResult,
+  type ProactiveBudgetMode,
+} from './store.js';
 import {
   WebScout,
   type ScoutOutcome,
@@ -288,6 +293,10 @@ export class MemoEngine {
   }
 
   createMemo(input: CreateMemoInput): MemoRecord {
+    return this.createMemoWithIdempotency(input).memo;
+  }
+
+  createMemoWithIdempotency(input: CreateMemoInput): CreateMemoResult {
     const current = this.now();
     const prepared: CreateMemoInput = { ...input };
 
@@ -349,7 +358,7 @@ export class MemoEngine {
       }
     }
 
-    return this.store.createMemo(prepared, {
+    return this.store.createMemoWithIdempotency(prepared, {
       maxActivePerRoom: this.config.maxActivePerRoom,
       now: current,
     });

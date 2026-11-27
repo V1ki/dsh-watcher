@@ -2,9 +2,12 @@ import type { HubService } from '@local/dsh-hub/contracts';
 import {
   MemoStore,
   MemoRoomCapError,
+  MemoIdempotencyConflictError,
   createMemoStore,
   normalizeUrlKey,
+  type CancelMemoOptions,
   type CreateMemoInput,
+  type CreateMemoResult,
   type DbHandle,
   type ListMemosFilter,
   type MemoSeenUrlRecord,
@@ -42,6 +45,14 @@ import {
 } from './scheduler.js';
 import {
   registerMemoTools,
+  MemoAuthorizationError,
+  MemoTargetError,
+  type MemoCallerPrincipal,
+  type MemoPrincipalResolver,
+  type MemoTargetBinding,
+  type MemoTargetErrorCode,
+  type MemoTargetResolution,
+  type MemoTargetResolver,
   type MemoToolDefinition,
   type MemoToolsContext,
   type ToolExecutionContext,
@@ -168,6 +179,9 @@ export function apply(ctx: MemoPluginContext, rawConfig: RawMemoEngineConfig = {
 export {
   MemoStore,
   MemoRoomCapError,
+  MemoIdempotencyConflictError,
+  MemoAuthorizationError,
+  MemoTargetError,
   createMemoStore,
   normalizeUrlKey,
   WebScout,
@@ -184,7 +198,9 @@ export {
 };
 
 export type {
+  CancelMemoOptions,
   CreateMemoInput,
+  CreateMemoResult,
   DbHandle,
   ListMemosFilter,
   MemoSeenUrlRecord,
@@ -205,6 +221,12 @@ export type {
   MemoEngineOptions,
   MemoLogger,
   RawMemoEngineConfig,
+  MemoCallerPrincipal,
+  MemoPrincipalResolver,
+  MemoTargetBinding,
+  MemoTargetErrorCode,
+  MemoTargetResolution,
+  MemoTargetResolver,
   MemoToolDefinition,
   MemoToolsContext,
   ToolExecutionContext,
