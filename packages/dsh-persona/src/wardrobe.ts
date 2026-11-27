@@ -45,6 +45,11 @@ import type {
   StyleSampleFile,
   StyleSampleInfo,
   StyleSampleItem,
+  VaultKnowledgeContextOptions,
+  VaultKnowledgeContextResult,
+  VaultKnowledgeHit,
+  VaultKnowledgeSearchQuery,
+  VaultVisibility,
   VisualObservationInput,
   VisualObservationRecord,
   WxarcImportResult,
@@ -82,11 +87,13 @@ import {
   getMemoryVersion,
   listChatCircleRecords,
   resolveCardAccess,
+  resolveVaultVisibilityRecord,
   rowToFullMemoryRecord,
   selectDrawerMemories,
   setChatCircleRecord,
 } from './wardrobe-policy.js';
 import { recallMultimodalOp } from './wardrobe-recall.js';
+import { getVaultKnowledgeContextOp, searchVaultKnowledgeOp } from './wardrobe-vault.js';
 
 const DEFAULT_CARD_MEMORY_LIMIT = 16;
 const DEFAULT_MAX_MEMORIES_PER_SCOPE = 24;
@@ -507,6 +514,14 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
     return getChatCircleRecord(this.store, chatId);
   }
 
+  resolveChatCircle(roomKey: string): ChatCircleRecord {
+    return getChatCircleRecord(this.store, roomKey);
+  }
+
+  resolveVaultVisibility(roomKey: string): VaultVisibility {
+    return resolveVaultVisibilityRecord(this.store, roomKey);
+  }
+
   setChatCircle(chatId: string, circle: ChatCircle, label?: string): ChatCircleRecord {
     return setChatCircleRecord(this.store, chatId, circle, label, this.now());
   }
@@ -517,6 +532,17 @@ export class PersonaWardrobeImpl implements PersonaWardrobe {
 
   listChatCircles(): ChatCircleRecord[] {
     return listChatCircleRecords(this.store);
+  }
+
+  searchVaultKnowledge(query: VaultKnowledgeSearchQuery): VaultKnowledgeHit[] {
+    return searchVaultKnowledgeOp(this.store, query);
+  }
+
+  getVaultKnowledgeContext(
+    itemId: string,
+    opts?: VaultKnowledgeContextOptions,
+  ): VaultKnowledgeContextResult | null {
+    return getVaultKnowledgeContextOp(this.store, itemId, opts);
   }
 
   getDynamicCard(input: DynamicPersonaCardInput): DynamicPersonaCard | null;

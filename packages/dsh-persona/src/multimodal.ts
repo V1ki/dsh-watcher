@@ -42,6 +42,32 @@ export function normalizeChatId(raw: string | null | undefined): string {
   return trimmed;
 }
 
+export function buildChatCircleLookupKeys(raw: string | null | undefined): string[] {
+  const normalized = normalizeChatId(raw);
+  if (!normalized) return [];
+  if (normalized.startsWith('wxarc:')) {
+    const bare = normalizeChatId(normalized.slice('wxarc:'.length));
+    return bare && bare !== normalized ? [normalized, bare] : [normalized];
+  }
+  if (!normalized.includes(':')) {
+    return [normalized, `wxarc:${normalized}`];
+  }
+  return [normalized];
+}
+
+export function isSameChatId(
+  a: string | null | undefined,
+  b: string | null | undefined,
+): boolean {
+  const keysA = buildChatCircleLookupKeys(a);
+  const keysB = buildChatCircleLookupKeys(b);
+  if (keysA.length === 0 || keysB.length === 0) return false;
+  for (const ka of keysA) {
+    if (keysB.includes(ka)) return true;
+  }
+  return false;
+}
+
 export function isGroupChatId(chatId: string, scope?: string, explicit?: boolean): boolean {
   if (explicit === true) return true;
   if (explicit === false) return false;
@@ -159,13 +185,13 @@ export function isDrawerRecordAllowed(params: {
     if (isGroupChat) return false;
     if (!activeChatId) return false;
     return (
-      normalizeChatId(recordRoomChatId) === activeChatId ||
-      (recordSubjectWxid !== '' && recordSubjectWxid === activeChatId)
+      isSameChatId(recordRoomChatId, activeChatId) ||
+      (recordSubjectWxid !== '' && isSameChatId(recordSubjectWxid, activeChatId))
     );
   }
   if (recordVisibility === 'room') {
     if (!activeChatId) return false;
-    return normalizeChatId(recordRoomChatId) === activeChatId;
+    return isSameChatId(recordRoomChatId, activeChatId);
   }
   if (recordVisibility === 'circle') {
     if (allowOwnerPrivate && !isGroupChat) {

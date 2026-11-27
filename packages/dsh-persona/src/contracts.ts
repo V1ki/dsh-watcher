@@ -4,6 +4,10 @@ export type PersonaKind = 'double' | 'original' | 'fiction';
 
 export type ChatCircle = 'family' | 'work' | 'external';
 
+export type VaultVisibility = 'external' | 'work' | 'family' | 'owner_private';
+
+export type VaultKnowledgeKind = 'foundation' | 'event_fact' | 'reference_card';
+
 export type MemoryVisibility = 'room' | 'circle' | 'dm_only' | 'owner_private';
 
 export type AudienceTag = 'family' | 'work' | 'external' | '';
@@ -569,6 +573,60 @@ export interface LegacyMigrationResult {
   sourcePath: string | null;
 }
 
+export interface VaultKnowledgeSearchQuery {
+  query: string;
+  allowedCircles: ReadonlyArray<VaultVisibility>;
+  person?: string;
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+export interface VaultKnowledgeHit {
+  source: 'persona';
+  itemId: string;
+  kind: VaultKnowledgeKind;
+  circle: VaultVisibility;
+  roomKey?: string;
+  roomName?: string;
+  author?: string;
+  occurredAt: string;
+  snippet: string;
+  score: number;
+}
+
+export interface VaultKnowledgeContextOptions {
+  before?: number;
+  after?: number;
+  allowedCircles?: ReadonlyArray<VaultVisibility>;
+}
+
+export interface VaultKnowledgeContextEntry {
+  itemId: string;
+  kind: VaultKnowledgeKind | 'evidence';
+  circle: VaultVisibility;
+  author?: string;
+  occurredAt: string;
+  text: string;
+}
+
+export interface VaultKnowledgeContextResult {
+  source: 'persona';
+  itemId: string;
+  kind: VaultKnowledgeKind;
+  circle: VaultVisibility;
+  roomKey?: string;
+  roomName?: string;
+  author?: string;
+  occurredAt: string;
+  title?: string;
+  content: string;
+  quote?: string;
+  metadata?: Record<string, unknown>;
+  before: VaultKnowledgeContextEntry[];
+  after: VaultKnowledgeContextEntry[];
+}
+
 export interface PersonaDb {
   readonly db: DatabaseSync;
   readonly stateDir: string;
@@ -590,9 +648,16 @@ export interface PersonaWardrobe {
   getVersion(): number;
   getContextStamp(input: ContextStampInput): ContextStamp;
   getChatCircle(chatId: string): ChatCircleRecord;
+  resolveChatCircle(roomKey: string): ChatCircleRecord;
+  resolveVaultVisibility(roomKey: string): VaultVisibility;
   setChatCircle(chatId: string, circle: ChatCircle, label?: string): ChatCircleRecord;
   deleteChatCircle(chatId: string): boolean;
   listChatCircles(): ChatCircleRecord[];
+  searchVaultKnowledge(query: VaultKnowledgeSearchQuery): VaultKnowledgeHit[];
+  getVaultKnowledgeContext(
+    itemId: string,
+    opts?: VaultKnowledgeContextOptions,
+  ): VaultKnowledgeContextResult | null;
   getDynamicCard(input: DynamicPersonaCardInput): DynamicPersonaCard | null;
   recordTurnPreference(input: RecordTurnPreferenceInput): { recorded: number };
   addMemory(input: AddPersonaMemoryInput): PersonaMemoryRecord;

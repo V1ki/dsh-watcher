@@ -10,11 +10,13 @@ import type {
   PersonaDb,
   PersonaMemoryMetadata,
   PersonaMemoryRecord,
+  VaultVisibility,
 } from './contracts.js';
 import {
   VALID_AUDIENCE_TAGS,
   VALID_CHAT_CIRCLES,
   VALID_MEMORY_VISIBILITIES,
+  buildChatCircleLookupKeys,
   isDrawerRecordAllowed,
   normalizeChatId,
 } from './multimodal.js';
@@ -138,25 +140,77 @@ export function bumpMemoryVersion(store: PersonaDb): number {
 }
 
 export function getChatCircleRecord(store: PersonaDb, chatId: string): ChatCircleRecord {
-  const normalized = normalizeChatId(chatId);
-  if (!normalized) {
+  const keys = buildChatCircleLookupKeys(chatId);
+  if (keys.length === 0) {
     return { chatId: '', circle: 'external', label: '', updatedAt: 0, labeled: false };
   }
-  const row = store.db
-    .prepare('SELECT chat_id, circle, label, updated_at FROM chat_circle WHERE chat_id = ?')
-    .get(normalized) as
-    | { chat_id: string; circle: string; label: string; updated_at: number }
-    | undefined;
-  if (!row) {
-    return { chatId: normalized, circle: 'external', label: '', updatedAt: 0, labeled: false };
+  const stmt = store.db.prepare(
+    'SELECT chat_id, circle, label, updated_at FROM chat_circle WHERE chat_id = ?',
+  );
+  for (const key of keys) {
+    const row = stmt.get(key) as
+      | { chat_id: string; circle: string; label: string; updated_at: number }
+      | undefined;
+    if (row) {
+      return {
+        chatId: row.chat_id,
+        circle: coerceChatCircle(row.circle, 'external'),
+        label: row.label ?? '',
+        updatedAt: Number(row.updated_at),
+        labeled: true,
+      };
+    }
   }
-  return {
-    chatId: row.chat_id,
-    circle: coerceChatCircle(row.circle, 'external'),
-    label: row.label ?? '',
-    updatedAt: Number(row.updated_at),
-    labeled: true,
-  };
+  return { chatId: keys[0]!, circle: 'external', label: '', updatedAt: 0, labeled: false };
+}
+
+export function resolveVaultVisibilityRecord(
+  store: PersonaDb,
+  roomKey: string,
+): VaultVisibility {
+  const record = getChatCircleRecord(store, roomKey);
+  if (!record.labeled) {
+    return 'owner_private';
+  }
+  if (record.circle === 'work') return 'work';
+  if (record.circle === 'family') return 'family';
+  if (record.circle === 'external') return 'external';
+  return 'owner_private';
+}
+
+export function resolveRecordVaultVisibility(
+  store: PersonaDb,
+  input: {
+    visibility: MemoryVisibility;
+    circle: ChatCircle;
+    roomChatId: string;
+  },
+): VaultVisibility {
+  if (input.visibility === 'owner_private' || input.visibility === 'dm_only') {
+    return 'owner_private';
+  }
+  const normalizedRoom = normalizeChatId(input.roomChatId);
+  if (normalizedRoom) {
+    const roomRec = getChatCircleRecord(store, normalizedRoom);
+    if (!roomRec.labeled) {
+      return 'owner_private';
+    }
+    if (
+      input.visibility === 'circle' &&
+      (input.circle === 'family' || input.circle === 'work') &&
+      roomRec.circle === 'external'
+    ) {
+      return input.circle;
+    }
+    if (roomRec.circle === 'work') return 'work';
+    if (roomRec.circle === 'family') return 'family';
+    if (roomRec.circle === 'external') return 'external';
+    return 'owner_private';
+  }
+  if (input.circle === 'family') return 'family';
+  if (input.circle === 'work') return 'work';
+  if (input.circle === 'external' && input.visibility === 'circle') return 'external';
+  return 'owner_private';
 }
 
 export function setChatCircleRecord(
@@ -197,13 +251,18 @@ export function setChatCircleRecord(
 }
 
 export function deleteChatCircleRecord(store: PersonaDb, chatId: string): boolean {
-  const normalized = normalizeChatId(chatId);
-  if (!normalized) return false;
+  const keys = buildChatCircleLookupKeys(chatId);
+  if (keys.length === 0) return false;
   return store.transaction(() => {
-    const res = store.db.prepare('DELETE FROM chat_circle WHERE chat_id = ?').run(normalized);
-    const deleted = Number(res.changes) > 0;
-    if (deleted) bumpMemoryVersion(store);
-    return deleted;
+    const stmt = store.db.prepare('DELETE FROM chat_circle WHERE chat_id = ?');
+    for (const key of keys) {
+      const res = stmt.run(key);
+      if (Number(res.changes) > 0) {
+        bumpMemoryVersion(store);
+        return true;
+      }
+    }
+    return false;
   });
 }
 
