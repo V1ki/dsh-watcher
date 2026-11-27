@@ -2,12 +2,20 @@ import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import type {
   ActionSink,
+  DoorGuard,
+  GuardDecision,
   HubService,
+  PersonaWardrobe,
+  ResolvedSessionPrincipal,
   SinkInvokeInput,
   SinkInvokeResult,
+  ToolExecutionContext as HubToolExecutionContext,
+  VaultVisibility,
   WatcherDb,
 } from '@local/dsh-hub/contracts';
+import { PUBLIC_TAINT_WARNING_TEXT } from '@local/dsh-hub';
 import type { GitHubAuthAccessor, GitHubAuthToken } from './auth.js';
+import { resolveGitHubOutboundTargetCircle } from './vault-provider.js';
 
 const GITHUB_API = 'https://api.github.com';
 const SELF_MARKER_REGEX = /<!--\s*dsh-watch-self:([a-zA-Z0-9._:-]+)\s*-->/;
@@ -17,6 +25,8 @@ export interface GitHubRepoEntry {
   localPath?: string;
   defaultBranch?: string;
   sensitive?: boolean;
+  private?: boolean;
+  visibility?: 'public' | 'private' | 'internal';
   autoSend?: boolean;
   enabled?: boolean;
   personaId?: string | null;
@@ -55,6 +65,8 @@ export interface CreateGitHubSinkOptions {
   config?: GitHubSinkConfig;
   credentials: GitHubAuthAccessor;
   db?: DbHandle;
+  guard?: DoorGuard | null;
+  getWardrobe?: () => PersonaWardrobe | null;
   onPublished?: (meta: GitHubPublishedMeta) => void;
   fetchImpl?: FetchLike;
 }
@@ -65,18 +77,7 @@ export interface ExtendedSinkInvokeInput extends SinkInvokeInput {
   approved?: boolean;
 }
 
-export interface ToolExecutionContext {
-  agent?: {
-    id?: string;
-    session?: {
-      header?: {
-        cwd?: string;
-        delegationDepth?: number;
-        origin?: string;
-      };
-    };
-  };
-}
+export type ToolExecutionContext = HubToolExecutionContext;
 
 export interface ToolDefinition {
   name: string;
@@ -89,9 +90,18 @@ export interface ToolsRegistryLike {
   register?: (def: ToolDefinition) => (() => void) | void;
 }
 
+export type StageToolsHubLike = Pick<HubService, 'invokeSink'> &
+  Partial<
+    Pick<
+      HubService,
+      'resolveSessionPrincipal' | 'isSessionTainted' | 'guard' | 'getWardrobe' | 'wardrobe'
+    >
+  >;
+
 export interface StageToolsContext {
-  hub?: Pick<HubService, 'invokeSink'>;
-  watcher?: Pick<HubService, 'invokeSink'>;
+  hub?: StageToolsHubLike;
+  watcher?: StageToolsHubLike;
+  personaWardrobe?: PersonaWardrobe;
   get?: (name: string) => unknown;
   tools?: ToolsRegistryLike;
 }
@@ -222,6 +232,8 @@ export function createGitHubSink(opts: CreateGitHubSinkOptions): GitHubActionSin
     config = {},
     credentials,
     db = null,
+    guard = null,
+    getWardrobe,
     onPublished,
     fetchImpl = globalThis.fetch as unknown as FetchLike,
   } = opts;
@@ -248,17 +260,78 @@ export function createGitHubSink(opts: CreateGitHubSinkOptions): GitHubActionSin
         return { status: 'failed', detail: 'Missing target.repo or target.number' };
       }
 
+      const targetCircle: VaultVisibility =
+        input.targetCircle ??
+        resolveGitHubOutboundTargetCircle(repo, { config: activeConfig, getWardrobe });
       const autoSend = shouldAutoSend(repo, activeConfig);
       const approvedInDb = isDraftApprovedInDb(sqlite, input.idempotencyKey);
+      const isApproved = input.approved === true || approvedInDb;
+
+      let gate: GuardDecision | null = null;
+      if (guard && !isApproved) {
+        gate = await guard.beforeSendOut({
+          hook: 'beforeSendOut',
+          source: 'github',
+          sinkId,
+          action: input.action,
+          roomKey: `github:${repo}#${number}`,
+          sessionId: input.sessionId ?? null,
+          targetCircle,
+          target: input.target,
+          payload: input.payload,
+        });
+        if (!gate.allow) {
+          return { status: 'skipped', detail: gate.reason ?? 'blocked_by_guard' };
+        }
+      }
+
+      const forceStageByGuard = gate?.stageOnly === true && !isApproved;
+      const payloadHasPublicWarning = input.payload?.publicTaintWarning === true && !isApproved;
+      const publicTaintWarning =
+        !isApproved && (gate?.publicTaintWarning === true || payloadHasPublicWarning);
+      const warningText = publicTaintWarning
+        ? (gate?.warningText ||
+            (typeof input.payload?.taintWarning === 'string' && input.payload.taintWarning.trim()
+              ? input.payload.taintWarning
+              : PUBLIC_TAINT_WARNING_TEXT))
+        : undefined;
       const mustStage =
-        input.stageOnly === true || (!autoSend && input.approved !== true && !approvedInDb);
+        input.stageOnly === true || forceStageByGuard || (!autoSend && !isApproved);
 
       if (mustStage) {
-        const { draftId } = persistStagedDraft(sqlite, { sinkId, input, repo, number });
+        const basePreview =
+          input.previewText ||
+          `[GH ${input.action} ${repo}#${number}] ${String(input.payload?.body || '').slice(0, 140)}`;
+        const previewText =
+          warningText && !basePreview.includes(warningText)
+            ? `${warningText}\n\n${basePreview}`
+            : basePreview;
+        const enrichedPayload: Record<string, unknown> =
+          publicTaintWarning && warningText
+            ? {
+                ...(input.payload ?? {}),
+                publicTaintWarning: true,
+                taintWarning: warningText,
+                targetCircle,
+              }
+            : (input.payload ?? {});
+        const draftInput: ExtendedSinkInvokeInput = {
+          ...input,
+          targetCircle,
+          payload: enrichedPayload,
+          previewText,
+        };
+        const { draftId } = persistStagedDraft(sqlite, { sinkId, input: draftInput, repo, number });
         return {
           status: 'staged',
           draftId,
-          detail: `Staged ${input.action} draft for ${repo}#${number} (awaiting approval)`,
+          ...(forceStageByGuard ? { stageOnlyForced: true } : {}),
+          ...(publicTaintWarning && warningText
+            ? { publicTaintWarning: true, warningText }
+            : {}),
+          detail: warningText
+            ? `${warningText} — Staged ${input.action} draft for ${repo}#${number} (awaiting approval)`
+            : `Staged ${input.action} draft for ${repo}#${number} (awaiting approval)`,
         };
       }
 
@@ -359,29 +432,148 @@ export function createGitHubSink(opts: CreateGitHubSinkOptions): GitHubActionSin
   };
 }
 
-function assertRootSessionCaller(exec?: ToolExecutionContext): { sessionId: string; cwd?: string } {
-  const sessionId = exec?.agent?.id;
+function assertAuthorizedGitHubOutboundCaller(
+  hub: StageToolsHubLike,
+  repo: string,
+  exec?: ToolExecutionContext,
+): { sessionId: string; cwd?: string; principal: ResolvedSessionPrincipal | null } {
+  const rawSessionId = typeof exec?.agent?.id === 'string' ? exec.agent.id.trim() : '';
   const header = exec?.agent?.session?.header;
-  if (!sessionId) {
+  if (!rawSessionId) {
     throw new Error('gh_stage_* tools require an active DSH root session context (exec.agent.id).');
   }
   if (header && ((header.delegationDepth ?? 0) > 0 || header.origin === 'subagent')) {
     throw new Error('Subagents are not permitted to invoke GitHub outbound tools.');
   }
-  return { sessionId, cwd: header?.cwd };
+
+  if (typeof hub.resolveSessionPrincipal === 'function') {
+    const principal = hub.resolveSessionPrincipal(exec);
+    if (!principal.sessionId) {
+      throw new Error('gh_stage_* tools require an active DSH root session context (exec.agent.id).');
+    }
+    if (principal.isSubagent || principal.delegationDepth > 0) {
+      throw new Error('Subagents are not permitted to invoke GitHub outbound tools.');
+    }
+    if (principal.role === 'owner_session' || principal.role === 'interactive') {
+      return { sessionId: principal.sessionId, cwd: header?.cwd, principal };
+    }
+    if (principal.role === 'worker') {
+      const boundRepo =
+        typeof principal.boundRepo === 'string' ? principal.boundRepo.trim().toLowerCase() : '';
+      const targetRepo = repo.trim().toLowerCase();
+      if (!boundRepo || !targetRepo || boundRepo !== targetRepo) {
+        throw new Error(
+          `Worker session is bound to "${principal.boundRepo ?? 'none'}" and cannot invoke GitHub outbound tools for "${repo}".`,
+        );
+      }
+      return { sessionId: principal.sessionId, cwd: header?.cwd, principal };
+    }
+    throw new Error(
+      `Session role "${principal.role}" is not permitted to invoke GitHub outbound tools.`,
+    );
+  }
+
+  return { sessionId: rawSessionId, cwd: header?.cwd, principal: null };
 }
 
 export function registerGitHubStageTools(
   ctx: StageToolsContext,
-  opts: { config?: GitHubSinkConfig; sinkId?: string } = {},
+  opts: {
+    config?: GitHubSinkConfig;
+    sinkId?: string;
+    getWardrobe?: () => PersonaWardrobe | null;
+  } = {},
 ): Array<() => void> {
-  const { config = {}, sinkId = 'github.draft' } = opts;
+  const { config = {}, sinkId = 'github.draft', getWardrobe } = opts;
   const hub = ctx.hub ?? ctx.watcher;
   const tools =
     typeof ctx.get === 'function'
       ? (ctx.get('tools') as ToolsRegistryLike | undefined)
       : ctx.tools;
   if (!tools?.register || !hub) return [];
+
+  const resolveWardrobe = (): PersonaWardrobe | null => {
+    if (getWardrobe) {
+      const fromOpt = getWardrobe();
+      if (fromOpt) return fromOpt;
+    }
+    const fromCtx =
+      typeof ctx.get === 'function'
+        ? (ctx.get('personaWardrobe') as PersonaWardrobe | undefined)
+        : ctx.personaWardrobe;
+    return fromCtx ?? hub.getWardrobe?.() ?? hub.wardrobe ?? null;
+  };
+
+  const invokeWithOutboundPolicy = async (params: {
+    action: 'issue_comment' | 'pr_review';
+    repo: string;
+    number: number;
+    target: Record<string, unknown>;
+    payload: Record<string, unknown>;
+    previewText: string;
+    idempotencyKey: string;
+    stageOnlyRequested: boolean;
+    exec?: ToolExecutionContext;
+  }): Promise<SinkInvokeResult> => {
+    const {
+      action,
+      repo,
+      number,
+      target,
+      payload,
+      previewText,
+      idempotencyKey,
+      stageOnlyRequested,
+      exec,
+    } = params;
+    const { sessionId, principal } = assertAuthorizedGitHubOutboundCaller(hub, repo, exec);
+    const targetCircle = resolveGitHubOutboundTargetCircle(repo, {
+      config,
+      getWardrobe: resolveWardrobe,
+    });
+    const isTainted = Boolean(principal?.tainted || hub.isSessionTainted?.(sessionId));
+    const autoSend = stageOnlyRequested ? false : shouldAutoSend(repo, config);
+    const forceStageByTaint = isTainted;
+    const publicTaintWarning = isTainted && targetCircle === 'external';
+    const enrichedPayload: Record<string, unknown> = publicTaintWarning
+      ? {
+          ...payload,
+          publicTaintWarning: true,
+          taintWarning: PUBLIC_TAINT_WARNING_TEXT,
+          targetCircle,
+        }
+      : payload;
+
+    const invokeInput: ExtendedSinkInvokeInput = {
+      action,
+      target: { ...target, repo, number },
+      payload: enrichedPayload,
+      previewText,
+      idempotencyKey,
+      sessionId,
+      targetCircle,
+      stageOnly: !autoSend || forceStageByTaint,
+    };
+
+    const result = await hub.invokeSink(sinkId, invokeInput);
+    if (result.status === 'staged' && (result.publicTaintWarning || publicTaintWarning)) {
+      const warningText = result.warningText ?? PUBLIC_TAINT_WARNING_TEXT;
+      return {
+        ...result,
+        ...(result.stageOnlyForced || forceStageByTaint ? { stageOnlyForced: true } : {}),
+        publicTaintWarning: true,
+        warningText,
+        detail: result.detail ?? warningText,
+      };
+    }
+    if (result.status === 'staged' && forceStageByTaint && !result.stageOnlyForced) {
+      return {
+        ...result,
+        stageOnlyForced: true,
+      };
+    }
+    return result;
+  };
 
   const stageReply = tools.register({
     name: 'gh_stage_reply',
@@ -401,21 +593,20 @@ export function registerGitHubStageTools(
       },
     },
     execute: async (args, exec) => {
-      const { sessionId } = assertRootSessionCaller(exec);
       const repo = String(args.repo || '');
       const number = Number(args.number || 0);
       const body = String(args.body || '');
-      const autoSend = args.stageOnly === true ? false : shouldAutoSend(repo, config);
-      const invokeInput: ExtendedSinkInvokeInput = {
+      return invokeWithOutboundPolicy({
         action: 'issue_comment',
+        repo,
+        number,
         target: { repo, number },
         payload: { body },
         previewText: `[GH Comment ${repo}#${number}] ${body.slice(0, 120)}`,
         idempotencyKey: `gh-reply:${repo}#${number}:${randomUUID()}`,
-        sessionId,
-        stageOnly: !autoSend,
-      };
-      return hub.invokeSink(sinkId, invokeInput);
+        stageOnlyRequested: args.stageOnly === true,
+        exec,
+      });
     },
   });
 
@@ -446,22 +637,21 @@ export function registerGitHubStageTools(
       },
     },
     execute: async (args, exec) => {
-      const { sessionId } = assertRootSessionCaller(exec);
       const repo = String(args.repo || '');
       const number = Number(args.number || 0);
       const body = String(args.body || '');
       const event = String(args.event || 'COMMENT');
-      const autoSend = args.stageOnly === true ? false : shouldAutoSend(repo, config);
-      const invokeInput: ExtendedSinkInvokeInput = {
+      return invokeWithOutboundPolicy({
         action: 'pr_review',
+        repo,
+        number,
         target: { repo, number, prAuthor: args.prAuthor },
         payload: { body, event, comments: Array.isArray(args.comments) ? args.comments : [] },
         previewText: `[GH Review (${event}) ${repo}#${number}] ${body.slice(0, 120)}`,
         idempotencyKey: `gh-review:${repo}#${number}:${randomUUID()}`,
-        sessionId,
-        stageOnly: !autoSend,
-      };
-      return hub.invokeSink(sinkId, invokeInput);
+        stageOnlyRequested: args.stageOnly === true,
+        exec,
+      });
     },
   });
 

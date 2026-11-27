@@ -56,6 +56,13 @@ import {
   mountGitHubConnectorHttpRoutes,
   type GitHubConnectorHttpContext,
 } from './http-routes.js';
+import {
+  createGitHubVaultProvider,
+  resolveGitHubOutboundTargetCircle,
+  resolveGitHubRepoVaultVisibility,
+  type GitHubVaultProviderOptions,
+  type GitHubVisibilityOptions,
+} from './vault-provider.js';
 
 export const name = 'connector-github';
 
@@ -718,10 +725,19 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
     db,
   });
 
+  const resolveWardrobe = (): PersonaWardrobe | null => {
+    const fromCtx =
+      typeof ctx.get === 'function'
+        ? (ctx.get('personaWardrobe') as PersonaWardrobe | undefined)
+        : ctx.personaWardrobe;
+    return fromCtx ?? hub.getWardrobe?.() ?? hub.wardrobe ?? null;
+  };
+
   const sink = createGitHubSink({
     config,
     credentials,
     db,
+    getWardrobe: resolveWardrobe,
     fetchImpl,
     onPublished: (meta) => poller.recordSelfPublished(meta),
   });
@@ -1039,7 +1055,10 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
 
   let stageToolDisposers: Array<() => void> = [];
   try {
-    stageToolDisposers = registerGitHubStageTools({ ...ctx, hub, watcher: hub }, { config, sinkId: sink.id });
+    stageToolDisposers = registerGitHubStageTools(
+      { ...ctx, hub, watcher: hub },
+      { config, sinkId: sink.id, getWardrobe: resolveWardrobe },
+    );
   } catch {
     stageToolDisposers = [];
   }
@@ -1050,14 +1069,6 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
     skillDisposers = [];
   }
 
-  const resolveWardrobe = (): PersonaWardrobe | null => {
-    const fromCtx =
-      typeof ctx.get === 'function'
-        ? (ctx.get('personaWardrobe') as PersonaWardrobe | undefined)
-        : ctx.personaWardrobe;
-    return fromCtx ?? hub.getWardrobe?.() ?? hub.wardrobe ?? null;
-  };
-
   let unmountHttp: () => void = () => {};
   if (typeof ctx.inject === 'function') {
     ctx.inject(['webServer'], (webCtx) => {
@@ -1067,6 +1078,16 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
   } else {
     unmountHttp = mountGitHubConnectorHttpRoutes(ctx, admin, { getWardrobe: resolveWardrobe });
   }
+
+  const vaultProvider = createGitHubVaultProvider({
+    db,
+    hub,
+    getConfig: () => config,
+    getWardrobe: resolveWardrobe,
+    listSnapshots: () => poller.listIssueSnapshots(),
+    listRecentEvents: () => poller.listRecentEvents(),
+  });
+  const vaultDisposer = hub.registerVaultProvider?.(vaultProvider);
 
   const connectorDisposer = hub.registerConnector?.({
     id: 'github',
@@ -1089,6 +1110,7 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
     hub.registerSource(poller.asWatchSource()),
     hub.registerResolver(resolver.asEntityResolver()),
     hub.registerSink(sink),
+    vaultDisposer,
     connectorDisposer,
     adminDisposer,
     ...stageToolDisposers,
@@ -1115,7 +1137,7 @@ export function apply(ctx: GitHubPluginContext, rawConfig: RawGitHubAdapterConfi
   ctx.on?.('dispose', dispose);
   ctx.effect?.(() => dispose);
 
-  return { config, credentials, poller, resolver, sink, admin, dispose };
+  return { config, credentials, poller, resolver, sink, admin, vaultProvider, dispose };
 }
 
 export {
@@ -1140,5 +1162,8 @@ export {
   checkLocalOwnerRequest,
   createGitHubConnectorHttpHandler,
   mountGitHubConnectorHttpRoutes,
+  createGitHubVaultProvider,
+  resolveGitHubOutboundTargetCircle,
+  resolveGitHubRepoVaultVisibility,
 };
-export type { GitHubRecentEvent };
+export type { GitHubRecentEvent, GitHubVaultProviderOptions, GitHubVisibilityOptions };

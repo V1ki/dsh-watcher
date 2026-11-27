@@ -98,7 +98,7 @@ interface ReactionState {
   comments: Record<string, ReactionCounts>;
 }
 
-interface IssueSnapshotState {
+export interface IssueSnapshotState {
   updatedAt: string | null;
   title: string;
   state: string;
@@ -108,10 +108,23 @@ interface IssueSnapshotState {
   commentsCount: number;
   lastCommentSyncAt?: string;
   lastReviewSyncAt?: string;
+  isPr?: boolean;
+  author?: string;
+  url?: string;
+  bodySnippet?: string;
+  merged?: boolean;
+}
+
+export interface RepoIssueSnapshotEntry {
+  repo: string;
+  number: number;
+  isPrivate?: boolean;
+  snapshot: IssueSnapshotState;
 }
 
 interface RepoIssueSnapshotStore {
   lastMaxUpdatedAt?: string;
+  isPrivate?: boolean;
   items: Record<string, IssueSnapshotState>;
 }
 
@@ -137,6 +150,13 @@ interface GitHubNotificationLike {
   subject?: { url?: string; title?: string; type?: string };
 }
 
+interface GitHubPullRequestRefLike {
+  url?: string;
+  html_url?: string;
+  merged_at?: string | null;
+  merged?: boolean;
+}
+
 interface GitHubIssueLike {
   id?: string | number;
   number: number;
@@ -145,7 +165,10 @@ interface GitHubIssueLike {
   state?: string;
   draft?: boolean;
   comments?: number;
-  pull_request?: unknown;
+  merged?: boolean;
+  merged_at?: string | null;
+  pull_request?: GitHubPullRequestRefLike | boolean | null;
+  repository?: { private?: boolean; visibility?: string };
   html_url?: string;
   created_at?: string;
   updated_at?: string;
@@ -233,11 +256,42 @@ function normalizeLabels(labels: GitHubIssueLike['labels']): string[] {
   return [...out].sort((a, b) => a.localeCompare(b));
 }
 
-function buildIssueSnapshot(item: GitHubIssueLike, labels: string[]): IssueSnapshotState {
+function isPullRequestMerged(item: GitHubIssueLike, isPr: boolean): boolean {
+  if (!isPr) return false;
+  if (item.merged === true) return true;
+  if (typeof item.merged_at === 'string' && item.merged_at.trim().length > 0) return true;
+  if (item.pull_request && typeof item.pull_request === 'object') {
+    if (item.pull_request.merged === true) return true;
+    if (typeof item.pull_request.merged_at === 'string' && item.pull_request.merged_at.trim().length > 0) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function buildCompactBodySnippet(body: string | null | undefined): string | undefined {
+  const cleaned = String(body || '')
+    .replace(/<!--[\s\S]*?-->/g, ' ')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return undefined;
+  return cleaned.length > 220 ? `${cleaned.slice(0, 219).trimEnd()}…` : cleaned;
+}
+
+function buildIssueSnapshot(
+  item: GitHubIssueLike,
+  labels: string[],
+  isPr: boolean,
+  merged: boolean,
+): IssueSnapshotState {
   const commentsCount =
     typeof item.comments === 'number' && Number.isFinite(item.comments) && item.comments >= 0
       ? Math.floor(item.comments)
       : 0;
+  const author = typeof item.user?.login === 'string' && item.user.login.trim() ? item.user.login.trim() : undefined;
+  const url = typeof item.html_url === 'string' && item.html_url.trim() ? item.html_url.trim() : undefined;
+  const bodySnippet = buildCompactBodySnippet(item.body);
   return {
     updatedAt: item.updated_at || null,
     title: item.title || '',
@@ -246,6 +300,11 @@ function buildIssueSnapshot(item: GitHubIssueLike, labels: string[]): IssueSnaps
     labels,
     bodyHash: hashText(item.body || ''),
     commentsCount,
+    isPr,
+    ...(author ? { author } : {}),
+    ...(url ? { url } : {}),
+    ...(bodySnippet ? { bodySnippet } : {}),
+    ...(isPr && merged ? { merged: true } : {}),
   };
 }
 
@@ -549,10 +608,16 @@ export class GitHubPoller {
             : 0,
         lastCommentSyncAt: typeof e.lastCommentSyncAt === 'string' ? e.lastCommentSyncAt : undefined,
         lastReviewSyncAt: typeof e.lastReviewSyncAt === 'string' ? e.lastReviewSyncAt : undefined,
+        ...(typeof e.isPr === 'boolean' ? { isPr: e.isPr } : {}),
+        ...(typeof e.author === 'string' && e.author ? { author: e.author } : {}),
+        ...(typeof e.url === 'string' && e.url ? { url: e.url } : {}),
+        ...(typeof e.bodySnippet === 'string' && e.bodySnippet ? { bodySnippet: e.bodySnippet } : {}),
+        ...(e.merged === true ? { merged: true } : {}),
       };
     }
     return {
       lastMaxUpdatedAt: typeof val?.lastMaxUpdatedAt === 'string' ? val.lastMaxUpdatedAt : undefined,
+      isPrivate: typeof val?.isPrivate === 'boolean' ? val.isPrivate : undefined,
       items,
     };
   }
@@ -571,9 +636,80 @@ export class GitHubPoller {
     this._writeCursor(`state:repo_issues:${repo}`, {
       value: {
         ...(store.lastMaxUpdatedAt ? { lastMaxUpdatedAt: store.lastMaxUpdatedAt } : {}),
+        ...(typeof store.isPrivate === 'boolean' ? { isPrivate: store.isPrivate } : {}),
         items: trimmed,
       },
     });
+  }
+
+  listIssueSnapshots(): RepoIssueSnapshotEntry[] {
+    const results: RepoIssueSnapshotEntry[] = [];
+    const prefix = 'state:repo_issues:';
+    const parseStore = (repo: string, rawVal: Record<string, unknown>): void => {
+      const isPrivate = typeof rawVal.isPrivate === 'boolean' ? rawVal.isPrivate : undefined;
+      const rawItems =
+        rawVal.items && typeof rawVal.items === 'object' && !Array.isArray(rawVal.items)
+          ? (rawVal.items as Record<string, unknown>)
+          : {};
+      for (const [key, entry] of Object.entries(rawItems)) {
+        const number = Number(key);
+        if (!Number.isInteger(number) || number <= 0) continue;
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+        const e = entry as Record<string, unknown>;
+        results.push({
+          repo,
+          number,
+          isPrivate,
+          snapshot: {
+            updatedAt: typeof e.updatedAt === 'string' ? e.updatedAt : null,
+            title: typeof e.title === 'string' ? e.title : '',
+            state: typeof e.state === 'string' ? e.state : '',
+            draft: Boolean(e.draft),
+            labels: Array.isArray(e.labels) ? e.labels.map(String) : [],
+            bodyHash: typeof e.bodyHash === 'string' ? e.bodyHash : '',
+            commentsCount:
+              typeof e.commentsCount === 'number' && Number.isFinite(e.commentsCount)
+                ? e.commentsCount
+                : 0,
+            lastCommentSyncAt: typeof e.lastCommentSyncAt === 'string' ? e.lastCommentSyncAt : undefined,
+            lastReviewSyncAt: typeof e.lastReviewSyncAt === 'string' ? e.lastReviewSyncAt : undefined,
+            ...(typeof e.isPr === 'boolean' ? { isPr: e.isPr } : {}),
+            ...(typeof e.author === 'string' && e.author ? { author: e.author } : {}),
+            ...(typeof e.url === 'string' && e.url ? { url: e.url } : {}),
+            ...(typeof e.bodySnippet === 'string' && e.bodySnippet ? { bodySnippet: e.bodySnippet } : {}),
+            ...(e.merged === true ? { merged: true } : {}),
+          },
+        });
+      }
+    };
+
+    if (this.sqlite) {
+      try {
+        const rows = this.sqlite
+          .prepare(
+            `SELECT cursor_key, cursor_value
+             FROM source_cursors
+             WHERE source_id = ? AND cursor_key LIKE 'state:repo_issues:%'`,
+          )
+          .all(SOURCE_ID) as Array<{ cursor_key: string; cursor_value: string }>;
+        for (const row of rows) {
+          const repo = row.cursor_key.slice(prefix.length).trim();
+          if (!repo) continue;
+          const val = safeJsonParse<Record<string, unknown>>(row.cursor_value, {});
+          parseStore(repo, val);
+        }
+      } catch {
+      }
+      return results;
+    }
+
+    for (const [key, rec] of this.memCursors.entries()) {
+      if (!key.startsWith(prefix)) continue;
+      const repo = key.slice(prefix.length).trim();
+      if (!repo) continue;
+      parseStore(repo, rec.value);
+    }
+    return results;
   }
 
   private _isPinnedTarget(repo: string, number: number): boolean {
@@ -1212,8 +1348,22 @@ export class GitHubPoller {
     for (const item of data as GitHubIssueLike[]) {
       const entityKey = `github:${repo}#${item.number}`;
       const isPr = Boolean(item.pull_request);
+      const merged = isPullRequestMerged(item, isPr);
       const reactions = extractReactions(item);
       nextRepoMaxUpdatedAt = maxIsoTimestamp(nextRepoMaxUpdatedAt, item.updated_at);
+      if (typeof item.repository?.private === 'boolean' && store.isPrivate !== item.repository.private) {
+        store.isPrivate = item.repository.private;
+        storeDirty = true;
+      } else if (typeof item.repository?.visibility === 'string') {
+        const vis = item.repository.visibility.trim().toLowerCase();
+        if (vis === 'public' && store.isPrivate !== false) {
+          store.isPrivate = false;
+          storeDirty = true;
+        } else if ((vis === 'private' || vis === 'internal') && store.isPrivate !== true) {
+          store.isPrivate = true;
+          storeDirty = true;
+        }
+      }
 
       if (reactions) {
         const state = this._loadReactionState(entityKey);
@@ -1242,7 +1392,7 @@ export class GitHubPoller {
       const labels = normalizeLabels(item.labels);
       const itemKey = String(item.number);
       const prev = store.items[itemKey];
-      const nextSnapshot = buildIssueSnapshot(item, labels);
+      const nextSnapshot = buildIssueSnapshot(item, labels, isPr, merged);
       const isPinned = this._isPinnedTarget(repo, item.number);
 
       if (!prev) {
@@ -1477,6 +1627,7 @@ export class GitHubPoller {
             isPr,
             state: item.state,
             prevState: prev.state,
+            ...(isPr && merged ? { merged: true } : {}),
             draft: Boolean(item.draft),
             title: item.title || '',
             body: item.body || '',
@@ -1485,6 +1636,48 @@ export class GitHubPoller {
             removedLabels: diff.removedLabels,
             changes: diff.changes,
             reactions: reactions?.raw,
+            ...(isPr && linkedIssues.length > 0 ? { linkedIssues } : {}),
+          },
+          rawRef: {
+            url: item.html_url,
+            externalId: String(item.id ?? item.number),
+            repo,
+            number: item.number,
+          },
+        });
+        emitted += 1;
+      } else if (
+        prev.state.toLowerCase() === 'open' &&
+        String(item.state || '').toLowerCase() === 'closed'
+      ) {
+        const trustLevel = this.classifyTrust(item.user);
+        const eventType = isPr
+          ? (merged ? 'github.pr.merged' : 'github.pr.closed')
+          : 'github.issue.closed';
+        const terminalTag = merged ? 'merged' : 'closed';
+        await this._emitEvent({
+          id: randomUUID(),
+          source: SOURCE_ID,
+          type: eventType,
+          dedupeKey: `github:${repo}#${item.number}:lifecycle:${terminalTag}:${item.updated_at || nextSnapshot.bodyHash}`,
+          threadKey: entityKey,
+          entityKey,
+          actor: this.toActor(item.user),
+          trustLevel,
+          occurredAt: item.updated_at || new Date().toISOString(),
+          summary: `${isPr ? 'PR' : 'Issue'} ${repo}#${item.number} (${terminalTag}): ${item.title || ''}`.trim(),
+          payload: {
+            repo,
+            number: item.number,
+            isPr,
+            state: 'closed',
+            prevState: prev.state,
+            ...(isPr && merged ? { merged: true } : {}),
+            lifecycleOnly: true,
+            draft: Boolean(item.draft),
+            title: item.title || '',
+            labels,
+            changes: diff.changes,
             ...(isPr && linkedIssues.length > 0 ? { linkedIssues } : {}),
           },
           rawRef: {
