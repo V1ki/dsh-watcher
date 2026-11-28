@@ -12,6 +12,7 @@
     "build": "pnpm -r --if-present run build",
     "test": "pnpm -r --if-present run test",
     "check:comments": "node scripts/check-no-comments.ts",
+    "check:docs": "node scripts/check-docs.ts",
     "check": "pnpm run check:comments && pnpm run build",
     "deploy:macmini": "node scripts/deploy-macmini.ts"
   },

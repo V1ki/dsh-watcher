@@ -1,36 +1,42 @@
-# dsh-watcher 文档目录（唯一权威文档）
+# dsh-watcher 使用说明书
 
-> 本目录（`dsh-watcher/docs/`）是整个代码库的**唯一权威文档**。
-> 凡是涉及架构、消息流转、配置默认值、工具接口、安全门禁或外发行为的代码改动，**必须在同一次改动中同步更新本目录对应文档**。
+这套文档用大白话讲清这套个人助理系统的日常用法、协作规矩与安全底线，按你关心的问题直接翻对应篇章即可。
 
-## 文档索引
+## 文档总目录
 
-| 编号 | 文档 | 核心内容 |
+| 编号 | 文档 | 一句话看懂讲什么 |
 |---|---|---|
-| 01 | [01-整体框架图.md](./01-整体框架图.md) | 整体结构：独立性格衣柜（`dsh-persona`）、纯确定性 Hub 总控台（`dsh-hub`，0 LLM + 统一 `Vault` 知识检索 + `SessionPrincipal` + `TargetDirectoryProvider` + `onThreadLifecycle`）、Layer-3 Super-agent 大脑（`dsh-router`）、多连接器标准三件套（`WatchSource` + `ActionSink` + `VaultProvider`）、待惦记便签与 DSH 房间 |
-| 02 | [02-消息流转全过程.md](./02-消息流转全过程.md) | 4 条日常消息路线 + Router 冷启动 4 级分诊、无焦点锁微信双向协作（0-LLM 顶层分拣 / 薄 `owner_session` 桥接 / 积压 `≥3` 合并汇总卡 / PR 与 Issue 合并关闭 `lifecycleOnly` 自动销账）、Worker 实物/截图回报与 `thread_subscriptions` 快车道直达的完整走法 |
-| 03 | [03-怎么拆分与落地步骤.md](./03-怎么拆分与落地步骤.md) | 6 个运行时插件 + 1 个聚合包的真实目录结构、独立「Router」「性格衣柜」「GitHub」面板、无损迁移、`dsh-connector-wxarc` 瘦身（单主人 `controllerId`、退役 `wxarc_admin_sessions`、多模态旁路异步预处理）与常用命令 |
-| 04 | [04-以后再加的安全门禁.md](./04-以后再加的安全门禁.md) | 安全与隐私护栏：内存 `SessionPrincipal` 与四档 Vault 可见性（`0/1/2/3`）、粘性污点锁（Sticky Taint）与 `DoorGuard` 公网草稿污点警告、Router `RouterApprovals` + `tools/pre-execute` 护栏、Worker 无网沙箱，以及 `DoorGuard` 可插拔钩子 |
-| 05 | [05-消息怎么真正发出去.md](./05-消息怎么真正发出去.md) | 微信 GUI 外发（含文字+截图串行发送、双模式桥接、`controllerId` 透出与统一 Hub 鉴权/污点草稿箱）与 GitHub API 外发（独立「GitHub」面板、原生 GitHub App 机器人、默认草稿箱、主体鉴权 + 污点公网草稿警告、防回环与不重发） |
+| 01 | [01-整体长什么样](./01-整体长什么样.md) | 六个模块各管哪一摊，小纸条和独立房间怎么配合 |
+| 02 | [02-日常消息怎么走](./02-日常消息怎么走.md) | 微信和 GitHub 新动态怎么进收件箱、分诊与合房 |
+| 03 | [03-微信上怎么指挥它](./03-微信上怎么指挥它.md) | 私聊助理、按作息收提醒、发口令派活和群里跨群查档 |
+| 04 | [04-性格衣柜与查资料](./04-性格衣柜与查资料.md) | 学说话口吻、认图记人，以及统一资料库怎么按圈层翻历史 |
+| 05 | [05-待惦记便签怎么主动开口](./05-待惦记便签怎么主动开口.md) | 定时轻提醒、追新闻后续、长期蹲官宣三种便签怎么用 |
+| 06 | [06-安全防线与隐私边界](./06-安全防线与隐私边界.md) | 圈层隔离、防泄密封条、防冒充核验与高危微信确认码 |
+| 07 | [07-消息怎么发出去](./07-消息怎么发出去.md) | 草稿箱把关、微信防发串与双机连接、GitHub 防刷屏 |
+| 08 | [08-安装部署与日常维护](./08-安装部署与日常维护.md) | 插件安装顺序、数据平滑过渡、日常自检和更新维护 |
 
-## 常用验证命令
+## 按常见疑问直达
 
-```bash
-pnpm install
-pnpm run build
-pnpm test
-pnpm run check:comments
-```
+- **刚接触这套系统**：先看 [01-整体长什么样](./01-整体长什么样.md)，五分钟摸清六个模块和房间心智模型。
+- **平时在微信里用**：重点看 [03-微信上怎么指挥它](./03-微信上怎么指挥它.md) 和 [04-性格衣柜与查资料](./04-性格衣柜与查资料.md)。
+- **担心隐私或误发**：直接看 [06-安全防线与隐私边界](./06-安全防线与隐私边界.md) 和 [07-消息怎么发出去](./07-消息怎么发出去.md)。
 
-## 同步更新清单
+## 改了代码怎么同步文档
 
-修改代码时，按影响范围更新对应文档：
+每个代码包只对应 **1 篇** 主责人类文档。代码改动影响日常使用体验时，请整段重写对应篇章里的相关小节；接口、数据库表和内部阈值统一记在各包自己的技术契约里，不倒进本目录。
 
-- 改动独立性格衣柜、风格提炼、24/16 偏好记忆、`foundation` 2-gram 检索、多连接器 `chat_circle` 圈层前缀或只读 `Vault` 知识查询（`packages/dsh-persona`）→ 更新 `01`、`03`、`04`
-- 改动纯确定性事件总线、统一 `Vault`（`vault_search` / `vault_context` / `ctx.provide('vault')`）、`SessionPrincipal` 与粘性污点锁、`TargetDirectoryProvider`、`onThreadLifecycle`、`thread_subscriptions` / `onUnclaimedEvent` / 管理员微信分发总线或 Hub 4 标签页 UI（`packages/dsh-hub`）→ 更新 `01`、`02`、`03`、`04`
-- 改动 Layer-3 Super-agent 路由器、4 级分诊与硬护栏、作息与积压 `≥3` 合并汇总卡、终态自动销账、薄 `owner_session` 桥接与 0-LLM 顶层分拣、`RouterApprovals` / `tools/pre-execute` 护栏、Worker 派发/`router_report_result`、效果统计或 Router 4 标签页 UI（`packages/dsh-router`）→ 更新 `01`、`02`、`03`、`04`
-- 改动 `DoorGuard`、污点草稿警告或安全拦截逻辑（`packages/dsh-hub/src/guard.ts`）→ 更新 `04`、`05`
-- 改动 GitHub 轮询、`lifecycleOnly` 终态补发、`VaultProvider('github')`、原始事件流、图谱、合并预检、性格卡绑定、原生 GitHub App 认证或独立「GitHub」面板（`packages/dsh-connector-github`）→ 更新 `02`、`03`、`05`
-- 改动待惦记便签调度、`VaultProvider('memo')`、Hub 主体/目标目录鉴权或房间工具（`packages/dsh-trigger-memo`）→ 更新 `01`、`02`、`03`、`04`
-- 改动双向微信连接器瘦身（单一 `controllerId`、退役 `wxarc_admin_sessions`、主人多模态旁路预处理、`VaultProvider('wechat'/'nas')`、`TargetDirectoryProvider`、统一 Hub 鉴权、`nasArchiveUrl` 无硬编码默认 IP、SwiftCUA 发送与双模式桥接）（`packages/dsh-connector-wxarc`）→ 更新 `02`、`03`、`04`、`05`
-- 改动聚合清单或端到端集成测试（`packages/dsh-hub-bundle`）→ 更新 `03` 与根目录 `README.md`
+| 代码包 | 对应模块 | 主责人类文档 | 开发者契约 |
+|---|---|---|---|
+| `@local/dsh-persona` | 性格衣柜 | [04-性格衣柜与查资料](./04-性格衣柜与查资料.md) | [技术契约](../packages/dsh-persona/AGENTS.md) |
+| `@local/dsh-hub` | Hub 总控台 | [02-日常消息怎么走](./02-日常消息怎么走.md) | [技术契约](../packages/dsh-hub/AGENTS.md) |
+| `@local/dsh-router` | Router 大脑 | [03-微信上怎么指挥它](./03-微信上怎么指挥它.md) | [技术契约](../packages/dsh-router/AGENTS.md) |
+| `@local/dsh-connector-github` | GitHub 连接器 | [07-消息怎么发出去](./07-消息怎么发出去.md) | [技术契约](../packages/dsh-connector-github/AGENTS.md) |
+| `@local/dsh-connector-wxarc` | 微信连接器 | [07-消息怎么发出去](./07-消息怎么发出去.md) | [技术契约](../packages/dsh-connector-wxarc/AGENTS.md) |
+| `@local/dsh-trigger-memo` | 待惦记便签 | [05-待惦记便签怎么主动开口](./05-待惦记便签怎么主动开口.md) | [技术契约](../packages/dsh-trigger-memo/AGENTS.md) |
+| `@local/dsh-hub-bundle` | 组合安装包 | [08-安装部署与日常维护](./08-安装部署与日常维护.md) | [技术契约](../packages/dsh-hub-bundle/AGENTS.md) |
+
+补充说明：
+
+- 只有顶层模块边界调整时，才顺手更新 [01-整体长什么样](./01-整体长什么样.md)。
+- 涉及权限分级、防泄密封条或高危确认码变动时，统一更新 [06-安全防线与隐私边界](./06-安全防线与隐私边界.md)。
+- 写完文档后，在仓库根目录运行 `pnpm run check:docs` 做自动体检。
