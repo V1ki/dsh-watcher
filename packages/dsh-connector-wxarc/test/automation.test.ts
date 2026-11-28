@@ -1030,3 +1030,100 @@ test('deliverOne resolves multi-member mentions, skips duplicate/missing members
     ['wxid_sender'],
   );
 });
+
+test('deliverOne avoids infinite loop on unknown failed mentionId and discards prepared draft if settings change before send', async (t) => {
+  const f = fixture(t);
+  f.auto.save(policy({ mode: 'send', allChats: true, rules: [] }), 0);
+  f.auto.resolveTarget = async () => ({
+    kind: 'text',
+    sourceId: 'room@chatroom',
+    title: '测试群',
+    search: '测试群',
+    wechatId: '',
+    route: 'group',
+    uniqueTitle: true,
+  });
+  f.auto.resolveSource = (_home: string, ev: any) => ({
+    ...ev,
+    account: '/data/wxid_me_abcd/db_storage',
+    senderId: ev.senderId || 'wxid_sender',
+    sourceKey: ev.sourceKey || 'k1',
+  });
+  f.auto.identify = async (ev: any) => ({
+    ...ev,
+    senderIdentity: {
+      id: 'wxid_sender',
+      nickname: '甲',
+      groupNickname: '',
+      uiName: '甲',
+      uniqueUiName: true,
+    },
+    groupMembers: [
+      { id: 'wxid_sender', nickname: '甲', groupNickname: '', uiName: '甲', uniqueUiName: true },
+    ],
+    mentions: {
+      status: 'verified',
+      sourceKey: ev.sourceKey || 'k1',
+      recipients: ['wxid_me'],
+      toSelf: true,
+    },
+  });
+  let prepareCalls = 0;
+  f.args.cua.prepare = async () => {
+    prepareCalls++;
+    throw Object.assign(
+      new Error('无法唯一核对微信 @ 成员菜单（OCR=空）；已清理本次未发送的 @ 查询和引用'),
+      { mentionId: 'wxid_unmatched' },
+    );
+  };
+  f.store.commit(
+    'text',
+    0,
+    [
+      {
+        id: 1,
+        kind: 'text',
+        session: 'room@chatroom',
+        session_name: '测试群',
+        sender: '甲',
+        text: '@bot 你好',
+        ts: 1000,
+        local_type: 1,
+      },
+    ],
+    100,
+  );
+  await f.auto.collect();
+  f.auto.state(1, 'draft', '', { action: 'reply', text: '收到', replyTo: 'message:1' });
+  const stored = f.auto.job(1);
+  f.store.db
+    .prepare('UPDATE automation_jobs SET event=? WHERE id=1')
+    .run(
+      JSON.stringify({
+        ...stored.event,
+        senderId: 'wxid_sender',
+        sourceKey: 'k1',
+        mentions: { status: 'verified', sourceKey: 'k1', recipients: ['wxid_me'], toSelf: true },
+      }),
+    );
+  await assert.rejects(
+    f.auto.deliverOne(f.auto.job(1) as any, AbortSignal.timeout(5000), 0, 1),
+    /无法唯一核对微信 @ 成员菜单/,
+  );
+  assert.equal(prepareCalls, 1);
+
+  let discarded = 0;
+  f.args.cua.prepare = async () => {
+    f.auto.save(policy({ mode: 'send', allChats: true, rules: [], instructions: '新规则' }), 1);
+    return Object.assign(async () => ({ confirmed: true }), {
+      discard: async () => {
+        discarded++;
+      },
+    });
+  };
+  await assert.rejects(
+    f.auto.deliverOne(f.auto.job(1) as any, AbortSignal.timeout(5000), 0, 1),
+    /设置已改变/,
+  );
+  assert.equal(discarded, 1);
+});

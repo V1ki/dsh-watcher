@@ -138,6 +138,95 @@ const exec: CuaRunner = async (file, args, options) => {
   return { stdout: String(stdout) };
 };
 const APP = 'com.tencent.xinWeChat';
+const STATE_RETRY_DELAYS_MS = [150, 300] as const;
+const NON_TRANSIENT_STATE_ERROR_RE = /桌面已锁定|辅助功能权限/;
+const MENTION_POST_CLICK_PAUSE_MS = 180;
+const EMOJI_TOKEN_RE = /\[[^\[\]\r\n]{1,16}\]/g;
+const DRAFT_CLEANUP_HANDLED = Symbol('draftCleanupHandled');
+
+interface CleanupHandledError extends Error {
+  [DRAFT_CLEANUP_HANDLED]?: true;
+  mentionId?: string;
+}
+
+const escapeRegExp = (text: string): string => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const isInsertedMentionValue = (value: string, axPrefixSoFar: string): boolean =>
+  value.startsWith(axPrefixSoFar) && /^\uFFFC[ \u2005]*$/.test(value.slice(axPrefixSoFar.length));
+
+const matchesOwnedBody = (actual: string, axPrefix: string, body: string): boolean => {
+  if (!actual.startsWith(axPrefix)) return false;
+  const rest = actual.slice(axPrefix.length);
+  if (rest === body) return true;
+  if (!body.includes('[')) return false;
+  const parts: string[] = [];
+  let lastIndex = 0;
+  EMOJI_TOKEN_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = EMOJI_TOKEN_RE.exec(body)) !== null) {
+    parts.push(escapeRegExp(body.slice(lastIndex, match.index)));
+    parts.push(`(?:${escapeRegExp(match[0])}|\\uFFFC)`);
+    lastIndex = match.index + match[0].length;
+  }
+  if (lastIndex === 0) return false;
+  parts.push(escapeRegExp(body.slice(lastIndex)));
+  return new RegExp(`^${parts.join('')}$`).test(rest);
+};
+
+const formatCuaCause = (error: unknown): string => {
+  if (!error || typeof error !== 'object') return '';
+  const record = error as { code?: unknown; stderr?: unknown };
+  const parts: string[] = [];
+  if (
+    (typeof record.code === 'number' && Number.isFinite(record.code)) ||
+    (typeof record.code === 'string' && record.code.trim())
+  ) {
+    parts.push(`code=${String(record.code).trim()}`);
+  }
+  const stderr = typeof record.stderr === 'string' ? record.stderr.replace(/\s+/g, ' ').trim() : '';
+  if (stderr) {
+    parts.push(stderr.length > 120 ? stderr.slice(0, 117) + '...' : stderr);
+  }
+  return parts.join(', ');
+};
+
+const isNonTransientStateError = (error: unknown): boolean => {
+  const queue: unknown[] = [error];
+  const seen = new Set<unknown>();
+  while (queue.length > 0) {
+    const current = queue.shift();
+    if (!current || seen.has(current)) continue;
+    seen.add(current);
+    if (typeof current === 'string') {
+      if (NON_TRANSIENT_STATE_ERROR_RE.test(current)) return true;
+      continue;
+    }
+    if (typeof current !== 'object') continue;
+    const record = current as { message?: unknown; stderr?: unknown; code?: unknown; cause?: unknown };
+    if (record.code === 'ENOENT') return true;
+    if (typeof record.message === 'string' && NON_TRANSIENT_STATE_ERROR_RE.test(record.message)) {
+      return true;
+    }
+    if (typeof record.stderr === 'string' && NON_TRANSIENT_STATE_ERROR_RE.test(record.stderr)) {
+      return true;
+    }
+    if (record.cause !== undefined) queue.push(record.cause);
+  }
+  return false;
+};
+
+const markCleanupHandled = (
+  error: Error,
+  extra?: { mentionId?: string },
+): CleanupHandledError => {
+  const marked = error as CleanupHandledError;
+  marked[DRAFT_CLEANUP_HANDLED] = true;
+  if (extra?.mentionId !== undefined) marked.mentionId = extra.mentionId;
+  return marked;
+};
+
+const isCleanupHandled = (error: unknown): boolean =>
+  Boolean(error && typeof error === 'object' && DRAFT_CLEANUP_HANDLED in error);
 
 class QuoteUnavailableError extends Error {
   readonly menuOpened: boolean;
@@ -319,8 +408,14 @@ export class SwiftCua {
       const killed = Boolean(
         e && typeof e === 'object' && 'killed' in e && (e as { killed?: unknown }).killed,
       );
+      const causeDetail = formatCuaCause(e);
+      const detailParts = [
+        ...(signal.aborted || killed ? ['取消或超时'] : []),
+        ...(causeDetail ? [causeDetail] : []),
+      ];
+      const suffix = detailParts.length > 0 ? `（${detailParts.join('：')}）` : '';
       throw new Error(
-        `SwiftCUA ${method} 操作失败${signal.aborted || killed ? '（取消或超时）' : ''}；请检查微信界面与 SwiftCUA 服务`,
+        `SwiftCUA ${method} 操作失败${suffix}；请检查微信界面与 SwiftCUA 服务`,
         { cause: e },
       );
     }
@@ -331,12 +426,27 @@ export class SwiftCua {
     extra: Record<string, unknown> = {},
     activate = false,
   ): Promise<CuaAppState> {
-    const response = (await this.call(
-      'getAppState',
-      { includeScreenshot: false, disableDiff: true, limit: 1000, depth: 15, ...extra },
-      signal,
-      activate,
-    )) as { state?: CuaAppState };
+    let response: { state?: CuaAppState } | undefined;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        response = (await this.call(
+          'getAppState',
+          { includeScreenshot: false, disableDiff: true, limit: 1000, depth: 15, ...extra },
+          signal,
+          activate,
+        )) as { state?: CuaAppState };
+        break;
+      } catch (e) {
+        if (
+          signal.aborted ||
+          isNonTransientStateError(e) ||
+          attempt >= STATE_RETRY_DELAYS_MS.length
+        ) {
+          throw e;
+        }
+        await this.pause(STATE_RETRY_DELAYS_MS[attempt], signal);
+      }
+    }
     const { state } = response;
     if (!state || state.info?.frontmostApp === 'com.apple.loginwindow') {
       throw new Error('Mac mini 桌面已锁定');
@@ -1214,9 +1324,56 @@ export class SwiftCua {
       signal,
       true,
     );
-    await this.pause(200, signal);
-    const prepared = await this.state(signal);
-    this.chat(prepared, job.rule.title);
+    let prepared: CuaAppState;
+    try {
+      await this.pause(200, signal);
+      prepared = await this.state(signal);
+      this.chat(prepared, job.rule.title);
+    } catch (postClickError) {
+      const message =
+        postClickError instanceof Error ? postClickError.message : String(postClickError);
+      let cleanedQuote = false;
+      try {
+        const cleanup = AbortSignal.timeout(20000);
+        let current = await this.state(cleanup);
+        let currentChat = this.chat(current, job.rule.title);
+        if (current.info?.frontmostApp !== APP || currentChat.input.value) {
+          throw Error('草稿已改变');
+        }
+        const removeButtons = currentChat.nodes.filter((n) => n.title === '删除引用消息');
+        if (removeButtons.length === 1) {
+          await this.clickFrame(removeButtons[0].frame, cleanup);
+          await this.pause(150, cleanup);
+          current = await this.state(cleanup);
+          currentChat = this.chat(current, job.rule.title);
+          if (
+            currentChat.input.value ||
+            currentChat.nodes.some((n) => n.title === '删除引用消息')
+          ) {
+            throw Error('引用尚未清理');
+          }
+          cleanedQuote = true;
+        } else if (removeButtons.length > 1) {
+          throw Error('无法唯一核对引用清理按钮');
+        }
+      } catch {
+        throw markCleanupHandled(
+          new Error(message + '；半成品草稿无法安全清理，请核对微信输入框', {
+            cause: postClickError,
+          }),
+        );
+      }
+      if (cleanedQuote) {
+        throw markCleanupHandled(
+          new Error(message + '；已清理本次未发送的引用', { cause: postClickError }),
+        );
+      }
+      throw markCleanupHandled(
+        postClickError instanceof Error
+          ? postClickError
+          : new Error(message, { cause: postClickError }),
+      );
+    }
     try {
       this.quotePreview(prepared, job);
     } catch (previewError) {
@@ -1229,6 +1386,68 @@ export class SwiftCua {
       });
     }
     return prepared;
+  }
+
+  async cleanupOwnedDraft(
+    job: CuaJob,
+    options: {
+      allowInput: (value: string) => boolean;
+      shouldEscape?: (value: string) => boolean;
+      cleanupTimeoutMs?: number;
+    },
+  ): Promise<'cleaned' | 'already_clean'> {
+    const cleanup = AbortSignal.timeout(options.cleanupTimeoutMs ?? 20000);
+    let current = await this.state(cleanup);
+    let currentChat = this.chat(current, job.rule.title);
+    const currentValue = currentChat.input.value ?? '';
+    if (current.info?.frontmostApp !== APP || !options.allowInput(currentValue)) {
+      throw Error('草稿已改变');
+    }
+    this.verifyQuoteState(current, job);
+    if (!currentValue && !job.decision.replyTo) {
+      return 'already_clean';
+    }
+    if (options.shouldEscape?.(currentValue)) {
+      await this.call('pressKey', { key: 'Escape' }, cleanup, true);
+      current = await this.state(cleanup);
+      currentChat = this.chat(current, job.rule.title);
+      const afterEscapeValue = currentChat.input.value ?? '';
+      if (current.info?.frontmostApp !== APP || !options.allowInput(afterEscapeValue)) {
+        throw Error('草稿已改变');
+      }
+      this.verifyQuoteState(current, job);
+    }
+    let after = current;
+    let afterChat = currentChat;
+    const valueBeforeDelete = currentChat.input.value ?? '';
+    if (valueBeforeDelete) {
+      if (!currentChat.input.states?.includes('focused')) {
+        current = await this.focusInput(current, job.rule.title, cleanup);
+        currentChat = this.chat(current, job.rule.title);
+        const focusedValue = currentChat.input.value ?? '';
+        if (!options.allowInput(focusedValue) || !currentChat.input.states?.includes('focused')) {
+          throw Error('草稿焦点无法确认');
+        }
+      }
+      await this.call('pressKey', { key: 'Cmd+a' }, cleanup, true);
+      await this.call('pressKey', { key: 'Backspace' }, cleanup, true);
+      after = await this.state(cleanup);
+      afterChat = this.chat(after, job.rule.title);
+      if (afterChat.input.value) throw Error('草稿清理未确认');
+    }
+    if (job.decision.replyTo) {
+      this.quotePreview(after, job);
+      await this.clickFrame(
+        one(afterChat.nodes, (n) => n.title === '删除引用消息', '无法核对旧草稿引用').frame,
+        cleanup,
+      );
+      after = await this.state(cleanup);
+      afterChat = this.chat(after, job.rule.title);
+    }
+    if (afterChat.input.value || afterChat.nodes.some((n) => n.title === '删除引用消息')) {
+      throw Error('草稿或引用尚未清理');
+    }
+    return 'cleaned';
   }
 
   async focusInput(state: CuaAppState, title: string, signal: AbortSignal): Promise<CuaAppState> {
@@ -1263,7 +1482,7 @@ export class SwiftCua {
   }
 
   async finishCopy(state: CuaAppState, job: CuaJob, signal: AbortSignal): Promise<void> {
-    if (job.mention) {
+    if (jobMentions(job).length > 0) {
       state = await this.focusInput(state, job.rule.title, signal);
       const input = this.chat(state, job.rule.title).input;
       if (!Number.isInteger(input.index)) throw Error('无法定位原生 @ 输入框光标');
@@ -1297,6 +1516,7 @@ export class SwiftCua {
     const targetName = norm(mention.name);
     let chat = this.chat(state, job.rule.title);
     if (chat.input.value !== typed) throw Error('@ 成员搜索内容已改变');
+    let clickedCandidate = false;
     try {
       const w = state.info?.window;
       const f = chat.input.frame;
@@ -1315,11 +1535,14 @@ export class SwiftCua {
       const retryWidth = axPrefixSoFar
         ? maxWidth
         : Math.min(maxWidth, Math.max(initialWidth, mention.name.length * 36 + 80));
+      const wideRetryWidth = axPrefixSoFar
+        ? maxWidth
+        : Math.min(maxWidth, Math.max(retryWidth, 260));
       let choice: CuaOcrMatch | undefined;
       let lastObserved: string[] = [];
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; attempt < 3; attempt++) {
         if (attempt > 0) {
-          await this.pause(200, signal);
+          await this.pause(attempt === 1 ? 200 : 250, signal);
           state = await this.state(signal);
           chat = this.chat(state, job.rule.title);
           if (
@@ -1329,10 +1552,11 @@ export class SwiftCua {
             throw Error('@ 菜单或输入已改变');
           }
         }
-        const scanHeight = attempt === 0 ? 70 : 120;
+        const scanHeight = attempt === 0 ? 70 : attempt === 1 ? 120 : 160;
+        const scanWidth = attempt === 0 ? initialWidth : attempt === 1 ? retryWidth : wideRetryWidth;
         const y = Math.max(w.bounds.y, f.y - scanHeight);
         const height = Math.max(0, f.y - y);
-        const band: Rect = { x, y, width: attempt === 0 ? initialWidth : retryWidth, height };
+        const band: Rect = { x, y, width: scanWidth, height };
         const bounds: Rect = {
           x: band.x - 2,
           y: band.y - 2,
@@ -1382,7 +1606,7 @@ export class SwiftCua {
           signal,
         )) as { matches?: CuaOcrMatch[] };
         let matches = matchInBand(found.matches);
-        if (matches.length === 0 && attempt === 1) {
+        if (matches.length === 0 && attempt >= 1) {
           found = (await this.call(
             'findText',
             {
@@ -1418,6 +1642,7 @@ export class SwiftCua {
         throw Error('@ 菜单或输入已改变');
       }
       this.verifyQuoteState(checked, job);
+      clickedCandidate = true;
       await this.call(
         'click',
         {
@@ -1430,61 +1655,38 @@ export class SwiftCua {
         signal,
         true,
       );
+      await this.pause(MENTION_POST_CLICK_PAUSE_MS, signal);
       state = await this.state(signal);
       chat = this.chat(state, job.rule.title);
-      const val = chat.input.value ?? '';
-      if (!val.startsWith(axPrefixSoFar) || !/^\uFFFC[ \u2005]*$/.test(val.slice(axPrefixSoFar.length))) {
+      let val = chat.input.value ?? '';
+      if (!isInsertedMentionValue(val, axPrefixSoFar) && val === typed) {
+        await this.pause(MENTION_POST_CLICK_PAUSE_MS, signal);
+        state = await this.state(signal);
+        chat = this.chat(state, job.rule.title);
+        val = chat.input.value ?? '';
+      }
+      if (!isInsertedMentionValue(val, axPrefixSoFar)) {
         throw Error('微信没有插入原生 @ 成员对象');
       }
       return state;
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       try {
-        const cleanup = AbortSignal.timeout(20000);
-        let current = await this.state(cleanup);
-        let currentChat = this.chat(current, job.rule.title);
-        if (current.info?.frontmostApp !== APP || currentChat.input.value !== typed) {
-          throw Error('草稿已改变');
-        }
-        this.verifyQuoteState(current, job);
-        await this.call('pressKey', { key: 'Escape' }, cleanup, true);
-        current = await this.state(cleanup);
-        currentChat = this.chat(current, job.rule.title);
-        if (current.info?.frontmostApp !== APP || currentChat.input.value !== typed) {
-          throw Error('草稿已改变');
-        }
-        this.verifyQuoteState(current, job);
-        if (!currentChat.input.states?.includes('focused')) {
-          current = await this.focusInput(current, job.rule.title, cleanup);
-          currentChat = this.chat(current, job.rule.title);
-          if (currentChat.input.value !== typed || !currentChat.input.states?.includes('focused')) {
-            throw Error('草稿焦点无法确认');
-          }
-        }
-        await this.call('pressKey', { key: 'Cmd+a' }, cleanup, true);
-        await this.call('pressKey', { key: 'Backspace' }, cleanup, true);
-        let after = await this.state(cleanup);
-        let afterChat = this.chat(after, job.rule.title);
-        if (afterChat.input.value) throw Error('草稿清理未确认');
-        if (job.decision.replyTo) {
-          this.quotePreview(after, job);
-          await this.clickFrame(
-            one(afterChat.nodes, (n) => n.title === '删除引用消息', '无法核对旧草稿引用').frame,
-            cleanup,
-          );
-          after = await this.state(cleanup);
-          afterChat = this.chat(after, job.rule.title);
-        }
-        if (afterChat.input.value || afterChat.nodes.some((n) => n.title === '删除引用消息')) {
-          throw Error('草稿或引用尚未清理');
-        }
+        await this.cleanupOwnedDraft(job, {
+          allowInput: (value) =>
+            value === typed ||
+            (clickedCandidate && isInsertedMentionValue(value, axPrefixSoFar)) ||
+            (axPrefixSoFar !== '' && value === axPrefixSoFar),
+          shouldEscape: (value) =>
+            value.startsWith(axPrefixSoFar) && value.slice(axPrefixSoFar.length).startsWith('@'),
+        });
       } catch {
-        throw Object.assign(
+        throw markCleanupHandled(
           new Error(message + '；半成品草稿无法安全清理，请核对微信输入框', { cause: error }),
           { mentionId: mention.id },
         );
       }
-      throw Object.assign(
+      throw markCleanupHandled(
         new Error(message + '；已清理本次未发送的 @ 查询和引用', { cause: error }),
         { mentionId: mention.id },
       );
@@ -1521,53 +1723,109 @@ export class SwiftCua {
     for (let i = 0; i < mentions.length; i++) {
       const mention = mentions[i];
       const names = resolvedNames[i];
-      let state = await this.state(signal);
-      let chat = this.chat(state, job.rule.title);
-      if ((chat.input.value ?? '') !== axPrefixSoFar || !chat.input.states?.includes('focused')) {
-        throw Error('@ 前输入框已改变');
-      }
-      this.verifyQuoteState(state, job);
-      await this.call('pressKey', { key: 'Shift+2' }, signal, true);
-      await this.call('typeText', { text: mention.name }, signal, true);
-      await this.pause(250, signal);
-      state = await this.state(signal);
-      chat = this.chat(state, job.rule.title);
       const typed = axPrefixSoFar + '@' + mention.name;
-      if (chat.input.value !== typed || !chat.input.states?.includes('focused')) {
-        throw Error('@ 成员搜索内容已改变');
+      let state: CuaAppState;
+      let chat: { nodes: CuaNode[]; input: CuaNode };
+      let startedTyping = false;
+      try {
+        state = await this.state(signal);
+        chat = this.chat(state, job.rule.title);
+        if ((chat.input.value ?? '') !== axPrefixSoFar || !chat.input.states?.includes('focused')) {
+          throw Error('@ 前输入框已改变');
+        }
+        this.verifyQuoteState(state, job);
+        startedTyping = true;
+        await this.call('pressKey', { key: 'Shift+2' }, signal, true);
+        await this.call('typeText', { text: mention.name }, signal, true);
+        await this.pause(250, signal);
+        state = await this.state(signal);
+        chat = this.chat(state, job.rule.title);
+        if (chat.input.value !== typed || !chat.input.states?.includes('focused')) {
+          throw Error('@ 成员搜索内容已改变');
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!startedTyping && !axPrefixSoFar && !job.decision.replyTo) {
+          throw error;
+        }
+        let outcome: 'cleaned' | 'already_clean';
+        try {
+          outcome = await this.cleanupOwnedDraft(job, {
+            allowInput: (value) =>
+              value === axPrefixSoFar ||
+              (startedTyping && (value === axPrefixSoFar + '@' || value === typed)),
+            shouldEscape: (value) =>
+              startedTyping &&
+              value.startsWith(axPrefixSoFar) &&
+              value.slice(axPrefixSoFar.length).startsWith('@'),
+          });
+        } catch {
+          throw markCleanupHandled(
+            new Error(message + '；半成品草稿无法安全清理，请核对微信输入框', { cause: error }),
+            { mentionId: mention.id },
+          );
+        }
+        if (outcome === 'already_clean') {
+          throw markCleanupHandled(
+            error instanceof Error ? error : new Error(message, { cause: error }),
+            { mentionId: mention.id },
+          );
+        }
+        throw markCleanupHandled(
+          new Error(message + '；已清理本次未发送的 @ 查询和引用', { cause: error }),
+          { mentionId: mention.id },
+        );
       }
       state = await this.selectMention(job, state, signal, mention, axPrefixSoFar);
       chat = this.chat(state, job.rule.title);
       const axPrefix = chat.input.value ?? '';
-      const saved = await this.pasteboard({ action: 'snapshot' }, signal);
       let copiedText = '';
       try {
-        await this.focusInput(state, job.rule.title, signal);
-        await this.call('pressKey', { key: 'Cmd+a' }, signal, true);
-        await this.call('pressKey', { key: 'Cmd+c' }, signal, true);
-        const copied = await this.pasteboard({ action: 'read' }, signal);
-        copiedText = copied.text ?? '';
-        const after = this.chat(await this.state(signal), job.rule.title).input;
-        const segment = copiedText.startsWith(copiedPrefixSoFar)
-          ? copiedText.slice(copiedPrefixSoFar.length)
-          : '';
-        if (
-          copied.count === saved.count ||
-          !copiedText.startsWith(copiedPrefixSoFar) ||
-          !names.some(
-            (n) =>
-              segment === `\u2005@${n}\u2005` ||
-              segment === `@${n}\u2005` ||
-              segment === `@${n} `,
-          ) ||
-          after.value !== axPrefix ||
-          !after.states?.includes('focused')
-        ) {
-          throw Error('原生 @ 名称或成员对象不一致');
+        const saved = await this.pasteboard({ action: 'snapshot' }, signal);
+        try {
+          await this.focusInput(state, job.rule.title, signal);
+          await this.call('pressKey', { key: 'Cmd+a' }, signal, true);
+          await this.call('pressKey', { key: 'Cmd+c' }, signal, true);
+          const copied = await this.pasteboard({ action: 'read' }, signal);
+          copiedText = copied.text ?? '';
+          const after = this.chat(await this.state(signal), job.rule.title).input;
+          const segment = copiedText.startsWith(copiedPrefixSoFar)
+            ? copiedText.slice(copiedPrefixSoFar.length)
+            : '';
+          if (
+            copied.count === saved.count ||
+            !copiedText.startsWith(copiedPrefixSoFar) ||
+            !names.some(
+              (n) =>
+                segment === `\u2005@${n}\u2005` ||
+                segment === `@${n}\u2005` ||
+                segment === `@${n} `,
+            ) ||
+            after.value !== axPrefix ||
+            !after.states?.includes('focused')
+          ) {
+            throw Error('原生 @ 名称或成员对象不一致');
+          }
+          await this.finishCopy(await this.state(signal), job, signal);
+        } finally {
+          await this.pasteboard({ action: 'restore', items: saved.items ?? [] });
         }
-        await this.finishCopy(await this.state(signal), job, signal);
-      } finally {
-        await this.pasteboard({ action: 'restore', items: saved.items ?? [] });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        try {
+          await this.cleanupOwnedDraft(job, {
+            allowInput: (value) => value === axPrefix,
+          });
+        } catch {
+          throw markCleanupHandled(
+            new Error(message + '；半成品草稿无法安全清理，请核对微信输入框', { cause: error }),
+            { mentionId: mention.id },
+          );
+        }
+        throw markCleanupHandled(
+          new Error(message + '；已清理本次未发送的 @ 查询和引用', { cause: error }),
+          { mentionId: mention.id },
+        );
       }
       axPrefixSoFar = axPrefix;
       copiedPrefixSoFar = copiedText;
@@ -1639,9 +1897,11 @@ export class SwiftCua {
         deliveryDetail: [job.deliveryDetail, note].filter(Boolean).join('；'),
       };
     }
+    let quoteAttached = false;
     if (job.decision.replyTo === 'current') {
       try {
         state = await this.prepareQuote(job, state, signal);
+        quoteAttached = true;
       } catch (error) {
         if (!(error instanceof QuoteUnavailableError)) throw error;
         signal.throwIfAborted();
@@ -1696,14 +1956,41 @@ export class SwiftCua {
         };
       }
     }
-    await this.focusInput(state, job.rule.title, signal);
-    const focused = this.chat(await this.state(signal), job.rule.title).input;
-    if (focused.value || !focused.states?.includes('focused')) {
-      throw new Error('目标输入框未取得焦点或已有内容');
+    let typedBody = false;
+    try {
+      await this.focusInput(state, job.rule.title, signal);
+      const focused = this.chat(await this.state(signal), job.rule.title).input;
+      if (focused.value || !focused.states?.includes('focused')) {
+        throw new Error('目标输入框未取得焦点或已有内容');
+      }
+      if (jobMentions(job).length > 0) job = await this.prepareMention(job, signal);
+      typedBody = true;
+      await this.call('typeText', { text: job.decision.text }, signal, true);
+      return await this.preparedReply(job, signal);
+    } catch (error) {
+      if (isCleanupHandled(error)) throw error;
+      const axPrefix = job.mentionProof?.axPrefix ?? '';
+      if (!quoteAttached && !axPrefix && !typedBody) throw error;
+      const message = error instanceof Error ? error.message : String(error);
+      let outcome: 'cleaned' | 'already_clean';
+      try {
+        outcome = await this.cleanupOwnedDraft(job, {
+          allowInput: (value) =>
+            typedBody
+              ? value === axPrefix || matchesOwnedBody(value, axPrefix, job.decision.text)
+              : value === axPrefix,
+        });
+      } catch {
+        throw new Error(message + '；半成品草稿无法安全清理，请核对微信输入框', { cause: error });
+      }
+      if (outcome === 'already_clean') throw error;
+      const suffix = job.decision.replyTo
+        ? typedBody || axPrefix
+          ? '；已清理本次未发送的草稿和引用'
+          : '；已清理本次未发送的引用'
+        : '；已清理本次未发送的草稿';
+      throw new Error(message + suffix, { cause: error });
     }
-    if (jobMentions(job).length > 0) job = await this.prepareMention(job, signal);
-    await this.call('typeText', { text: job.decision.text }, signal, true);
-    return this.preparedReply(job, signal);
   }
 
   async preparedReply(job: CuaJob, signal: AbortSignal): Promise<PreparedCommit> {

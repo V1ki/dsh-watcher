@@ -1022,3 +1022,508 @@ test('multi-mention picker failure tags failed mentionId and matchHistory verifi
     1,
   );
 });
+
+test('selectMention pauses after click, retries transient post-click getAppState 1007, and does not re-click when AX pill settles slowly', async () => {
+  let input = '';
+  let sent = false;
+  let count = 0;
+  let body = '';
+  let postClickStateReads = 0;
+  let candidateClicks = 0;
+  const events: string[] = [];
+  const target: WxarcEvent = {
+    ...incoming(1),
+    text: '查一下状态',
+    sender: 'u1',
+    senderIdentity: {
+      id: 'u1',
+      nickname: 'viki',
+      uiName: 'viki',
+      groupNickname: 'viki',
+      uniqueUiName: true,
+    },
+  };
+  const job = {
+    event: incoming(1),
+    quoteEvent: target,
+    rule: { title: '群' },
+    decision: { action: 'reply' as const, text: '好的' },
+    mention: { id: 'u1', name: 'viki' },
+  };
+  const runner = async (_path: string, args: string[]) => {
+    const m = args.at(-2) ?? '';
+    const p = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+    events.push(m);
+    if (m === 'getAppState') {
+      if (candidateClicks > 0) {
+        postClickStateReads++;
+        if (postClickStateReads === 1) {
+          throw Object.assign(new Error('timeout'), { code: 1007, stderr: 'CUAService timeout' });
+        }
+        if (postClickStateReads === 2) {
+          input = '@viki';
+        } else if (postClickStateReads === 3) {
+          input = '\uFFFC';
+        }
+      }
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: true },
+              window: { id: 1, bounds: { x: 0, y: 0, width: 800, height: 800 } },
+            },
+            accessibility: {
+              nodes: [
+                { identifier: 'current_chat_name_label', value: '群' },
+                {
+                  identifier: 'chat_input_field',
+                  index: 33,
+                  value: input,
+                  states: ['focused'],
+                  frame: { x: 300, y: 600, width: 400, height: 60 },
+                },
+                { identifier: 'chat_message_list', frame: { x: 300, y: 100, width: 400, height: 450 } },
+                {
+                  identifier: 'chat_bubble_item_view',
+                  title: target.text,
+                  frame: { x: 300, y: 200, width: 400, height: 60 },
+                },
+                { role: 'AXButton', title: '发送', frame: { x: 700, y: 730, width: 60, height: 20 } },
+                ...(sent
+                  ? [{ identifier: 'chat_bubble_item_view', title: '@viki 好的' }]
+                  : []),
+              ],
+            },
+          },
+        }),
+      };
+    }
+    if (m === 'findText') {
+      return {
+        stdout: JSON.stringify({
+          matches: [{ windowId: 1, confidence: 1, text: 'viki', rect: { x: 305, y: 560, width: 40, height: 20 } }],
+        }),
+      };
+    }
+    if (m === 'pressKey' && p.key === 'Shift+2') input = '@';
+    if (m === 'pressKey' && p.key === 'Cmd+c') count++;
+    if (m === 'typeText') {
+      const typed = String(p.text ?? '');
+      input += typed;
+      if (!input.startsWith('@')) body = typed;
+    }
+    if (m === 'click' && p.y === 570) {
+      candidateClicks++;
+      events.push('click-mention');
+    }
+    if (m === 'click' && p.y === 740) {
+      sent = true;
+      input = '';
+    }
+    return { stdout: '{}' };
+  };
+  const clipboard: ClipboardFn = async (r) =>
+    r.action === 'snapshot'
+      ? { count, items: [] }
+      : r.action === 'read'
+        ? { count, text: '\u2005@viki\u2005' + body }
+        : { restored: true };
+  const cua = new SwiftCua(
+    '/fake',
+    runner,
+    async (ms) => {
+      events.push(`pause:${ms}`);
+    },
+    clipboard,
+  );
+  const commit = await cua.prepare(job, AbortSignal.timeout(5000));
+  assert.equal(candidateClicks, 1);
+  const clickIdx = events.indexOf('click-mention');
+  assert.equal(events[clickIdx + 1], 'pause:180');
+  assert.equal(events[clickIdx + 2], 'getAppState');
+  assert.equal(events[clickIdx + 3], 'pause:150');
+  assert.equal(events[clickIdx + 4], 'getAppState');
+  assert.equal(events[clickIdx + 5], 'pause:180');
+  assert.deepEqual(await commit(AbortSignal.timeout(5000)), { confirmed: true });
+});
+
+test('selectMention post-click failure cleans up inserted \\uFFFC pill and quote so next job is not cascade-blocked, but never wipes user edits', async () => {
+  let input = '';
+  let quote = false;
+  let sent = false;
+  let count = 0;
+  let body = '';
+  let postClickFailuresLeft = 3;
+  let editAfterClick = false;
+  const actions: ActionEntry[] = [];
+  const target: WxarcEvent = {
+    ...incoming(1),
+    text: '查一下状态',
+    sender: 'u1',
+    senderIdentity: {
+      id: 'u1',
+      nickname: 'viki',
+      uiName: 'viki',
+      groupNickname: 'viki',
+      uniqueUiName: true,
+    },
+  };
+  const quoteText = '引用 viki 的消息 : ' + target.text;
+  const job = {
+    event: incoming(1),
+    quoteEvent: target,
+    rule: { title: '群' },
+    decision: { action: 'reply' as const, text: '收到了', replyTo: 'current' },
+    mention: { id: 'u1', name: 'viki' },
+  };
+  const runner = async (_path: string, args: string[]) => {
+    const m = args.at(-2) ?? '';
+    const p = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+    actions.push({ m, p });
+    if (m === 'getAppState') {
+      if (input.includes('\uFFFC') && postClickFailuresLeft > 0) {
+        postClickFailuresLeft--;
+        throw Object.assign(new Error('timeout'), { code: 1007, stderr: 'CUAService timeout' });
+      }
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: true },
+              window: { id: 1, bounds: { x: 0, y: 0, width: 800, height: 800 } },
+            },
+            accessibility: {
+              nodes: [
+                { identifier: 'current_chat_name_label', value: '群' },
+                {
+                  identifier: 'chat_input_field',
+                  index: 33,
+                  value: input,
+                  states: ['focused'],
+                  frame: { x: 300, y: 600, width: 400, height: 60 },
+                },
+                { identifier: 'chat_message_list', frame: { x: 300, y: 100, width: 400, height: 450 } },
+                {
+                  identifier: 'chat_bubble_item_view',
+                  title: target.text,
+                  frame: { x: 300, y: 200, width: 400, height: 60 },
+                },
+                ...(quote
+                  ? [
+                      { role: 'AXGroup', title: quoteText, frame: { x: 300, y: 670, width: 300, height: 30 } },
+                      { role: 'AXButton', title: '删除引用消息', frame: { x: 700, y: 670, width: 20, height: 20 } },
+                    ]
+                  : []),
+                { role: 'AXButton', title: '发送', frame: { x: 700, y: 730, width: 60, height: 20 } },
+                ...(sent
+                  ? [{ identifier: 'chat_bubble_item_view', title: '\u2005@viki\u2005收到了\n' + quoteText }]
+                  : []),
+              ],
+            },
+          },
+        }),
+      };
+    }
+    if (m === 'findText') {
+      if (p.text === '' && p.limit === 60) {
+        return {
+          stdout: JSON.stringify({
+            matches: [{ windowId: 1, confidence: 1, text: '引用', rect: { x: 400, y: 400, width: 40, height: 20 } }],
+          }),
+        };
+      }
+      if (p.text === target.text!.slice(0, 4)) {
+        return {
+          stdout: JSON.stringify({
+            matches: [{ windowId: 1, confidence: 1, text: target.text, rect: { x: 320, y: 220, width: 180, height: 20 } }],
+          }),
+        };
+      }
+      return {
+        stdout: JSON.stringify({
+          matches: [{ windowId: 1, confidence: 1, text: 'viki', rect: { x: 305, y: 560, width: 40, height: 20 } }],
+        }),
+      };
+    }
+    if (m === 'click' && p.y === 410) quote = true;
+    if (m === 'click' && p.y === 680) quote = false;
+    if (m === 'pressKey' && p.key === 'Shift+2') input = '@';
+    if (m === 'pressKey' && p.key === 'Cmd+c') count++;
+    if (m === 'typeText') {
+      const typed = String(p.text ?? '');
+      input += typed;
+      if (!input.startsWith('@')) body = typed;
+    }
+    if (m === 'click' && p.y === 570) input = editAfterClick ? '\uFFFC 用户手动补充' : '\uFFFC';
+    if (m === 'pressKey' && p.key === 'Backspace') {
+      input = '';
+      body = '';
+    }
+    if (m === 'click' && p.y === 740) {
+      sent = true;
+      input = '';
+      quote = false;
+    }
+    return { stdout: '{}' };
+  };
+  const clipboard: ClipboardFn = async (r) =>
+    r.action === 'snapshot'
+      ? { count, items: [] }
+      : r.action === 'read'
+        ? { count, text: '\u2005@viki\u2005' + body }
+        : { restored: true };
+  const cua = new SwiftCua('/fake', runner, async () => {}, clipboard);
+  await assert.rejects(
+    cua.prepare(job, AbortSignal.timeout(5000)),
+    /SwiftCUA getAppState 操作失败（code=1007, CUAService timeout）.*已清理本次未发送的 @ 查询和引用/,
+  );
+  assert.equal(input, '');
+  assert.equal(quote, false);
+  assert.ok(!actions.some((a) => a.m === 'pressKey' && a.p.key === 'Escape'));
+
+  const nextCommit = await cua.prepare(job, AbortSignal.timeout(5000));
+  assert.deepEqual(await nextCommit(AbortSignal.timeout(5000)), { confirmed: true });
+
+  editAfterClick = true;
+  postClickFailuresLeft = 3;
+  actions.length = 0;
+  await assert.rejects(
+    cua.prepare(job, AbortSignal.timeout(5000)),
+    /半成品草稿无法安全清理/,
+  );
+  assert.equal(input, '\uFFFC 用户手动补充');
+  assert.equal(quote, true);
+  assert.ok(!actions.some((a) => a.m === 'pressKey' && a.p.key === 'Backspace'));
+});
+
+test('selectMention third read-only OCR attempt catches slow or taller @ popup without weakening uniqueness', async () => {
+  let input = '';
+  let sent = false;
+  let count = 0;
+  let body = '';
+  let mentionScans = 0;
+  const pauses: number[] = [];
+  const regions: RegionRect[] = [];
+  const target: WxarcEvent = {
+    ...incoming(1),
+    text: '找人',
+    sender: 'u1',
+    senderIdentity: {
+      id: 'u1',
+      nickname: 'viki',
+      uiName: 'viki',
+      groupNickname: 'viki',
+      uniqueUiName: true,
+    },
+  };
+  const job = {
+    event: incoming(1),
+    quoteEvent: target,
+    rule: { title: '群' },
+    decision: { action: 'reply' as const, text: '来了' },
+    mention: { id: 'u1', name: 'viki' },
+  };
+  const runner = async (_path: string, args: string[]) => {
+    const m = args.at(-2) ?? '';
+    const p = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+    if (m === 'getAppState') {
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: true },
+              window: { id: 1, bounds: { x: 0, y: 0, width: 800, height: 800 } },
+            },
+            accessibility: {
+              nodes: [
+                { identifier: 'current_chat_name_label', value: '群' },
+                {
+                  identifier: 'chat_input_field',
+                  index: 33,
+                  value: input,
+                  states: ['focused'],
+                  frame: { x: 300, y: 600, width: 400, height: 60 },
+                },
+                { identifier: 'chat_message_list', frame: { x: 300, y: 100, width: 400, height: 450 } },
+                {
+                  identifier: 'chat_bubble_item_view',
+                  title: target.text,
+                  frame: { x: 300, y: 200, width: 400, height: 60 },
+                },
+                { role: 'AXButton', title: '发送', frame: { x: 700, y: 730, width: 60, height: 20 } },
+                ...(sent ? [{ identifier: 'chat_bubble_item_view', title: '@viki 来了' }] : []),
+              ],
+            },
+          },
+        }),
+      };
+    }
+    if (m === 'findText') {
+      mentionScans++;
+      regions.push(p.region as RegionRect);
+      if (mentionScans === 4) {
+        return {
+          stdout: JSON.stringify({
+            matches: [{ windowId: 1, confidence: 0.92, text: 'viki', rect: { x: 310, y: 455, width: 40, height: 20 } }],
+          }),
+        };
+      }
+      return { stdout: JSON.stringify({ matches: [] }) };
+    }
+    if (m === 'pressKey' && p.key === 'Shift+2') input = '@';
+    if (m === 'pressKey' && p.key === 'Cmd+c') count++;
+    if (m === 'typeText') {
+      const typed = String(p.text ?? '');
+      input += typed;
+      if (!input.startsWith('@')) body = typed;
+    }
+    if (m === 'click' && p.y === 465) input = '\uFFFC';
+    if (m === 'click' && p.y === 740) {
+      sent = true;
+      input = '';
+    }
+    return { stdout: '{}' };
+  };
+  const clipboard: ClipboardFn = async (r) =>
+    r.action === 'snapshot'
+      ? { count, items: [] }
+      : r.action === 'read'
+        ? { count, text: '\u2005@viki\u2005' + body }
+        : { restored: true };
+  const cua = new SwiftCua(
+    '/fake',
+    runner,
+    async (ms) => {
+      pauses.push(ms);
+    },
+    clipboard,
+  );
+  const commit = await cua.prepare(job, AbortSignal.timeout(5000));
+  assert.equal(mentionScans, 4);
+  assert.equal(regions[3].height, 160);
+  assert.ok(regions[3].width >= 260);
+  assert.ok(pauses.includes(250));
+  assert.deepEqual(await commit(AbortSignal.timeout(5000)), { confirmed: true });
+});
+
+test('prepareMention cleans up owned draft and quote on Shift+2/typeText failure, wrongPerson clipboard mismatch, and quote-only validation failure', async () => {
+  const wrongPersonFixture = nativeFixture({ wrongPerson: true });
+  await assert.rejects(
+    wrongPersonFixture.cua.prepare(wrongPersonFixture.job, wrongPersonFixture.signal),
+    /原生 @ 名称或成员对象不一致；已清理本次未发送的 @ 查询和引用/,
+  );
+  assert.ok(wrongPersonFixture.actions.some((a) => a.m === 'pressKey' && a.p.key === 'Backspace'));
+  assert.ok(wrongPersonFixture.actions.some((a) => a.m === 'click' && a.p.y === 680));
+
+  const ambiguousFixture = nativeFixture({ ambiguousName: true });
+  await assert.rejects(
+    ambiguousFixture.cua.prepare(ambiguousFixture.job, ambiguousFixture.signal),
+    /原生 @ 缺少可核对的成员身份；已清理本次未发送的引用/,
+  );
+  assert.ok(!ambiguousFixture.actions.some((a) => a.m === 'pressKey' && a.p.key === 'Backspace'));
+  assert.ok(ambiguousFixture.actions.some((a) => a.m === 'click' && a.p.y === 680));
+
+  let input = '';
+  let quote = false;
+  let failTypeText = true;
+  const actions: ActionEntry[] = [];
+  const target: WxarcEvent = {
+    ...incoming(1),
+    text: '帮我确认一下',
+    sender: 'u1',
+    senderIdentity: {
+      id: 'u1',
+      nickname: '甲',
+      uiName: '甲',
+      groupNickname: '甲',
+      uniqueUiName: true,
+    },
+  };
+  const quoteText = '引用 甲 的消息 : ' + target.text;
+  const job = {
+    event: incoming(1),
+    quoteEvent: target,
+    rule: { title: '群' },
+    decision: { action: 'reply' as const, text: '好', replyTo: 'current' },
+    mention: { id: 'u1', name: '甲' },
+  };
+  const runner = async (_path: string, args: string[]) => {
+    const m = args.at(-2) ?? '';
+    const p = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+    actions.push({ m, p });
+    if (m === 'getAppState') {
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: true },
+              window: { id: 1, bounds: { x: 0, y: 0, width: 800, height: 800 } },
+            },
+            accessibility: {
+              nodes: [
+                { identifier: 'current_chat_name_label', value: '群' },
+                {
+                  identifier: 'chat_input_field',
+                  index: 33,
+                  value: input,
+                  states: ['focused'],
+                  frame: { x: 300, y: 600, width: 400, height: 60 },
+                },
+                { identifier: 'chat_message_list', frame: { x: 300, y: 100, width: 400, height: 450 } },
+                {
+                  identifier: 'chat_bubble_item_view',
+                  title: target.text,
+                  frame: { x: 300, y: 200, width: 400, height: 60 },
+                },
+                ...(quote
+                  ? [
+                      { role: 'AXGroup', title: quoteText, frame: { x: 300, y: 670, width: 300, height: 30 } },
+                      { role: 'AXButton', title: '删除引用消息', frame: { x: 700, y: 670, width: 20, height: 20 } },
+                    ]
+                  : []),
+                { role: 'AXButton', title: '发送', frame: { x: 700, y: 730, width: 60, height: 20 } },
+              ],
+            },
+          },
+        }),
+      };
+    }
+    if (m === 'findText') {
+      if (p.text === '' && p.limit === 60) {
+        return {
+          stdout: JSON.stringify({
+            matches: [{ windowId: 1, confidence: 1, text: '引用', rect: { x: 400, y: 400, width: 40, height: 20 } }],
+          }),
+        };
+      }
+      return {
+        stdout: JSON.stringify({
+          matches: [{ windowId: 1, confidence: 1, text: target.text, rect: { x: 320, y: 220, width: 180, height: 20 } }],
+        }),
+      };
+    }
+    if (m === 'click' && p.y === 410) quote = true;
+    if (m === 'click' && p.y === 680) quote = false;
+    if (m === 'pressKey' && p.key === 'Shift+2') input = '@';
+    if (m === 'typeText' && failTypeText) {
+      failTypeText = false;
+      throw Object.assign(new Error('typeText failed'), { code: 1008 });
+    }
+    if (m === 'pressKey' && p.key === 'Backspace') input = '';
+    return { stdout: '{}' };
+  };
+  const cua = new SwiftCua('/fake', runner, async () => {});
+  await assert.rejects(
+    cua.prepare(job, AbortSignal.timeout(5000)),
+    /SwiftCUA typeText 操作失败.*已清理本次未发送的 @ 查询和引用/,
+  );
+  assert.equal(input, '');
+  assert.equal(quote, false);
+  assert.ok(actions.some((a) => a.m === 'pressKey' && a.p.key === 'Escape'));
+  assert.ok(actions.some((a) => a.m === 'pressKey' && a.p.key === 'Backspace'));
+});

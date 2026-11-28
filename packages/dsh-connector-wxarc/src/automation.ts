@@ -1932,6 +1932,11 @@ export class Automation {
           signal,
         );
         if (current.revision !== this.settings().revision || !this.approvals!.live.has(notice.code)) {
+          if (commit.discard && !this.stopped) {
+            try {
+              await commit.discard(AbortSignal.timeout(10000));
+            } catch {}
+          }
           throw new Error('审批已结束或设置已改变');
         }
         this.approvals!.notice(notice.code, 'sending');
@@ -2567,6 +2572,9 @@ export class Automation {
             const remaining = failedId
               ? currentMentions.filter((m) => m.id !== failedId)
               : [];
+            if (remaining.length >= currentMentions.length) {
+              throw err;
+            }
             const skipped = failedId
               ? currentMentions.find((m) => m.id === failedId)
               : currentMentions[0];
@@ -2603,13 +2611,23 @@ export class Automation {
             this.store.db
               .prepare('UPDATE automation_jobs SET event=? WHERE id=?')
               .run(JSON.stringify(job.event), job.id);
+            this.assertCurrent(job, signal);
           } else {
             throw err;
           }
         }
       }
     }
-    this.assertCurrent(job, signal);
+    try {
+      this.assertCurrent(job, signal);
+    } catch (error) {
+      if (commit.discard && !this.stopped) {
+        try {
+          await commit.discard(AbortSignal.timeout(10000));
+        } catch {}
+      }
+      throw error;
+    }
     if (this.batches.enabled(job.event as any)) {
       await this.collect();
       if (this.batches.pending(job as any).length) {
@@ -2652,7 +2670,16 @@ export class Automation {
         throw error;
       }
     }
-    this.assertCurrent(job, signal);
+    try {
+      this.assertCurrent(job, signal);
+    } catch (error) {
+      if (commit.discard && !this.stopped) {
+        try {
+          await commit.discard(AbortSignal.timeout(10000));
+        } catch {}
+      }
+      throw error;
+    }
     this.store.db
       .prepare(
         "INSERT INTO automation_deliveries(job_id,part_index,text,status,detail,updated_at,clicked_at) VALUES (?,?,?,'sending',?,?,?)",

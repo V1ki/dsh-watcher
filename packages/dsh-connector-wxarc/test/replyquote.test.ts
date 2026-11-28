@@ -451,3 +451,114 @@ test('retryableDetail whitelists quote menu location errors with optional OCR su
   assert.equal(retryableDetail('找不到微信原生引用菜单；半成品草稿无法安全清理'), false);
   assert.equal(retryableDetail('引用失败清理前出现了草稿或引用，未覆盖'), false);
 });
+
+test('prepareQuote post-click non-QuoteUnavailableError cleans up inserted quote bar when input is empty, and preserves user draft', async () => {
+  const runCase = async (userDraftAfterClick: string) => {
+    let input = '';
+    let quoted = false;
+    let postClickFailuresLeft = 3;
+    const actions: ActionRecord[] = [];
+    const job = {
+      event: { id: 1, kind: 'text' as const, local_type: 1, sender: 'Peer', text: '引用这句话' },
+      rule: { title: 'Peer' },
+      decision: { action: 'reply' as const, text: '这样就对啦', replyTo: 'current' },
+    };
+    const runner = async (_path: string, args: string[]) => {
+      const method = args.at(-2) ?? '';
+      const p = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+      actions.push({ method, p });
+      if (method === 'getAppState') {
+        if (quoted && postClickFailuresLeft > 0) {
+          postClickFailuresLeft--;
+          throw Object.assign(new Error('timeout'), { code: 1007, stderr: 'CUAService timeout' });
+        }
+        return {
+          stdout: JSON.stringify({
+            state: {
+              info: {
+                frontmostApp: 'com.tencent.xinWeChat',
+                permissions: { accessibility: true },
+                window: { id: 73, bounds: { x: 100, y: 100, width: 600, height: 500 } },
+              },
+              accessibility: {
+                nodes: [
+                  { identifier: 'current_chat_name_label', value: 'Peer' },
+                  {
+                    identifier: 'chat_input_field',
+                    value: input,
+                    frame: { x: 300, y: 450, width: 350, height: 40 },
+                    states: ['focused'],
+                  },
+                  { identifier: 'chat_message_list', frame: { x: 300, y: 200, width: 350, height: 220 } },
+                  {
+                    identifier: 'chat_bubble_item_view',
+                    title: '引用这句话',
+                    frame: { x: 300, y: 300, width: 350, height: 60 },
+                  },
+                  ...(quoted
+                    ? [
+                        {
+                          role: 'AXGroup',
+                          title: '引用 Peer 的消息 : 引用这句话',
+                          frame: { x: 300, y: 500, width: 280, height: 26 },
+                        },
+                        {
+                          role: 'AXButton',
+                          title: '删除引用消息',
+                          frame: { x: 590, y: 502, width: 16, height: 16 },
+                        },
+                      ]
+                    : []),
+                ],
+              },
+            },
+          }),
+        };
+      }
+      if (method === 'findText') {
+        if (p.region) {
+          return {
+            stdout: JSON.stringify({
+              matches: [
+                { text: '复制', confidence: 0.95, source: 'ocr', windowId: 73, rect: { x: 300, y: 500, width: 30, height: 20 } },
+                { text: '引用', confidence: 0.95, source: 'ocr', windowId: 73, rect: { x: 300, y: 530, width: 30, height: 20 } },
+              ],
+            }),
+          };
+        }
+        return {
+          stdout: JSON.stringify({
+            matches: [
+              { text: '引用这句话', confidence: 0.99, source: 'ocr', windowId: 73, rect: { x: 220, y: 220, width: 90, height: 20 } },
+            ],
+          }),
+        };
+      }
+      if (method === 'click' && p.y === 540) {
+        quoted = true;
+        if (userDraftAfterClick) input = userDraftAfterClick;
+      }
+      if (method === 'click' && p.x === 598 && p.y === 510) quoted = false;
+      return { stdout: '{}' };
+    };
+    const cua = new SwiftCua('/fake', runner, async () => {});
+    return { cua, job, actions, isQuoted: () => quoted, getInput: () => input };
+  };
+
+  const clean = await runCase('');
+  await assert.rejects(
+    clean.cua.prepare(clean.job, new AbortController().signal),
+    /SwiftCUA getAppState 操作失败.*已清理本次未发送的引用/,
+  );
+  assert.equal(clean.isQuoted(), false);
+  assert.ok(clean.actions.some((a) => a.method === 'click' && a.p.x === 598 && a.p.y === 510));
+
+  const dirty = await runCase('用户刚输入的草稿');
+  await assert.rejects(
+    dirty.cua.prepare(dirty.job, new AbortController().signal),
+    /半成品草稿无法安全清理/,
+  );
+  assert.equal(dirty.isQuoted(), true);
+  assert.equal(dirty.getInput(), '用户刚输入的草稿');
+  assert.ok(!dirty.actions.some((a) => a.method === 'click' && a.p.x === 598 && a.p.y === 510));
+});

@@ -671,3 +671,209 @@ test('openChat falls back to Cmd+f search when selectSession is obstructed', asy
     !actions.some((a) => a.method === 'click' && a.params.coordinateSpace === 'global'),
   );
 });
+
+test('state() retries transient getAppState failures up to twice with abortable pauses and surfaces diagnostics', async () => {
+  const pauses: number[] = [];
+  let calls = 0;
+  const okState: CuaAppState = {
+    info: {
+      frontmostApp: 'com.tencent.xinWeChat',
+      permissions: { accessibility: true },
+    },
+    accessibility: { nodes: [] },
+  };
+  const transientRunner: CuaRunner = async () => {
+    calls++;
+    if (calls <= 2) {
+      throw Object.assign(new Error('timeout'), { code: 1007, stderr: 'CUAService timeout' });
+    }
+    return { stdout: JSON.stringify({ state: okState }) };
+  };
+  const cua = new SwiftCua('/test/cua', transientRunner, async (ms) => {
+    pauses.push(ms);
+  });
+  const state = await cua.state(new AbortController().signal);
+  assert.equal(state.info?.frontmostApp, 'com.tencent.xinWeChat');
+  assert.equal(calls, 3);
+  assert.deepEqual(pauses, [150, 300]);
+
+  let failCalls = 0;
+  const failPauses: number[] = [];
+  const alwaysFailRunner: CuaRunner = async () => {
+    failCalls++;
+    throw Object.assign(new Error('timeout'), { code: 1007, stderr: 'CUAService getAppState timeout' });
+  };
+  const failing = new SwiftCua('/test/cua', alwaysFailRunner, async (ms) => {
+    failPauses.push(ms);
+  });
+  await assert.rejects(
+    failing.state(new AbortController().signal),
+    /SwiftCUA getAppState 操作失败（code=1007, CUAService getAppState timeout）；请检查微信界面与 SwiftCUA 服务/,
+  );
+  assert.equal(failCalls, 3);
+  assert.deepEqual(failPauses, [150, 300]);
+});
+
+test('state() never retries on aborted signal, locked desktop, missing accessibility permission, or ENOENT', async () => {
+  const abortController = new AbortController();
+  abortController.abort(new Error('cancelled'));
+  let abortedCalls = 0;
+  const abortedCua = new SwiftCua(
+    '/test/cua',
+    async () => {
+      abortedCalls++;
+      return { stdout: '{}' };
+    },
+    async () => {},
+  );
+  await assert.rejects(abortedCua.state(abortController.signal), /cancelled/);
+  assert.equal(abortedCalls, 0);
+
+  let lockCalls = 0;
+  const lockPauses: number[] = [];
+  const lockedCua = new SwiftCua(
+    '/test/cua',
+    async () => {
+      lockCalls++;
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.apple.loginwindow',
+              permissions: { accessibility: true },
+            },
+          },
+        }),
+      };
+    },
+    async (ms) => {
+      lockPauses.push(ms);
+    },
+  );
+  await assert.rejects(lockedCua.state(new AbortController().signal), /桌面已锁定/);
+  assert.equal(lockCalls, 1);
+  assert.deepEqual(lockPauses, []);
+
+  let permCalls = 0;
+  const permPauses: number[] = [];
+  const permCua = new SwiftCua(
+    '/test/cua',
+    async () => {
+      permCalls++;
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: false },
+            },
+          },
+        }),
+      };
+    },
+    async (ms) => {
+      permPauses.push(ms);
+    },
+  );
+  await assert.rejects(permCua.state(new AbortController().signal), /辅助功能权限/);
+  assert.equal(permCalls, 1);
+  assert.deepEqual(permPauses, []);
+
+  let enoentCalls = 0;
+  const enoentCua = new SwiftCua(
+    '/test/cua',
+    async () => {
+      enoentCalls++;
+      throw Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' });
+    },
+    async () => {},
+  );
+  await assert.rejects(enoentCua.state(new AbortController().signal), /SwiftCUA getAppState 操作失败/);
+  assert.equal(enoentCalls, 1);
+
+  const midAbort = new AbortController();
+  let midCalls = 0;
+  const midAbortCua = new SwiftCua(
+    '/test/cua',
+    async () => {
+      midCalls++;
+      throw Object.assign(new Error('timeout'), { code: 1007 });
+    },
+    async (_ms, sig) => {
+      midAbort.abort(new Error('mid-pause abort'));
+      sig.throwIfAborted();
+    },
+  );
+  await assert.rejects(midAbortCua.state(midAbort.signal), /mid-pause abort/);
+  assert.equal(midCalls, 1);
+});
+
+test('prepare() cleans up owned draft when post-typeText verification fails, but never wipes a user-edited draft', async () => {
+  const f = fixture({ emoji: true, wrongEmoji: true });
+  f.job.decision.text += '[旺柴]';
+  await assert.rejects(f.cua.prepare(f.job, f.signal), /含表情.*已清理本次未发送的草稿/);
+  assert.equal(f.clipboardCalls.at(-1), 'restore');
+  assert.ok(f.actions.some((a) => a.method === 'pressKey' && a.params.key === 'Backspace'));
+  f.job.decision.text = '下一条消息';
+  const secondCommit = await f.cua.prepare(f.job, f.signal);
+  assert.equal((await secondCommit(f.signal)).confirmed, true);
+
+  let input = '';
+  let mutated = false;
+  const editedActions: RecordedAction[] = [];
+  const frame = { x: 100, y: 200, width: 100, height: 40 };
+  const editedRunner: CuaRunner = async (_path, args) => {
+    const method = args.at(-2) ?? '';
+    const params = JSON.parse(args.at(-1) ?? '{}') as Record<string, unknown>;
+    editedActions.push({ method, params });
+    if (method === 'getAppState') {
+      return {
+        stdout: JSON.stringify({
+          state: {
+            info: {
+              frontmostApp: 'com.tencent.xinWeChat',
+              permissions: { accessibility: true },
+            },
+            text: '你好',
+            accessibility: {
+              nodes: [
+                { identifier: 'current_chat_name_label', value: 'Peer' },
+                {
+                  identifier: 'chat_input_field',
+                  role: 'AXTextArea',
+                  value: input,
+                  states: ['focused'],
+                  frame,
+                },
+                { role: 'AXButton', title: '发送', states: ['enabled'], frame: { ...frame, y: 500 } },
+              ],
+            },
+          },
+        }),
+      };
+    }
+    if (method === 'typeText') {
+      input = String(params.text ?? '');
+      if (!mutated) {
+        mutated = true;
+        input = '用户中途修改了输入框';
+      }
+    }
+    if (method === 'pressKey' && params.key === 'Backspace') input = '';
+    return { stdout: '{}' };
+  };
+  const editedCua = new SwiftCua('/test/cua', editedRunner, async () => {});
+  await assert.rejects(
+    editedCua.prepare(
+      {
+        event: { kind: 'text', text: '你好' },
+        rule: { sourceId: 'peer', title: 'Peer', search: 'peer123', wechatId: 'peer123' },
+        decision: { text: '自动回复正文' },
+      },
+      new AbortController().signal,
+    ),
+    /半成品草稿无法安全清理/,
+  );
+  assert.equal(input, '用户中途修改了输入框');
+  assert.ok(!editedActions.some((a) => a.method === 'pressKey' && a.params.key === 'Backspace'));
+});
