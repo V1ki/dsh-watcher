@@ -478,6 +478,7 @@ export function registerWechatSendTool(
       if (principal) {
         if (
           !principal.sessionId ||
+          principal.role === 'external_chat' ||
           principal.tier !== 3 ||
           principal.delegationDepth !== 0 ||
           principal.isSubagent

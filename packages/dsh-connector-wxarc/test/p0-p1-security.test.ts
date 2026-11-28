@@ -593,7 +593,7 @@ test('P1 Track A: wxarc_nas_search blocks port 8765, removes hardcoded LAN defau
 
   const fetchedUrls: string[] = [];
   const longText = '合同编号A123 ' + 'x'.repeat(800);
-  const rawItems = Array.from({ length: 30 }, (_, i) => ({
+  const rawItems = Array.from({ length: 60 }, (_, i) => ({
     id: i + 1,
     session: 'work@chatroom',
     session_name: '工作群',

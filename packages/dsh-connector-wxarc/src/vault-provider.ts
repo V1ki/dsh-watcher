@@ -19,6 +19,8 @@ import { messageBody, type WxarcEvent } from './core.js';
 import {
   MAX_NAS_SEARCH_LIMIT,
   getNasArchiveContext,
+  isDirectNasChatId,
+  normalizeNasSessionKey,
   searchNasArchive,
   type NasSearchItem,
 } from './nas-search.js';
@@ -110,15 +112,23 @@ function clampWindow(raw: unknown): number {
   return Math.max(0, Math.min(VAULT_CONTEXT_MAX_WINDOW, Math.floor(num)));
 }
 
-function parseBoundaryMs(raw: string | undefined): number | null {
+function parseBoundaryMs(raw: string | undefined, isUpperBound = false): number | null {
   if (!raw || !raw.trim()) {
     return null;
   }
-  const asNum = Number(raw);
-  if (Number.isFinite(asNum) && asNum > 0) {
-    return asNum < 10_000_000_000 ? Math.floor(asNum * 1000) : Math.floor(asNum);
+  const trimmed = raw.trim();
+  if (/^\d+(?:\.\d+)?$/.test(trimmed)) {
+    const asNum = Number(trimmed);
+    if (Number.isFinite(asNum) && asNum > 0) {
+      return asNum < 10_000_000_000 ? Math.floor(asNum * 1000) : Math.floor(asNum);
+    }
   }
-  const parsed = Date.parse(raw);
+  if (/^\d{4}-\d{2}-\d{2}$/.test(trimmed)) {
+    const suffix = isUpperBound ? 'T23:59:59.999+08:00' : 'T00:00:00.000+08:00';
+    const parsed = Date.parse(`${trimmed}${suffix}`);
+    return Number.isFinite(parsed) ? parsed : null;
+  }
+  const parsed = Date.parse(trimmed);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
@@ -199,8 +209,8 @@ export function createWechatVaultProvider(options: WechatVaultProviderOptions): 
         typeof query.person === 'string' && query.person.trim()
           ? query.person.trim().toLowerCase()
           : '';
-      const sinceMs = parseBoundaryMs(query.since);
-      const untilMs = parseBoundaryMs(query.until);
+      const sinceMs = parseBoundaryMs(query.since, false);
+      const untilMs = parseBoundaryMs(query.until, true);
       const limit = clampLimit(query.limit);
       const wardrobe = getWardrobe?.() ?? null;
 
@@ -457,39 +467,68 @@ export function createNasVaultProvider(options: NasVaultProviderOptions): VaultP
       }
 
       const queryText = typeof query.query === 'string' ? query.query.trim() : '';
-      if (!queryText) {
-        return [];
-      }
       const rawRoomKey = typeof query.roomKey === 'string' ? query.roomKey.trim() : '';
       const roomSession = rawRoomKey ? rawRoomKey.replace(/^wechat:/i, '').trim() : '';
-      const roomSessionLower = roomSession.toLowerCase();
+      const roomSessionNorm = normalizeNasSessionKey(roomSession);
+      const roomSessionDirect = isDirectNasChatId(roomSession);
+      const person = typeof query.person === 'string' ? query.person.trim() : '';
+      const sinceRaw = typeof query.since === 'string' ? query.since.trim() : '';
+      const untilRaw = typeof query.until === 'string' ? query.until.trim() : '';
+      if (!queryText && !roomSession && !person && !sinceRaw && !untilRaw) {
+        return [];
+      }
 
       const limit = clampLimit(query.limit);
-      const sinceMs = parseBoundaryMs(query.since);
-      const untilMs = parseBoundaryMs(query.until);
+      const sinceMs = parseBoundaryMs(sinceRaw || undefined, false);
+      const untilMs = parseBoundaryMs(untilRaw || undefined, true);
       const wardrobe = getWardrobe?.() ?? null;
+      const nasOptions = {
+        ...(baseUrl ? { baseUrl } : {}),
+        ...(archivePath ? { archivePath } : {}),
+        ...(fetcher ? { fetcher } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      };
 
-      const result = await searchNasArchive(
+      let result = await searchNasArchive(
         {
           query: queryText,
-          ...(roomSession ? { session: roomSession } : {}),
-          sender: query.person,
+          ...(roomSession ? { session: roomSession } : !queryText && person ? { session: person } : {}),
+          ...(roomSession || queryText ? (person ? { sender: person } : {}) : {}),
+          ...(sinceRaw ? { since: sinceRaw } : {}),
+          ...(untilRaw ? { until: untilRaw } : {}),
           limit: MAX_NAS_SEARCH_LIMIT,
         },
-        {
-          ...(baseUrl ? { baseUrl } : {}),
-          ...(archivePath ? { archivePath } : {}),
-          ...(fetcher ? { fetcher } : {}),
-          ...(timeoutMs !== undefined ? { timeoutMs } : {}),
-        },
+        nasOptions,
       );
+
+      if (!roomSession && person && result.items.length === 0) {
+        result = await searchNasArchive(
+          {
+            query: queryText,
+            ...(queryText ? { session: person } : { sender: person }),
+            ...(sinceRaw ? { since: sinceRaw } : {}),
+            ...(untilRaw ? { until: untilRaw } : {}),
+            limit: MAX_NAS_SEARCH_LIMIT,
+          },
+          nasOptions,
+        );
+      }
 
       const hits: VaultSearchHit[] = [];
       for (let i = 0; i < result.items.length; i += 1) {
         const item = result.items[i]!;
         const session = typeof item.session === 'string' ? item.session.trim() : '';
-        if (roomSessionLower && session.replace(/^wechat:/i, '').trim().toLowerCase() !== roomSessionLower) {
-          continue;
+        if (roomSessionNorm) {
+          const itemSessionNorm = normalizeNasSessionKey(session.replace(/^wechat:/i, '').trim());
+          const itemNameNorm = normalizeNasSessionKey(item.sessionName || '');
+          const roomMatched = roomSessionDirect
+            ? itemSessionNorm === roomSessionNorm
+            : itemSessionNorm === roomSessionNorm ||
+              itemSessionNorm.includes(roomSessionNorm) ||
+              itemNameNorm.includes(roomSessionNorm);
+          if (!roomMatched) {
+            continue;
+          }
         }
         const circle = resolveWechatVaultCircle(session, wardrobe);
         if (!allowed.has(circle)) {

